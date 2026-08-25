@@ -1,9 +1,13 @@
-//! On-disk `.ayz` container codecs (header, trailer; records in a later PR).
+//! On-disk `.ayz` container codecs (header, records, trailer).
 
 mod header;
+mod record;
 mod trailer;
 
 pub use header::{read_header, write_header, FileHeader};
+pub use record::{
+    read_ayz_file, read_record, read_records, write_ayz_file, write_record, Record, BUF_WRITER_CAP,
+};
 pub use trailer::{read_trailer, write_trailer, Trailer};
 
 use crate::error::AyzenpackError;
