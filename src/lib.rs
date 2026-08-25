@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod cas;
 pub mod error;
 pub mod format;
 pub mod hashutil;
