@@ -74,8 +74,7 @@ where
     let comment = String::from_utf8_lossy(archive.comment()).into_owned();
 
     let mut entries = Vec::with_capacity(archive.len());
-    let mut has_sf = false;
-    let mut has_block = false;
+    let mut signed = false;
 
     for i in 0..archive.len() {
         let mut zf = archive
@@ -89,10 +88,9 @@ where
         }
 
         let name = zf.name().to_string();
-        match signature_kind(&name) {
-            Some(SignatureKind::Sf) => has_sf = true,
-            Some(SignatureKind::Block) => has_block = true,
-            None => {}
+        // DESIGN: signed if any META-INF/*.SF or *.RSA/*.DSA/*.EC entry exists.
+        if looks_signed(&name) {
+            signed = true;
         }
 
         let (method, method_code) = method_label_and_code(zf.compression());
@@ -159,29 +157,23 @@ where
         source_blake3,
         source_sha256,
         comment,
-        signed: has_sf && has_block,
+        signed,
         entries,
     })
 }
 
-enum SignatureKind {
-    Sf,
-    Block,
-}
-
-fn signature_kind(name: &str) -> Option<SignatureKind> {
+fn looks_signed(name: &str) -> bool {
     let lower = name.replace('\\', "/").to_ascii_lowercase();
-    let rest = lower.strip_prefix("meta-inf/")?;
+    let Some(rest) = lower.strip_prefix("meta-inf/") else {
+        return false;
+    };
     if rest.is_empty() || rest.contains('/') {
-        return None;
+        return false;
     }
-    if rest.ends_with(".sf") {
-        Some(SignatureKind::Sf)
-    } else if rest.ends_with(".rsa") || rest.ends_with(".dsa") || rest.ends_with(".ec") {
-        Some(SignatureKind::Block)
-    } else {
-        None
-    }
+    rest.ends_with(".sf")
+        || rest.ends_with(".rsa")
+        || rest.ends_with(".dsa")
+        || rest.ends_with(".ec")
 }
 
 fn method_label_and_code(method: CompressionMethod) -> (String, u16) {

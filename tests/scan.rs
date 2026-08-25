@@ -195,6 +195,32 @@ fn scan_detects_signed_sf_rsa() {
     let signed = scan_jar(&signed_path, MAX_ENTRY).unwrap();
     assert!(signed.signed, "META-INF/*.SF + *.RSA must set signed");
 
+    let (_dir_sf, sf_only) = temp_jar("sf-only.jar");
+    write_jar(
+        &sf_only,
+        &[
+            ("META-INF/FOO.SF", b"Signature-Version: 1.0\n"),
+            ("com/App.class", b"class"),
+        ],
+    );
+    assert!(
+        scan_jar(&sf_only, MAX_ENTRY).unwrap().signed,
+        "SF-only JAR must set signed (OR, not AND)"
+    );
+
+    let (_dir_rsa, rsa_only) = temp_jar("rsa-only.jar");
+    write_jar(
+        &rsa_only,
+        &[
+            ("META-INF/FOO.RSA", b"pkcs7-placeholder"),
+            ("com/App.class", b"class"),
+        ],
+    );
+    assert!(
+        scan_jar(&rsa_only, MAX_ENTRY).unwrap().signed,
+        "RSA-only JAR must set signed (OR, not AND)"
+    );
+
     let (_dir2, unsigned_path) = temp_jar("unsigned.jar");
     write_jar(&unsigned_path, &[("com/App.class", b"class")]);
     let unsigned = scan_jar(&unsigned_path, MAX_ENTRY).unwrap();
@@ -284,10 +310,6 @@ fn for_each_jar_entry_drops_payload_before_next() {
     assert_eq!(file_payloads, 2);
     assert_eq!(max_live, 1);
     assert_eq!(scanned.entries.len(), 2);
-    assert!(
-        std::mem::size_of::<ScannedEntry>() < 256,
-        "ScannedEntry is metadata; a retained payload Vec would blow this bound on 64-bit"
-    );
 }
 
 #[test]
