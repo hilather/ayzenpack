@@ -1,0 +1,44 @@
+[package]
+name = "ayzenpack"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+description = "Dehydrate many JARs into one zstd content-addressed archive and rehydrate them"
+readme = "README.md"
+authors = ["ayzenpack contributors"]
+keywords = ["jar", "zip", "zstd", "dedup", "blake3"]
+categories = ["command-line-utilities", "compression"]
+
+[lib]
+name = "ayzenpack"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ayzenpack"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1.8"
+clap = { version = "4.5", features = ["derive"] }
+crc32fast = "1.5"
+glob = "0.3"
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.15"
+thiserror = "2.0"
+walkdir = "2.5"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+zstd = "0.13"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
