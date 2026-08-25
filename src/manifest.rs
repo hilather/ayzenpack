@@ -1,0 +1,351 @@
+use serde::{Deserialize, Serialize};
+
+/// Manifest JSON `format` discriminator. Not `jded-manifest`.
+pub const MANIFEST_FORMAT: &str = "ayzenpack-manifest";
+
+/// MANIFEST JSON (v1). Unknown keys are ignored (no `deny_unknown_fields`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Manifest {
+    pub format: String,
+    pub version: u32,
+    pub hash_algo: String,
+    pub mode: String,
+    pub jars: Vec<Jar>,
+    pub blobs: Vec<Blob>,
+    pub stats: Stats,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Jar {
+    pub name: String,
+    pub source_path: String,
+    pub source_size: u64,
+    pub source_blake3: String,
+    pub source_sha256: String,
+    pub comment: String,
+    pub signed: bool,
+    pub entries: Vec<Entry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Blob {
+    pub blake3: String,
+    pub sha256: String,
+    pub size: u64,
+    pub ref_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Stats {
+    pub jar_count: u64,
+    pub entry_count: u64,
+    pub file_entry_count: u64,
+    pub unique_blob_count: u64,
+    pub bytes_in_jars: u64,
+    pub bytes_uncompressed_entries: u64,
+    pub bytes_unique_blobs: u64,
+    pub dedup_ratio: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Entry {
+    pub name: String,
+    pub is_dir: bool,
+    pub blob: Option<String>,
+    pub sha256: Option<String>,
+    pub crc32: u32,
+    pub method: String,
+    pub method_code: u16,
+    pub uncompressed_size: u64,
+    pub compressed_size: u64,
+    pub dos_date: u16,
+    pub dos_time: u16,
+    pub unix_mode: Option<u32>,
+    pub utf8_flag: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_raw_hex: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TINY_JSON: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/tiny.manifest.json"
+    ));
+    const SCHEMA_JSON: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/schemas/manifest.v1.schema.json"
+    ));
+
+    const EMPTY_BLAKE3: &str = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+    const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    fn sample_file_entry() -> Entry {
+        Entry {
+            name: "shared.txt".into(),
+            is_dir: false,
+            blob: Some(EMPTY_BLAKE3.into()),
+            sha256: Some(EMPTY_SHA256.into()),
+            crc32: 0,
+            method: "deflated".into(),
+            method_code: 8,
+            uncompressed_size: 0,
+            compressed_size: 2,
+            dos_date: 0,
+            dos_time: 0,
+            unix_mode: None,
+            utf8_flag: true,
+            name_raw_hex: None,
+        }
+    }
+
+    fn sample_manifest() -> Manifest {
+        Manifest {
+            format: MANIFEST_FORMAT.into(),
+            version: 1,
+            hash_algo: "blake3".into(),
+            mode: "content".into(),
+            jars: vec![Jar {
+                name: "a.jar".into(),
+                source_path: "fixtures/a.jar".into(),
+                source_size: 1200,
+                source_blake3: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .into(),
+                source_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .into(),
+                comment: String::new(),
+                signed: false,
+                entries: vec![sample_file_entry()],
+            }],
+            blobs: vec![Blob {
+                blake3: EMPTY_BLAKE3.into(),
+                sha256: EMPTY_SHA256.into(),
+                size: 0,
+                ref_count: 1,
+            }],
+            stats: Stats {
+                jar_count: 1,
+                entry_count: 1,
+                file_entry_count: 1,
+                unique_blob_count: 1,
+                bytes_in_jars: 1200,
+                bytes_uncompressed_entries: 0,
+                bytes_unique_blobs: 0,
+                dedup_ratio: 0.0,
+            },
+        }
+    }
+
+    fn assert_compact(s: &str) {
+        assert!(!s.contains('\n'), "JSON must be compact (no newline): {s}");
+        assert!(
+            !s.contains(": ") && !s.contains(", "),
+            "JSON must be compact (no spaces after :/,): {s}"
+        );
+    }
+
+    /// First occurrence of `"key":` after `from`; panics if missing. Guards BTreeMap reordering.
+    fn find_key_after(json: &str, from: usize, key: &str) -> usize {
+        let needle = format!("\"{key}\":");
+        let rel = json[from..]
+            .find(&needle)
+            .unwrap_or_else(|| panic!("missing key {key} after byte {from} in {json}"));
+        from + rel
+    }
+
+    fn assert_key_order(json: &str, keys: &[&str]) {
+        let mut pos = 0usize;
+        for key in keys {
+            let at = find_key_after(json, pos, key);
+            pos = at + key.len();
+        }
+    }
+
+    #[test]
+    fn tiny_example_deserializes() {
+        // Guards jded-manifest discriminator and schema identity drift.
+        let m: Manifest = serde_json::from_str(TINY_JSON).unwrap();
+        assert_eq!(m, sample_manifest());
+        assert_eq!(m.format, MANIFEST_FORMAT);
+        assert_eq!(m.format, "ayzenpack-manifest");
+        assert_ne!(m.format, "jded-manifest");
+        assert!(!TINY_JSON.contains("jded"));
+        assert!(!TINY_JSON.contains("jded-manifest"));
+        assert!(SCHEMA_JSON.contains(
+            "https://github.com/hilather/ayzenpack/raw/main/schemas/manifest.v1.schema.json"
+        ));
+        assert!(SCHEMA_JSON.contains("\"const\": \"ayzenpack-manifest\""));
+        assert!(SCHEMA_JSON.contains("\"additionalProperties\": false"));
+        assert!(SCHEMA_JSON.contains("name_raw_hex"));
+        assert!(!SCHEMA_JSON.contains("jded"));
+        assert_eq!(m.version, 1);
+        assert_eq!(m.hash_algo, "blake3");
+        assert_eq!(m.mode, "content");
+        assert_eq!(m.jars[0].entries[0].blob.as_deref(), Some(EMPTY_BLAKE3));
+        assert_eq!(m.blobs[0].sha256, EMPTY_SHA256);
+    }
+
+    #[test]
+    fn compact_serialize_then_deserialize_eq() {
+        let m = sample_manifest();
+        let bytes = serde_json::to_vec(&m).unwrap();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert_compact(s);
+        let m2: Manifest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(m, m2);
+        assert_eq!(m2.format, "ayzenpack-manifest");
+        assert_ne!(m2.format, "jded-manifest");
+    }
+
+    #[test]
+    fn field_order_stable_for_known_struct() {
+        // Guards BTreeMap / alpha key order on compact serialize.
+        let m = sample_manifest();
+        let s = serde_json::to_string(&m).unwrap();
+        assert_compact(&s);
+        assert!(s.starts_with("{\"format\":\"ayzenpack-manifest\""));
+        assert!(!s.contains("jded-manifest"));
+        assert_key_order(
+            &s,
+            &[
+                "format",
+                "version",
+                "hash_algo",
+                "mode",
+                "jars",
+                "blobs",
+                "stats",
+            ],
+        );
+        assert_key_order(
+            &serde_json::to_string(&m.jars[0]).unwrap(),
+            &[
+                "name",
+                "source_path",
+                "source_size",
+                "source_blake3",
+                "source_sha256",
+                "comment",
+                "signed",
+                "entries",
+            ],
+        );
+        assert_key_order(
+            &serde_json::to_string(&m.blobs[0]).unwrap(),
+            &["blake3", "sha256", "size", "ref_count"],
+        );
+        assert_key_order(
+            &serde_json::to_string(&m.stats).unwrap(),
+            &[
+                "jar_count",
+                "entry_count",
+                "file_entry_count",
+                "unique_blob_count",
+                "bytes_in_jars",
+                "bytes_uncompressed_entries",
+                "bytes_unique_blobs",
+                "dedup_ratio",
+            ],
+        );
+        assert_key_order(
+            &serde_json::to_string(&m.jars[0].entries[0]).unwrap(),
+            &[
+                "name",
+                "is_dir",
+                "blob",
+                "sha256",
+                "crc32",
+                "method",
+                "method_code",
+                "uncompressed_size",
+                "compressed_size",
+                "dos_date",
+                "dos_time",
+                "unix_mode",
+                "utf8_flag",
+            ],
+        );
+    }
+
+    #[test]
+    fn dir_entry_blob_null_roundtrip() {
+        let e = Entry {
+            name: "com/example/".into(),
+            is_dir: true,
+            blob: None,
+            sha256: None,
+            crc32: 0,
+            method: "stored".into(),
+            method_code: 0,
+            uncompressed_size: 0,
+            compressed_size: 0,
+            dos_date: 0,
+            dos_time: 0,
+            unix_mode: None,
+            utf8_flag: true,
+            name_raw_hex: None,
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert_compact(&s);
+        assert!(s.contains("\"blob\":null"), "{s}");
+        assert!(s.contains("\"sha256\":null"), "{s}");
+        let e2: Entry = serde_json::from_str(&s).unwrap();
+        assert_eq!(e, e2);
+        assert!(e2.is_dir);
+        assert_eq!(e2.blob, None);
+        assert_eq!(e2.sha256, None);
+    }
+
+    #[test]
+    fn unknown_manifest_key_is_ignored_on_read() {
+        // Guards deny_unknown_fields: a v1.1 extra field must not break list/rehydrate.
+        let m = sample_manifest();
+        let mut v = serde_json::to_value(&m).unwrap();
+        v.as_object_mut().unwrap().insert(
+            "future_v1_1_field".into(),
+            serde_json::json!({"nested": true}),
+        );
+        v["jars"][0]
+            .as_object_mut()
+            .unwrap()
+            .insert("extra_jar_key".into(), serde_json::json!(1));
+        v["jars"][0]["entries"][0]
+            .as_object_mut()
+            .unwrap()
+            .insert("extra_entry_key".into(), serde_json::json!("ok"));
+        v["blobs"][0]
+            .as_object_mut()
+            .unwrap()
+            .insert("extra_blob_key".into(), serde_json::json!(false));
+        v["stats"]
+            .as_object_mut()
+            .unwrap()
+            .insert("extra_stats_key".into(), serde_json::json!(0));
+        let got: Manifest = serde_json::from_value(v).unwrap();
+        assert_eq!(got, m);
+    }
+
+    #[test]
+    fn name_raw_hex_omitted_when_none() {
+        let e = sample_file_entry();
+        assert_eq!(e.name_raw_hex, None);
+        let s = serde_json::to_string(&e).unwrap();
+        assert_compact(&s);
+        assert!(
+            !s.contains("name_raw_hex"),
+            "None name_raw_hex must be omitted: {s}"
+        );
+        let e2: Entry = serde_json::from_str(&s).unwrap();
+        assert_eq!(e2.name_raw_hex, None);
+
+        let mut with = e.clone();
+        with.name_raw_hex = Some("cafebabe".into());
+        let s2 = serde_json::to_string(&with).unwrap();
+        assert!(s2.contains("\"name_raw_hex\":\"cafebabe\""), "{s2}");
+        assert_key_order(&s2, &["utf8_flag", "name_raw_hex"]);
+        let round: Entry = serde_json::from_str(&s2).unwrap();
+        assert_eq!(round, with);
+    }
+}

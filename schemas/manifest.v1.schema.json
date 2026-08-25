@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/hilather/ayzenpack/raw/main/schemas/manifest.v1.schema.json",
+  "title": "ayzenpack-manifest",
+  "type": "object",
+  "required": ["format", "version", "hash_algo", "mode", "jars", "blobs", "stats"],
+  "additionalProperties": false,
+  "properties": {
+    "format": { "const": "ayzenpack-manifest" },
+    "version": { "const": 1 },
+    "hash_algo": { "const": "blake3" },
+    "mode": { "const": "content" },
+    "jars": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/jar" }
+    },
+    "blobs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/blob" }
+    },
+    "stats": { "$ref": "#/$defs/stats" }
+  },
+  "$defs": {
+    "hex64": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "blob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["blake3", "sha256", "size", "ref_count"],
+      "properties": {
+        "blake3": { "$ref": "#/$defs/hex64" },
+        "sha256": { "$ref": "#/$defs/hex64" },
+        "size": { "type": "integer", "minimum": 0 },
+        "ref_count": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "stats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "jar_count",
+        "entry_count",
+        "file_entry_count",
+        "unique_blob_count",
+        "bytes_in_jars",
+        "bytes_uncompressed_entries",
+        "bytes_unique_blobs",
+        "dedup_ratio"
+      ],
+      "properties": {
+        "jar_count": { "type": "integer", "minimum": 0 },
+        "entry_count": { "type": "integer", "minimum": 0 },
+        "file_entry_count": { "type": "integer", "minimum": 0 },
+        "unique_blob_count": { "type": "integer", "minimum": 0 },
+        "bytes_in_jars": { "type": "integer", "minimum": 0 },
+        "bytes_uncompressed_entries": { "type": "integer", "minimum": 0 },
+        "bytes_unique_blobs": { "type": "integer", "minimum": 0 },
+        "dedup_ratio": { "type": "number" }
+      }
+    },
+    "jar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "source_path",
+        "source_size",
+        "source_blake3",
+        "source_sha256",
+        "comment",
+        "signed",
+        "entries"
+      ],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "source_path": { "type": "string" },
+        "source_size": { "type": "integer", "minimum": 0 },
+        "source_blake3": { "$ref": "#/$defs/hex64" },
+        "source_sha256": { "$ref": "#/$defs/hex64" },
+        "comment": { "type": "string" },
+        "signed": { "type": "boolean" },
+        "entries": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/entry" }
+        }
+      }
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "is_dir",
+        "blob",
+        "sha256",
+        "crc32",
+        "method",
+        "method_code",
+        "uncompressed_size",
+        "compressed_size",
+        "dos_date",
+        "dos_time",
+        "unix_mode",
+        "utf8_flag"
+      ],
+      "properties": {
+        "name": { "type": "string" },
+        "is_dir": { "type": "boolean" },
+        "blob": { "anyOf": [{ "$ref": "#/$defs/hex64" }, { "type": "null" }] },
+        "sha256": { "anyOf": [{ "$ref": "#/$defs/hex64" }, { "type": "null" }] },
+        "crc32": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "method": { "enum": ["stored", "deflated", "other"] },
+        "method_code": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "uncompressed_size": { "type": "integer", "minimum": 0 },
+        "compressed_size": { "type": "integer", "minimum": 0 },
+        "dos_date": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "dos_time": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "unix_mode": { "anyOf": [{ "type": "integer" }, { "type": "null" }] },
+        "utf8_flag": { "type": "boolean" },
+        "name_raw_hex": { "type": "string" }
+      }
+    }
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "format": "ayzenpack-manifest",
+  "version": 1,
+  "hash_algo": "blake3",
+  "mode": "content",
+  "jars": [
+    {
+      "name": "a.jar",
+      "source_path": "fixtures/a.jar",
+      "source_size": 1200,
+      "source_blake3": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "comment": "",
+      "signed": false,
+      "entries": [
+        {
+          "name": "shared.txt",
+          "is_dir": false,
+          "blob": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "crc32": 0,
+          "method": "deflated",
+          "method_code": 8,
+          "uncompressed_size": 0,
+          "compressed_size": 2,
+          "dos_date": 0,
+          "dos_time": 0,
+          "unix_mode": null,
+          "utf8_flag": true
+        }
+      ]
+    }
+  ],
+  "blobs": [
+    {
+      "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0,
+      "ref_count": 1
+    }
+  ],
+  "stats": {
+    "jar_count": 1,
+    "entry_count": 1,
+    "file_entry_count": 1,
+    "unique_blob_count": 1,
+    "bytes_in_jars": 1200,
+    "bytes_uncompressed_entries": 0,
+    "bytes_unique_blobs": 0,
+    "dedup_ratio": 0.0
+  }
+}

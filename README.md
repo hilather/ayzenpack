@@ -15,6 +15,8 @@ Aliases: `pack` = `dehydrate`, `unpack` = `rehydrate`.
 
 These commands are not implemented yet.
 
+The archive MANIFEST is compact JSON with `"format": "ayzenpack-manifest"`. See `schemas/manifest.v1.schema.json` and `examples/tiny.manifest.json`.
+
 ## License
 
 Licensed under either of
