@@ -135,6 +135,16 @@ Do not add jarsigner / JDK verification. Do not require whole-file hash match on
 - Sweep 2: ACCEPT, no blockers. Folded three SHOULD items (replace whole DESIGN Signed JARs section; docs.rs forbids `those signatures will not verify`; README positive MANIFEST lock; `--strict` extra-clause reject).
 - Sweep 3: ACCEPT, no blockers. Plan locked. Implement.
 
+**Code review** (`git diff origin/main...HEAD`):
+
+| Sweep | Verdict |
+|-------|---------|
+| 1 | ACCEPT, no blockers |
+| 2 | ACCEPT, no blockers |
+| 3 | ACCEPT, no blockers |
+
+SHOULD leftovers left as residuals (docs.rs exact-phrase lock, loose library `contains("signed")` on Usage). Grammar “`raw_zip` of a healthy jar” applied after sweep 3.
+
 ---
 
 ## Done

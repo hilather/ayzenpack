@@ -293,7 +293,7 @@ Old packs still read (opaque nested blob, flate2-only `cdata_codec`, zip-rel `lo
 
 ## Signed JARs
 
-`META-INF/*.SF` / `MANIFEST.MF` digest uncompressed entry bytes, not the deflate stream. `*.RSA` / `*.DSA` / `*.EC` sign that `.SF`. Rebuild keeps names, CD order, and those uncompressed bytes, so jarsigner should still verify. Whole-file `source_*` may change. That is expected. ayzenpack does not re-sign. Do not store `cdata_blob` or `raw_zip` a healthy jar just to keep a file hash.
+`META-INF/*.SF` / `MANIFEST.MF` digest uncompressed entry bytes, not the deflate stream. `*.RSA` / `*.DSA` / `*.EC` sign that `.SF`. Rebuild keeps names, CD order, and those uncompressed bytes, so jarsigner should still verify. Whole-file `source_*` may change. That is expected. ayzenpack does not re-sign. Do not store `cdata_blob` or `raw_zip` of a healthy jar just to keep a file hash.
 
 Dehydrate still warns `signed JAR <name>` for exact and rebuild, and still packs. `--fail-on-signed` aborts. `--strict` does not promote the signed notice.
 
