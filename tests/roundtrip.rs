@@ -15,7 +15,7 @@ use ayzenpack::manifest::Manifest;
 use ayzenpack::{dehydrate, rehydrate, verify, DehydrateOptions, RehydrateOptions};
 use fixtures::{
     write_jar, write_jar_entries, write_stored_jar_dos_zero, write_stored_zip, write_wrapped_jar,
-    JarEntry, SPRING_LAUNCHER,
+    write_wrapped_jar_adjusted, JarEntry, SPRING_LAUNCHER, SYSTEMD_LAUNCHER,
 };
 use zip::{CompressionMethod, DateTime, ZipArchive};
 
@@ -935,6 +935,64 @@ fn roundtrip_bash_prefixed_executable_jar() {
         let mode = fs::metadata(&restored).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "wrapped jar must be restored executable");
     }
+}
+
+#[test]
+fn roundtrip_zip_a_adjusted_executable_jar() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("app.jar");
+    write_wrapped_jar_adjusted(
+        &jar,
+        SPRING_LAUNCHER,
+        &[
+            ("App.class", b"class-bytes"),
+            ("application.properties", b"x=1"),
+        ],
+    );
+    let src_bytes = fs::read(&jar).unwrap();
+    assert!(src_bytes.starts_with(SPRING_LAUNCHER));
+
+    let out = dir.path().join("out.ayz");
+    let summary = dehydrate(&opts(&out, vec![jar.clone()]))
+        .expect("zip -A adjusted executable JAR must not be NotZip");
+    assert!(summary.unique_blob_count >= 3, "prefix + two file entries");
+
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("app.jar");
+    let got = fs::read(&restored).unwrap();
+    assert_eq!(
+        &got[..SPRING_LAUNCHER.len()],
+        SPRING_LAUNCHER,
+        "restored file must start with the exact prefix"
+    );
+    assert_functional_identity(&jar, &restored);
+}
+
+#[test]
+fn roundtrip_systemd_launcher_executable_jar() {
+    assert!(SYSTEMD_LAUNCHER.len() > 200);
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("app.jar");
+    write_wrapped_jar(
+        &jar,
+        SYSTEMD_LAUNCHER,
+        &[
+            ("App.class", b"class-bytes"),
+            ("application.properties", b"x=1"),
+        ],
+    );
+
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("app.jar");
+    assert_eq!(
+        &fs::read(&restored).unwrap()[..SYSTEMD_LAUNCHER.len()],
+        SYSTEMD_LAUNCHER
+    );
+    assert_functional_identity(&jar, &restored);
 }
 
 #[test]

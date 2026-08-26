@@ -24,8 +24,68 @@ pub const SPRING_LAUNCHER: &[u8] = b"#!/bin/bash\n\
 #   :: Spring Boot Startup Script ::\n\
 ";
 
+/// Longer chkconfig + systemd-style Spring Boot launch script (not a 2-line shebang).
+pub const SYSTEMD_LAUNCHER: &[u8] = b"#!/bin/bash\n\
+#\n\
+# chkconfig: 2345 80 20\n\
+# description: demo Spring Boot application\n\
+# processname: demo\n\
+# pidfile: /var/run/demo.pid\n\
+#\n\
+### BEGIN INIT INFO\n\
+# Provides:          demo\n\
+# Required-Start:    $remote_fs $syslog $network\n\
+# Required-Stop:     $remote_fs $syslog $network\n\
+# Default-Start:     2 3 4 5\n\
+# Default-Stop:      0 1 6\n\
+# Short-Description: demo\n\
+# Description:       demo Spring Boot application\n\
+### END INIT INFO\n\
+#\n\
+#    .   ____          _            __ _ _\n\
+#   /\\\\ / ___'_ __ _ _(_)_ __  __ _ \\ \\ \\ \\\n\
+#  ( ( )\\___ | '_ | '_| | '_ \\/ _` | \\ \\ \\ \\\n\
+#   \\\\/  ___)| |_)| | | | | || (_| |  ) ) ) )\n\
+#    '  |____| .__|_| |_|_| |_\\__, | / / / /\n\
+#   =========|_|==============|___/=/_/_/_/\n\
+#   :: Spring Boot Startup Script ::\n\
+#\n\
+# [Unit]\n\
+# Description=demo Spring Boot application\n\
+# After=network.target\n\
+# [Service]\n\
+# Type=simple\n\
+# EnvironmentFile=-/etc/sysconfig/demo\n\
+# ExecStart=/usr/bin/demo\n\
+# [Install]\n\
+# WantedBy=multi-user.target\n\
+#\n\
+[ -n \"$DEBUG_SPRING_BOOT\" ] && set -x\n\
+prg=\"$0\"\n\
+while [ -h \"$prg\" ]; do\n\
+  ls=$(ls -ld \"$prg\")\n\
+  link=$(expr \"$ls\" : '.*-> \\(.*\\)$')\n\
+  if expr \"$link\" : '/.*' > /dev/null; then\n\
+    prg=\"$link\"\n\
+  else\n\
+    prg=$(dirname \"$prg\")\"/$link\"\n\
+  fi\ndone\n\
+# The JAR payload is appended after this script.\n\
+exec java -jar \"$0\" \"$@\"\n\
+";
+
 /// Write `launcher` then a tiny JAR built with [`write_jar`].
 pub fn write_wrapped_jar(path: &Path, launcher: &[u8], files: &[(&str, &[u8])]) {
+    std::fs::write(path, wrapped_jar_bytes(launcher, files, false)).unwrap();
+}
+
+/// Same as [`write_wrapped_jar`], then add `launcher.len()` to the EOCD CD
+/// offset and each central-directory local-header offset (`zip -A`).
+pub fn write_wrapped_jar_adjusted(path: &Path, launcher: &[u8], files: &[(&str, &[u8])]) {
+    std::fs::write(path, wrapped_jar_bytes(launcher, files, true)).unwrap();
+}
+
+fn wrapped_jar_bytes(launcher: &[u8], files: &[(&str, &[u8])], adjust: bool) -> Vec<u8> {
     use std::io::Cursor;
     let mut z = ZipWriter::new(Cursor::new(Vec::new()));
     let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
@@ -37,7 +97,46 @@ pub fn write_wrapped_jar(path: &Path, launcher: &[u8], files: &[(&str, &[u8])]) 
     let mut out = Vec::with_capacity(launcher.len() + zip.len());
     out.extend_from_slice(launcher);
     out.extend_from_slice(&zip);
-    std::fs::write(path, out).unwrap();
+    if adjust {
+        adjust_self_extracting_offsets(&mut out, u32::try_from(launcher.len()).unwrap());
+    }
+    out
+}
+
+/// Info-ZIP `zip -A`: CD/local offsets become file-absolute (include the stub).
+fn adjust_self_extracting_offsets(buf: &mut [u8], delta: u32) {
+    const EOCD_MIN: usize = 22;
+    let eocd = {
+        assert!(buf.len() >= EOCD_MIN);
+        let mut i = buf.len() - EOCD_MIN;
+        loop {
+            if buf[i..i + 4] == *b"PK\x05\x06" {
+                let comment_len = u16::from_le_bytes([buf[i + 20], buf[i + 21]]) as usize;
+                if i + 22 + comment_len == buf.len() {
+                    break i;
+                }
+            }
+            assert!(i > 0, "test zip must have EOCD");
+            i -= 1;
+        }
+    };
+    let cd_size = u32::from_le_bytes(buf[eocd + 12..eocd + 16].try_into().unwrap()) as usize;
+    let cd_off = u32::from_le_bytes(buf[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+    let phys_cd = cd_off + delta as usize;
+    let mut i = phys_cd;
+    let cd_end = phys_cd + cd_size;
+    while i + 46 <= cd_end {
+        assert_eq!(&buf[i..i + 4], b"PK\x01\x02", "central directory signature");
+        let name_len = u16::from_le_bytes([buf[i + 28], buf[i + 29]]) as usize;
+        let extra_len = u16::from_le_bytes([buf[i + 30], buf[i + 31]]) as usize;
+        let comment_len = u16::from_le_bytes([buf[i + 32], buf[i + 33]]) as usize;
+        let local_off = u32::from_le_bytes(buf[i + 42..i + 46].try_into().unwrap());
+        buf[i + 42..i + 46].copy_from_slice(&(local_off + delta).to_le_bytes());
+        i += 46 + name_len + extra_len + comment_len;
+    }
+    assert_eq!(i, cd_end, "central directory walk must consume cd_size");
+    buf[eocd + 16..eocd + 20]
+        .copy_from_slice(&(u32::try_from(cd_off).unwrap() + delta).to_le_bytes());
 }
 
 pub enum JarEntry<'a> {

@@ -10,7 +10,8 @@ use ayzenpack::error::AyzenpackError;
 use ayzenpack::hashutil::hash_both;
 use ayzenpack::scan::{for_each_jar_entry, scan_jar, zip_prefix_len, ScannedEntry};
 use fixtures::{
-    write_jar, write_jar_entries_with_mtime, write_wrapped_jar, JarEntry, SPRING_LAUNCHER,
+    write_jar, write_jar_entries_with_mtime, write_wrapped_jar, write_wrapped_jar_adjusted,
+    JarEntry, SPRING_LAUNCHER, SYSTEMD_LAUNCHER,
 };
 use zip::CompressionMethod;
 use zip::DateTime;
@@ -184,6 +185,31 @@ fn scan_prefix_len_on_script_plus_zip() {
     assert_eq!(scanned.source_blake3, b3);
     assert_eq!(scanned.source_sha256, sha);
     assert_eq!(scanned.source_size, bytes.len() as u64);
+}
+
+#[test]
+fn scan_adjusted_script_plus_zip() {
+    let (_dir, path) = temp_jar("app-adjusted.jar");
+    write_wrapped_jar_adjusted(&path, SPRING_LAUNCHER, &[("App.class", b"class-bytes")]);
+    assert_eq!(zip_prefix_len(&path).unwrap(), SPRING_LAUNCHER.len() as u64);
+    let scanned = scan_jar(&path, MAX_ENTRY).unwrap();
+    assert_eq!(scanned.prefix.as_deref(), Some(SPRING_LAUNCHER));
+    assert_eq!(scanned.entries.len(), 1);
+    assert_eq!(scanned.entries[0].name, "App.class");
+}
+
+#[test]
+fn scan_systemd_launcher_unadjusted() {
+    assert!(SYSTEMD_LAUNCHER.len() > 200);
+    let (_dir, path) = temp_jar("app-systemd.jar");
+    write_wrapped_jar(&path, SYSTEMD_LAUNCHER, &[("App.class", b"class-bytes")]);
+    assert_eq!(
+        zip_prefix_len(&path).unwrap(),
+        SYSTEMD_LAUNCHER.len() as u64
+    );
+    let scanned = scan_jar(&path, MAX_ENTRY).unwrap();
+    assert_eq!(scanned.prefix.as_deref(), Some(SYSTEMD_LAUNCHER));
+    assert_eq!(scanned.entries[0].name, "App.class");
 }
 
 #[test]
