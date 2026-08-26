@@ -1,0 +1,2 @@
+# Checked-in bash fixtures must stay LF. Windows autocrlf must not rewrite them.
+tests/fixtures/** text eol=lf

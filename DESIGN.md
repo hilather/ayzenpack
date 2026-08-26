@@ -81,7 +81,7 @@ Unknown header keys are ignored. Version byte (offset 4) `> 1` is `unsupported v
   "zstd_level": 3,
   "created_unix": 1710000000,
   "tool": "ayzenpack",
-  "tool_version": "0.1.4"
+  "tool_version": "0.1.5"
 }
 ```
 
@@ -172,19 +172,22 @@ Nested `.jar` entries are opaque blobs. They are not exploded.
 
 ## Executable / prefixed JARs
 
-Spring Boot “fully executable” JARs (`spring-boot-maven-plugin` `executable: true` and similar) prepend a bash launcher before a normal ZIP. The file starts with `#!/bin/bash` (or similar), not `PK\x03\x04`.
+Spring Boot “fully executable” JARs (`spring-boot-maven-plugin` `executable: true` / `bootJar { launchScript() }`) prepend the official `launch.script` before a ZIP (often Zip64). The file starts with `#!/bin/bash`, the Spring Boot banner, `### BEGIN INIT INFO` / chkconfig, and ends with `exit 0` — not `PK\x03\x04`. Placeholders like `{{mode:auto}}` are already substituted in a real build.
 
-Detection uses EOCD-from-EOF extra-data math, not a scan for the first local-file magic:
+Detection uses no CLI flag. If the file does not start with ZIP magic, scan from offset 0 for the first `PK\x03\x04` within 16 MiB. Prefix bytes are `[0, first_pk)`. Then try, in order:
+
+1. **Unadjusted** (Spring default): `ZipArchive` through `ZipView` shifted to `first_pk`. ZIP offsets are relative to the ZIP start. This is what `file` sees after the script is deleted.
+2. **Adjusted** (`zip -A`): if that open fails, open the full file (no `ZipView` shift). CD and local-header offsets are already file-absolute.
+
+A file with no `PK\x03\x04` stays `NotZip` (except an empty prefixed archive, which still uses EOCD extra-data math). 0.1.4 extra-data math alone is not sufficient: after `zip -A`, `extra == 0` and `confirm_zip_at(0)` reads `#!` / ELF.
 
 ```
-prefix_len = (eocd_file_offset - cd_size) - recorded_cd_offset
+extra = (eocd_file_offset - cd_size) - recorded_cd_offset
 ```
-
-Zip64 uses the locator / Zip64 EOCD when the 32-bit fields are sentinels. The byte at `prefix_len` must be `PK\x03\x04` (or empty-archive EOCD). Prefixes larger than 16 MiB are rejected (`NotZip`).
 
 The prefix is stored as a first-seen CAS BLOB (same `hash_both` path as entry payloads). Shared launchers across JARs dedup (`ref_count > 1`). Manifest `jars[]` may include optional `prefix_blob` (hex BLAKE3) and `prefix_size`. Omitted on normal ZIPs so old archives still list/rehydrate.
 
-Rehydrate writes the prefix bytes first, then `ZipWriter` on the same file (`[prefix][zip]`). ZIP offsets stay ZIP-relative. On Unix the restored file is `chmod 0755` so it stays executable.
+Rehydrate writes the prefix bytes first, then `ZipWriter` on the same file (`[prefix][zip]`). The rebuilt ZIP is unadjusted (offsets ZIP-relative). On Unix the restored file is `chmod 0755` so it stays executable.
 
 `source_blake3` / `source_sha256` / `source_size` remain hashes/size of the **whole** input (prefix + ZIP).
 

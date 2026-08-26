@@ -14,8 +14,9 @@ use ayzenpack::hashutil::blake3_bytes;
 use ayzenpack::manifest::Manifest;
 use ayzenpack::{dehydrate, rehydrate, verify, DehydrateOptions, RehydrateOptions};
 use fixtures::{
-    write_jar, write_jar_entries, write_stored_jar_dos_zero, write_stored_zip, write_wrapped_jar,
-    JarEntry, SPRING_LAUNCHER,
+    spring_boot_launch_script, write_jar, write_jar_entries, write_stored_jar_dos_zero,
+    write_stored_zip, write_wrapped_jar, write_wrapped_jar_adjusted, write_wrapped_zip64_jar,
+    zip64_jar_bytes, JarEntry, SPRING_LAUNCHER,
 };
 use zip::{CompressionMethod, DateTime, ZipArchive};
 
@@ -935,6 +936,87 @@ fn roundtrip_bash_prefixed_executable_jar() {
         let mode = fs::metadata(&restored).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "wrapped jar must be restored executable");
     }
+}
+
+#[test]
+fn roundtrip_zip_a_adjusted_executable_jar() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("app.jar");
+    write_wrapped_jar_adjusted(
+        &jar,
+        SPRING_LAUNCHER,
+        &[
+            ("App.class", b"class-bytes"),
+            ("application.properties", b"x=1"),
+        ],
+    );
+    let src_bytes = fs::read(&jar).unwrap();
+    assert!(src_bytes.starts_with(SPRING_LAUNCHER));
+
+    let out = dir.path().join("out.ayz");
+    let summary = dehydrate(&opts(&out, vec![jar.clone()]))
+        .expect("zip -A adjusted executable JAR must not be NotZip");
+    assert!(summary.unique_blob_count >= 3, "prefix + two file entries");
+
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("app.jar");
+    let got = fs::read(&restored).unwrap();
+    assert_eq!(
+        &got[..SPRING_LAUNCHER.len()],
+        SPRING_LAUNCHER,
+        "restored file must start with the exact prefix"
+    );
+    assert_functional_identity(&jar, &restored);
+}
+
+#[test]
+fn roundtrip_official_launch_script_executable_jar() {
+    let launcher = spring_boot_launch_script();
+    assert!(launcher.len() > 200);
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("app.jar");
+    write_wrapped_jar(
+        &jar,
+        launcher,
+        &[
+            ("App.class", b"class-bytes"),
+            ("application.properties", b"x=1"),
+        ],
+    );
+
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("app.jar");
+    assert_eq!(&fs::read(&restored).unwrap()[..launcher.len()], launcher);
+    assert_functional_identity(&jar, &restored);
+}
+
+#[test]
+fn roundtrip_official_script_plus_zip64_nested_lib() {
+    let launcher = spring_boot_launch_script();
+    let inner = zip64_jar_bytes(&[("com/Dep.class", b"dep-bytes")]);
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("app.jar");
+    write_wrapped_zip64_jar(
+        &jar,
+        launcher,
+        &[
+            ("BOOT-INF/lib/dep.jar", inner.as_slice()),
+            ("App.class", b"class-bytes"),
+        ],
+    );
+
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()]))
+        .expect("official launch.script + Zip64 fat JAR must not be NotZip");
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("app.jar");
+    assert_eq!(&fs::read(&restored).unwrap()[..launcher.len()], launcher);
+    assert_functional_identity(&jar, &restored);
 }
 
 #[test]
