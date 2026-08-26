@@ -42,11 +42,19 @@ case "$release" in
 esac
 
 # --allowerasing: curl-minimal vs curl. Do not pull `coreutils` (conflicts).
+# bash: Rocky 9 GHA later steps exec "bash" from PATH; rustup GITHUB_PATH
+# can hide /bin (exit 127: executable file not found).
+# file: used to record ELF/glibc notes on the built binary.
 dnf -y install --allowerasing \
+    bash file \
     gcc gcc-c++ make pkgconf-pkg-config git ca-certificates \
     which findutils tar gzip \
     binutils \
     perl-IPC-Cmd
+
+command -v bash
+command -v file
+test -x /usr/bin/bash
 
 if ! command -v curl >/dev/null 2>&1; then
     dnf -y install --allowerasing curl

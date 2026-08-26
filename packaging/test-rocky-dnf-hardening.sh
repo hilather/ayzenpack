@@ -28,7 +28,8 @@ grep -q -- '--allowerasing' "$DEPS" && pass "dnf helper uses --allowerasing" || 
 grep -q powertools "$DEPS" && pass "Rocky 8 PowerTools" || bad "missing powertools"
 grep -q crb "$DEPS" && pass "Rocky 9 CRB" || bad "missing crb"
 
-grep -q 'shell: bash' "$YML" && pass "container jobs force bash" || bad "container jobs must defaults.run.shell bash"
+grep -q 'shell: /usr/bin/bash' "$YML" && pass "container jobs force /usr/bin/bash" || bad "container jobs must defaults.run.shell /usr/bin/bash"
+grep -q 'bash file' "$DEPS" && pass "dnf helper installs bash and file" || bad "dnf helper must install bash and file"
 if grep -q 'cargo test --release' "$YML"; then
   bad "packages.yml must not cargo test --release (panic=abort)"
 else

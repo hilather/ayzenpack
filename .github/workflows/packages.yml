@@ -41,7 +41,9 @@ jobs:
     timeout-minutes: 60
     defaults:
       run:
-        shell: bash
+        # Absolute path: rustup writes GITHUB_PATH; GHA then execs "bash"
+        # from PATH and Rocky 9 failed with exit 127 (bash not found).
+        shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
     strategy:
       fail-fast: false
       matrix:
@@ -74,10 +76,14 @@ jobs:
             | sh -s -- -y --default-toolchain stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "/usr/bin" >> "$GITHUB_PATH"
+          echo "/bin" >> "$GITHUB_PATH"
           # shellcheck disable=SC1091
           . "$HOME/.cargo/env"
           command -v rustc
           command -v cargo
+          command -v bash
+          test -x /usr/bin/bash
           rustc --version
           cargo --version
 
@@ -85,7 +91,7 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x packaging/test-version-resolve.sh
-          bash packaging/test-version-resolve.sh --resolve | tee -a "$GITHUB_ENV"
+          /usr/bin/bash packaging/test-version-resolve.sh --resolve | /usr/bin/tee -a "$GITHUB_ENV"
 
       - name: Build .rpm + tarball
         env:
@@ -103,11 +109,11 @@ jobs:
           command -v cargo
           cargo --version
           chmod +x packaging/build-native-packages.sh
-          bash packaging/build-native-packages.sh
+          /usr/bin/bash packaging/build-native-packages.sh
           test -s dist/*.rpm
           test -s dist/*.tar.gz
-          file target/release/ayzenpack | tee "dist/file-info-${{ matrix.distro_label }}.txt"
-          ./target/release/ayzenpack --help | tee "dist/help-${{ matrix.distro_label }}.txt"
+          /usr/bin/file target/release/ayzenpack | /usr/bin/tee "dist/file-info-${{ matrix.distro_label }}.txt"
+          ./target/release/ayzenpack --help | /usr/bin/tee "dist/help-${{ matrix.distro_label }}.txt"
           grep -q dehydrate "dist/help-${{ matrix.distro_label }}.txt"
 
       - name: Upload artifacts
