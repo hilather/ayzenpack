@@ -233,7 +233,7 @@ Spring Boot “fully executable” JARs (`spring-boot-maven-plugin` `executable:
 Detection uses no CLI flag. If the file does not start with ZIP magic, the prefix ends at the central directory's first local header (CD min local offset, or that offset after `zip -A` made it file-absolute) — not the first `PK\x03\x04` in the stub. Prefix bytes are `[0, first_real_lh)` within 16 MiB. Then try, in order:
 
 1. **Unadjusted** (Spring default): `ZipArchive` through `ZipView` shifted to the real first local header. ZIP offsets are relative to the ZIP start. This is what `file` sees after the script is deleted.
-2. **Adjusted** (`zip -A`): if that open fails, open the full file (no `ZipView` shift). CD and local-header offsets are already file-absolute.
+2. **Adjusted** (`zip -A`): if that open is rejected (see below), open the full file (no `ZipView` shift). CD and local-header offsets are already file-absolute.
 
 `ZipArchive::new` success is **not** enough. rust zip may latch onto a STORE nested EOCD when the view's CD offset is wrong (`zip -A` file-absolute offsets vs a prefix-shifted view). Accept a view only when `archive.len()` equals the homemade outer CD count (`find_cd_bounds` entry count) **and** `header_start + view_shift == prefix_len` (first local at the prefix). Nested `BOOT-INF/lib/*.jar` stay opaque.
 

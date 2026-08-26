@@ -1209,7 +1209,7 @@ mod tests {
     fn complete_inner_zip(i: u8) -> Vec<u8> {
         let mut z = ZipWriter::new(Cursor::new(Vec::new()));
         let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-        z.start_file(&format!("com/Lib{i}.class"), opts).unwrap();
+        z.start_file(format!("com/Lib{i}.class"), opts).unwrap();
         z.write_all(&[i; 2048]).unwrap();
         let bytes = z.finish().unwrap().into_inner();
         assert!(

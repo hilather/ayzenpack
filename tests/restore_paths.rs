@@ -313,7 +313,7 @@ fn restore_paths_overwrite_keeps_store_nested_zipa_entries() {
     write_fat_spring_store_nested_zipa_jar(&fat);
     write_jar(&classic, &[("x.txt", b"classic-plain")]);
     let fat_src = fs::read(&fat).unwrap();
-    let _classic_src = fs::read(&classic).unwrap();
+    let classic_src = fs::read(&classic).unwrap();
     let fat_n = ZipArchive::new(File::open(&fat).unwrap()).unwrap().len();
     let classic_n = ZipArchive::new(File::open(&classic).unwrap())
         .unwrap()
@@ -347,6 +347,15 @@ fn restore_paths_overwrite_keeps_store_nested_zipa_entries() {
         assert!(e.cdata_blob.is_none());
     }
     assert_eq!(fat_rec.entries.len(), fat_n);
+    assert!(fat_rec.entries.iter().any(|e| e.name == "App.class"));
+    assert_eq!(
+        fat_rec
+            .entries
+            .iter()
+            .filter(|e| e.name.starts_with("BOOT-INF/lib/"))
+            .count(),
+        2
+    );
 
     ayzenpack()
         .args(["rehydrate", "--restore-paths", "--overwrite", "-i"])
@@ -374,7 +383,6 @@ fn restore_paths_overwrite_keeps_store_nested_zipa_entries() {
     let mut zs = ZipArchive::new(std::io::Cursor::new(&fat_src)).unwrap();
     let mut zd = ZipArchive::new(std::io::Cursor::new(&fat_got)).unwrap();
     let mut src_names = Vec::new();
-    let mut dst_names = Vec::new();
     for i in 0..zs.len() {
         let mut e = zs.by_index(i).unwrap();
         src_names.push(e.name().to_string());
@@ -384,7 +392,6 @@ fn restore_paths_overwrite_keeps_store_nested_zipa_entries() {
         let mut a = Vec::new();
         e.read_to_end(&mut a).unwrap();
         let mut f = zd.by_name(src_names.last().unwrap()).unwrap();
-        dst_names.push(f.name().to_string());
         let mut b = Vec::new();
         f.read_to_end(&mut b).unwrap();
         assert_eq!(a, b, "uncompressed bytes {}", src_names.last().unwrap());
@@ -393,6 +400,18 @@ fn restore_paths_overwrite_keeps_store_nested_zipa_entries() {
         .map(|i| zd.by_index(i).unwrap().name().to_string())
         .collect();
     assert_eq!(src_names, dst_order);
+
+    let mut cs = ZipArchive::new(std::io::Cursor::new(&classic_src)).unwrap();
+    let mut cd = ZipArchive::new(std::io::Cursor::new(&classic_got)).unwrap();
+    assert_eq!(
+        cs.by_index(0).unwrap().name(),
+        cd.by_index(0).unwrap().name()
+    );
+    let mut a = Vec::new();
+    cs.by_index(0).unwrap().read_to_end(&mut a).unwrap();
+    let mut b = Vec::new();
+    cd.by_index(0).unwrap().read_to_end(&mut b).unwrap();
+    assert_eq!(a, b, "classic uncompressed bytes");
 }
 
 #[test]

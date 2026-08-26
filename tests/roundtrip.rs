@@ -1071,11 +1071,17 @@ fn store_nested_zipa_fat_is_outer_listing_tail_no_raw_zip() {
         );
     }
     assert!(
+        m.jars[0].entries.iter().any(|e| e.name == "App.class"),
+        "outer listing must include App.class"
+    );
+    assert_eq!(
         m.jars[0]
             .entries
             .iter()
-            .any(|e| e.name.starts_with("BOOT-INF/lib/")),
-        "outer listing must keep nested libs opaque"
+            .filter(|e| e.name.starts_with("BOOT-INF/lib/"))
+            .count(),
+        2,
+        "outer listing must keep both nested libs opaque"
     );
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
