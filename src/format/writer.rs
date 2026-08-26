@@ -254,7 +254,20 @@ impl<W: Write + Read + Seek> AyzWriter<W> {
             .and_then(|x| x.checked_add(toc_len))
             .and_then(|x| x.checked_add(TRAILER_LEN))
             .ok_or(AyzenpackError::Format("file length overflow"))?;
-        verify_finished_ayz(w.get_mut(), expected_len)?;
+        // Length only: `File::create` is write-only, so a trailer re-read can EBADF.
+        // Magic is checked by `verify_finished_ayz` on read+write handles (dehydrate tmp).
+        let pos = w.get_mut().stream_position().map_err(io_error)?;
+        let file_len = w.get_mut().seek(SeekFrom::End(0)).map_err(io_error)?;
+        if pos != file_len {
+            return Err(AyzenpackError::Format(
+                "stream position != written file length",
+            ));
+        }
+        if file_len != expected_len {
+            return Err(AyzenpackError::Format(
+                "file length != header_total + payload_bytes + toc_len + 64",
+            ));
+        }
         Ok((trailer, expected_len))
     }
 }

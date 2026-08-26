@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Seek, SeekFrom};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -15,7 +15,7 @@ use walkdir::WalkDir;
 
 use crate::error::{AyzenpackError, Result};
 use crate::exact::{capture_zip_exact, ExactLocal, ZipExact};
-use crate::format::{AyzWriter, FileHeader};
+use crate::format::{verify_finished_ayz, AyzWriter, FileHeader};
 use crate::hashutil::{hash_both, hex_lower};
 use crate::manifest::{Blob, Entry, Jar, Manifest, Stats, MANIFEST_FORMAT};
 use crate::scan::{for_each_jar_entry_with_len, ScannedEntry};
@@ -642,6 +642,14 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
             2,
         )?;
         debug_assert_eq!(trailer.manifest_len, manifest_len);
+        if let Some(p) = pending.as_ref() {
+            let mut f = File::open(&p.tmp).map_err(|source| AyzenpackError::Io {
+                source,
+                path: Some(p.tmp.clone()),
+            })?;
+            f.seek(SeekFrom::End(0)).map_err(crate::format::io_error)?;
+            verify_finished_ayz(&mut f, output_len)?;
+        }
         output_len
     } else {
         0
@@ -1211,7 +1219,7 @@ fn unix_now() -> u64 {
 mod tests {
     use super::*;
     use crate::format::{verify_finished_ayz, TRAILER_MAGIC};
-    use std::io::SeekFrom;
+    use std::io::{Seek, SeekFrom};
 
     #[test]
     fn jar_store_policy_covers_all_four_classes() {

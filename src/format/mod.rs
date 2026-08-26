@@ -33,7 +33,7 @@ pub const TRAILER_LEN: u64 = 64;
 const _: () = assert!(FILE_MAGIC[4] == FORMAT_VERSION);
 const _: () = assert!(FILE_MAGIC_V1[4] == FORMAT_VERSION_V1);
 const _: () = assert!(TRAILER_LEN == 64);
-const _: () = assert!(TOC_OVERHEAD + 0 == 28);
+const _: () = assert!(TOC_OVERHEAD == 28);
 const _: () = assert!(TOC_ENTRY_SIZE == 56);
 
 pub(crate) fn io_error(err: std::io::Error) -> AyzenpackError {
