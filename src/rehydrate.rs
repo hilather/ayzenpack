@@ -1,8 +1,9 @@
 //! Restore JARs from a `.ayz` archive.
 //!
-//! New packs store exact local records + CD tail (or a raw zip blob) and restore
-//! byte-identical files. Archives without those fields keep the 0.1.x `ZipWriter`
-//! path (functional identity). Prefix bytes are always bit-exact.
+//! New packs keep ZIP metadata (local headers + CD tail) and either splice a
+//! reproduced bitstream (`cdata_codec` / STORE / legacy `cdata_blob`) or rebuild
+//! a valid ZIP with patched sizes. Archives without those fields keep the 0.1.x
+//! `ZipWriter` path (functional identity). Prefix bytes are always bit-exact.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -12,7 +13,12 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime, ZipWriter};
 
 use crate::cas;
+use crate::deflate;
 use crate::error::{AyzenpackError, Result};
+use crate::exact::{
+    detect_offset_mode, encode_offset, patch_central_directory, patch_data_descriptor,
+    patch_eocd_cd_start, patch_local_compressed_size,
+};
 use crate::format::{read_header, read_record, read_trailer, Record};
 use crate::hashutil::{blake3_bytes, hash_reader, hex_lower, parse_blake3_hex, parse_hex};
 use crate::manifest::{Entry, Jar, Manifest, MANIFEST_FORMAT};
@@ -240,8 +246,10 @@ fn restore_jars(opts: &RehydrateOptions, manifest: &Manifest, cas_dir: &Path) ->
             eprintln!("ayzenpack: restoring {}", jar.name);
         }
         let apply_prefix_chmod = !(opts.restore_paths && jar.restore_mode.is_some());
-        if jar.exact_restore() {
+        if jar.bit_identical_restore() {
             write_exact_jar(jar, cas_dir, &dest, apply_prefix_chmod)?;
+        } else if jar.metadata_rebuild() {
+            write_rebuilt_jar(jar, cas_dir, &dest, apply_prefix_chmod)?;
         } else {
             write_jar(opts, jar, cas_dir, &dest, apply_prefix_chmod)?;
         }
@@ -536,10 +544,7 @@ fn write_exact_entry(
         ))
     })?;
     let header = load_local_header(jar, e, cas_dir)?;
-    let cdata = match &e.cdata_blob {
-        Some(hex) => read_named_blob(cas_dir, hex, &format!("{}!{} cdata", jar.name, e.name))?,
-        None => Vec::new(),
-    };
+    let cdata = resolve_cdata(jar, e, cas_dir, false)?;
     let desc = match &e.data_descriptor_hex {
         Some(h) => parse_hex(h)?,
         None => Vec::new(),
@@ -568,6 +573,172 @@ fn write_exact_entry(
         path: Some(dest.to_path_buf()),
     })?;
     write_pad(file, jar, e, cas_dir, dest)?;
+    Ok(())
+}
+
+/// `allow_rebuild` is never true on the exact splice path (step 4 is jar-level).
+fn resolve_cdata(jar: &Jar, e: &Entry, cas_dir: &Path, allow_rebuild: bool) -> Result<Vec<u8>> {
+    if let Some(hex) = &e.cdata_blob {
+        return read_named_blob(cas_dir, hex, &format!("{}!{} cdata", jar.name, e.name));
+    }
+    if let Some(codec) = &e.cdata_codec {
+        let level = deflate::parse_codec(codec)?;
+        // Empty DEFLATE directories have no content blob; encode `[]` at the recorded level.
+        let bytes = if e.is_dir && e.blob.is_none() {
+            Vec::new()
+        } else {
+            read_entry_content(jar, e, cas_dir)?
+        };
+        let out = deflate::deflate_raw(&bytes, level)?;
+        if out.len() as u64 != e.compressed_size {
+            return Err(AyzenpackError::HashMismatch(format!(
+                "{}!{} cdata_codec size: recorded {} computed {}",
+                jar.name,
+                e.name,
+                e.compressed_size,
+                out.len()
+            )));
+        }
+        return Ok(out);
+    }
+    if e.is_dir {
+        if allow_rebuild && e.method_code == 8 {
+            return deflate::deflate_raw(&[], deflate::rebuild_level());
+        }
+        return Ok(Vec::new());
+    }
+    if e.method_code == 0 {
+        return read_entry_content(jar, e, cas_dir);
+    }
+    if allow_rebuild && e.method_code == 8 {
+        let bytes = read_entry_content(jar, e, cas_dir)?;
+        return deflate::deflate_raw(&bytes, deflate::rebuild_level());
+    }
+    Err(AyzenpackError::FormatOwned(format!(
+        "missing cdata for {}!{} (no cdata_blob/cdata_codec)",
+        jar.name, e.name
+    )))
+}
+
+fn read_entry_content(jar: &Jar, e: &Entry, cas_dir: &Path) -> Result<Vec<u8>> {
+    let hex = e.blob.as_deref().ok_or_else(|| {
+        AyzenpackError::FormatOwned(format!("missing blob for {}!{}", jar.name, e.name))
+    })?;
+    read_named_blob(cas_dir, hex, &format!("{}!{}", jar.name, e.name))
+}
+
+fn write_rebuilt_jar(
+    jar: &Jar,
+    cas_dir: &Path,
+    dest: &Path,
+    apply_prefix_chmod: bool,
+) -> Result<()> {
+    let mut file = File::create(dest).map_err(|source| AyzenpackError::Io {
+        source,
+        path: Some(dest.to_path_buf()),
+    })?;
+    let prefix_len = write_prefix(jar, cas_dir, dest, &mut file)?;
+
+    let tail = match (&jar.tail_blob, jar.tail_size) {
+        (Some(hex), Some(sz)) => {
+            let bytes = read_named_blob(cas_dir, hex, &format!("{} tail", jar.name))?;
+            if bytes.len() as u64 != sz {
+                return Err(AyzenpackError::HashMismatch(format!(
+                    "{} tail size: recorded {sz} computed {}",
+                    jar.name,
+                    bytes.len()
+                )));
+            }
+            bytes
+        }
+        _ => {
+            return Err(AyzenpackError::FormatOwned(format!(
+                "rebuild jar {} missing tail_blob/tail_size",
+                jar.name
+            )));
+        }
+    };
+
+    if jar.entries.is_empty() {
+        file.write_all(&tail).map_err(|source| AyzenpackError::Io {
+            source,
+            path: Some(dest.to_path_buf()),
+        })?;
+        if prefix_len > 0 && apply_prefix_chmod {
+            chmod_executable(dest)?;
+        }
+        return Ok(());
+    }
+
+    for e in &jar.entries {
+        if e.method_code != 0 && e.method_code != 8 {
+            return Err(AyzenpackError::FormatOwned(format!(
+                "cannot rebuild {}!{} method {}",
+                jar.name, e.name, e.method_code
+            )));
+        }
+        if e.is_dir && (e.cdata_blob.is_some() || e.cdata_codec.is_some()) {
+            return Err(AyzenpackError::FormatOwned(format!(
+                "cannot rebuild {}!{}: directory has cdata_blob/cdata_codec",
+                jar.name, e.name
+            )));
+        }
+    }
+
+    let first_lh = jar.entries[0].local_header_offset.ok_or_else(|| {
+        AyzenpackError::FormatOwned(format!(
+            "missing local_header_offset for {}!{}",
+            jar.name, jar.entries[0].name
+        ))
+    })?;
+    let mode = detect_offset_mode(&tail, first_lh, prefix_len, &jar.name)?;
+
+    let mut locals = Vec::new();
+    let mut updates = Vec::with_capacity(jar.entries.len());
+    for e in &jar.entries {
+        let mut header = load_local_header(jar, e, cas_dir)?;
+        let cdata = resolve_cdata(jar, e, cas_dir, true)?;
+        patch_local_compressed_size(&mut header, cdata.len() as u64, &jar.name)?;
+        let desc = match &e.data_descriptor_hex {
+            Some(h) => Some(patch_data_descriptor(
+                &parse_hex(h)?,
+                cdata.len() as u64,
+                &jar.name,
+            )?),
+            None => None,
+        };
+        let zip_rel = locals.len() as u64;
+        updates.push((zip_rel, cdata.len() as u64));
+        locals.extend_from_slice(&header);
+        locals.extend_from_slice(&cdata);
+        if let Some(d) = &desc {
+            locals.extend_from_slice(d);
+        }
+    }
+
+    let mut new_tail = tail;
+    let cd_size = patch_central_directory(&mut new_tail, &updates, mode, prefix_len, &jar.name)?;
+    let new_cd_start = encode_offset(mode, locals.len() as u64, prefix_len);
+    patch_eocd_cd_start(&mut new_tail, cd_size, new_cd_start, &jar.name)?;
+
+    file.write_all(&locals)
+        .map_err(|source| AyzenpackError::Io {
+            source,
+            path: Some(dest.to_path_buf()),
+        })?;
+    file.write_all(&new_tail)
+        .map_err(|source| AyzenpackError::Io {
+            source,
+            path: Some(dest.to_path_buf()),
+        })?;
+    let total = prefix_len + locals.len() as u64 + new_tail.len() as u64;
+    file.set_len(total).map_err(|source| AyzenpackError::Io {
+        source,
+        path: Some(dest.to_path_buf()),
+    })?;
+    if prefix_len > 0 && apply_prefix_chmod {
+        chmod_executable(dest)?;
+    }
     Ok(())
 }
 

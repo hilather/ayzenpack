@@ -131,6 +131,10 @@
         "utf8_flag": { "type": "boolean" },
         "name_raw_hex": { "type": "string" },
         "cdata_blob": { "$ref": "#/$defs/hex64" },
+        "cdata_codec": {
+          "type": "string",
+          "pattern": "^deflate-raw:flate2:[1369]$"
+        },
         "local_header_offset": { "type": "integer", "minimum": 0 },
         "local_header_hex": { "type": "string", "pattern": "^([0-9a-f]{2})+$" },
         "local_header_blob": { "$ref": "#/$defs/hex64" },

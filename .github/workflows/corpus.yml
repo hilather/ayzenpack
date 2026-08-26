@@ -10,7 +10,7 @@ jobs:
   corpus:
     name: pinned-maven-corpus
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
@@ -36,6 +36,7 @@ jobs:
         run: cargo fetch --locked
       - name: cargo test corpus (dev profile)
         # Dev profile only: [profile.release] panic = abort breaks the harness.
+        # Includes corpus_mix_regular_and_spring_whole_file_hashes (whole-file blake3/sha256).
         run: cargo test --locked --test corpus -- --nocapture
         env:
           CARGO_NET_OFFLINE: "true"

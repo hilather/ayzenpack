@@ -14,11 +14,13 @@ use ayzenpack::hashutil::blake3_bytes;
 use ayzenpack::manifest::Manifest;
 use ayzenpack::{dehydrate, rehydrate, verify, DehydrateOptions, RehydrateOptions};
 use fixtures::{
-    spring_boot_launch_script, write_data_descriptor_zip, write_jar, write_jar_entries,
+    spring_boot_launch_script, write_data_descriptor_zip, write_deflate_miss_plus_dir_cdata,
+    write_deflate_miss_plus_empty_deflate_dir, write_jar, write_jar_entries,
     write_jar_with_comment, write_non_utf8_name_zip, write_padded_locals_zip,
-    write_signed_looking_jar, write_stored_jar_dos_zero, write_stored_zip, write_wrapped_jar,
-    write_wrapped_jar_adjusted, write_wrapped_zip64_jar, zip64_jar_bytes, JarEntry,
-    SPRING_LAUNCHER,
+    write_signed_looking_jar, write_store_file_plus_empty_deflate_dir,
+    write_stored_block_deflate_wrapped, write_stored_block_deflate_zip, write_stored_jar_dos_zero,
+    write_stored_zip, write_wrapped_jar, write_wrapped_jar_adjusted, write_wrapped_zip64_jar,
+    zip64_jar_bytes, JarEntry, SPRING_LAUNCHER,
 };
 use zip::{CompressionMethod, DateTime, ZipArchive};
 
@@ -1327,6 +1329,7 @@ fn strip_exact_fields(records: Vec<Record>) -> Vec<Record> {
         }
         for e in &mut jar.entries {
             e.cdata_blob = None;
+            e.cdata_codec = None;
             e.local_header_offset = None;
             e.local_header_hex = None;
             e.local_header_blob = None;
@@ -1471,7 +1474,7 @@ fn roundtrip_zipalign_padding_is_bit_identical() {
 }
 
 #[test]
-fn two_jars_share_nested_lib_cdata_blob() {
+fn two_jars_share_nested_lib_content_blob() {
     let dir = tempfile::tempdir().unwrap();
     let inner = dir.path().join("dep.jar");
     write_jar(&inner, &[("com/Dep.class", b"dep-bytes")]);
@@ -1495,29 +1498,20 @@ fn two_jars_share_nested_lib_cdata_blob() {
     let out = dir.path().join("out.ayz");
     dehydrate(&opts(&out, vec![a.clone(), b.clone()])).unwrap();
     let m = manifest_from_records(&read_archive(&out).2);
-    let ca = m.jars[0]
+    let ea = m.jars[0]
         .entries
         .iter()
         .find(|e| e.name == "BOOT-INF/lib/dep.jar")
-        .and_then(|e| e.cdata_blob.as_ref())
-        .expect("a cdata");
-    let cb = m.jars[1]
+        .expect("a dep");
+    let eb = m.jars[1]
         .entries
         .iter()
         .find(|e| e.name == "BOOT-INF/lib/dep.jar")
-        .and_then(|e| e.cdata_blob.as_ref())
-        .expect("b cdata");
-    assert_eq!(ca, cb);
-    let blob = m
-        .blobs
-        .iter()
-        .find(|b| b.blake3 == *ca)
-        .expect("cdata catalog");
-    assert!(
-        blob.ref_count >= 2,
-        "shared nested lib cdata ref_count, got {}",
-        blob.ref_count
-    );
+        .expect("b dep");
+    assert_eq!(ea.blob, eb.blob);
+    assert_eq!(ea.cdata_codec, eb.cdata_codec);
+    assert!(ea.cdata_blob.is_none());
+    assert!(eb.cdata_blob.is_none());
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
     assert_bit_identical(&a, &dest.join("app-a.jar"));
@@ -1571,9 +1565,20 @@ fn content_mode_archive_still_rehydrates_via_zipwriter() {
 fn exact_rehydrate_fails_if_cdata_blob_swapped() {
     let dir = tempfile::tempdir().unwrap();
     let jar = dir.path().join("two.jar");
-    write_jar(
+    write_jar_entries(
         &jar,
-        &[("a.txt", b"AAAA-payload"), ("b.txt", b"BBBB-payload")],
+        &[
+            JarEntry::File {
+                name: "a.txt",
+                data: b"AAAA-payload",
+                method: CompressionMethod::Stored,
+            },
+            JarEntry::File {
+                name: "b.txt",
+                data: b"BBBB-payload",
+                method: CompressionMethod::Stored,
+            },
+        ],
     );
     let out = dir.path().join("out.ayz");
     dehydrate(&opts(&out, vec![jar])).unwrap();
@@ -1587,10 +1592,11 @@ fn exact_rehydrate_fails_if_cdata_blob_swapped() {
             Record::Manifest { json } => {
                 let mut m: Manifest = serde_json::from_slice(&json).unwrap();
                 jar_count = m.jars.len() as u64;
-                let a = m.jars[0].entries[0].cdata_blob.clone().expect("cdata a");
-                let b = m.jars[0].entries[1].cdata_blob.clone().expect("cdata b");
+                let a = m.jars[0].entries[0].blob.clone().expect("blob a");
+                let b = m.jars[0].entries[1].blob.clone().expect("blob b");
                 assert_ne!(a, b);
                 m.jars[0].entries[0].cdata_blob = Some(b);
+                m.jars[0].entries[1].cdata_blob = Some(a);
                 new_records.push(Record::Manifest {
                     json: serde_json::to_vec(&m).unwrap(),
                 });
@@ -1607,6 +1613,261 @@ fn exact_rehydrate_fails_if_cdata_blob_swapped() {
     assert!(
         matches!(err, AyzenpackError::HashMismatch(_)),
         "swapped cdata must fail source hash check, got {err:?}"
+    );
+}
+
+#[test]
+fn store_uses_content_blob_not_cdata_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("stored.jar");
+    write_jar_entries(
+        &jar,
+        &[JarEntry::File {
+            name: "payload.bin",
+            data: b"store-me-once-only",
+            method: CompressionMethod::Stored,
+        }],
+    );
+    let out = dir.path().join("out.ayz");
+    let summary = dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    let e = &m.jars[0].entries[0];
+    assert!(e.cdata_blob.is_none(), "STORE must omit cdata_blob");
+    assert!(e.cdata_codec.is_none());
+    let content = e.blob.as_ref().expect("content blob");
+    let matches = m.blobs.iter().filter(|b| b.blake3 == *content).count();
+    assert_eq!(matches, 1);
+    assert!(
+        summary.bytes_unique_blobs < summary.bytes_in_jars,
+        "unique blobs must not include a second payload copy"
+    );
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_bit_identical(&jar, &dest.join("stored.jar"));
+}
+
+#[test]
+fn codec_hit_deflated_jar_is_bit_identical_without_cdata_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("plain.jar");
+    write_jar(&jar, &[("x.txt", b"hello-deflate-please")]);
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    let e = &m.jars[0].entries[0];
+    assert!(e.cdata_blob.is_none());
+    assert!(
+        e.cdata_codec
+            .as_deref()
+            .is_some_and(|c| c.starts_with("deflate-raw:flate2:")),
+        "zip-crate deflate must hit cdata_codec, got {:?}",
+        e.cdata_codec
+    );
+    assert!(m.jars[0].exact_restore());
+    assert!(!m.jars[0].metadata_rebuild());
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_bit_identical(&jar, &dest.join("plain.jar"));
+}
+
+#[test]
+fn codec_miss_rebuilds_valid_zip_keeping_extras() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("miss.jar");
+    let payload = vec![b'a'; 256];
+    write_stored_block_deflate_zip(&jar, "a.txt", &payload);
+    let src = fs::read(&jar).unwrap();
+    let out = dir.path().join("out.ayz");
+    let summary = dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    let e = &m.jars[0].entries[0];
+    assert!(e.cdata_blob.is_none());
+    assert!(e.cdata_codec.is_none());
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    assert!(m.jars[0].tail_blob.is_some());
+    assert!(m.jars[0].metadata_rebuild());
+    assert!(!m.jars[0].exact_restore());
+    assert!(
+        summary.bytes_unique_blobs < summary.bytes_in_jars,
+        "miss pack must not store a second payload copy"
+    );
+
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("miss.jar");
+    assert_functional_identity(&jar, &restored);
+    let got = fs::read(&restored).unwrap();
+    assert_ne!(src, got, "rebuild must change compressed sizes / file hash");
+    // ZipWriter fallback would rewrite extras; we keep the source local header
+    // (including whatever extra ZipWriter originally emitted) and only patch sizes.
+    assert_eq!(&got[4..14], &src[4..14], "version/flags/method/time stay");
+}
+
+#[test]
+fn codec_miss_with_prefix_rebuilds() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("prefixed-miss.jar");
+    let payload = vec![b'a'; 256];
+    write_stored_block_deflate_wrapped(&jar, SPRING_LAUNCHER, "a.txt", &payload);
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert!(m.jars[0].prefix_blob.is_some());
+    assert!(m.jars[0].metadata_rebuild());
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("prefixed-miss.jar");
+    assert_functional_identity(&jar, &restored);
+    let got = fs::read(&restored).unwrap();
+    assert_eq!(&got[..SPRING_LAUNCHER.len()], SPRING_LAUNCHER);
+    assert_ne!(fs::read(&jar).unwrap(), got);
+}
+
+#[test]
+fn old_style_cdata_blob_store_still_rehydrates() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("old.jar");
+    write_jar_entries(
+        &jar,
+        &[JarEntry::File {
+            name: "legacy.bin",
+            data: b"old-cdata-blob-path",
+            method: CompressionMethod::Stored,
+        }],
+    );
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+
+    let mut f = File::open(&out).unwrap();
+    let (header, _trailer, records) = read_ayz_file(&mut f).unwrap();
+    let mut new_records = Vec::new();
+    let mut jar_count = 0u64;
+    for rec in records {
+        match rec {
+            Record::Manifest { json } => {
+                let mut m: Manifest = serde_json::from_slice(&json).unwrap();
+                jar_count = m.jars.len() as u64;
+                let blob = m.jars[0].entries[0].blob.clone().expect("blob");
+                m.jars[0].entries[0].cdata_blob = Some(blob);
+                m.jars[0].entries[0].cdata_codec = None;
+                new_records.push(Record::Manifest {
+                    json: serde_json::to_vec(&m).unwrap(),
+                });
+            }
+            other => new_records.push(other),
+        }
+    }
+    let crafted = dir.path().join("old-style.ayz");
+    let mut w = File::create(&crafted).unwrap();
+    write_ayz_file(&mut w, &header, &new_records, jar_count).unwrap();
+    verify(&crafted).unwrap();
+
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&crafted, &dest)).unwrap();
+    assert_bit_identical(&jar, &dest.join("old.jar"));
+}
+
+#[test]
+fn store_plus_maven_empty_deflate_dir_is_bit_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("store-maven-dir.jar");
+    write_store_file_plus_empty_deflate_dir(&jar, "a.txt", b"hello-store");
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    let dir_ent = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.is_dir || e.name.ends_with('/'))
+        .expect("dir");
+    assert!(dir_ent.blob.is_none());
+    assert!(dir_ent.cdata_blob.is_none());
+    assert_eq!(
+        dir_ent.cdata_codec.as_deref(),
+        Some("deflate-raw:flate2:6"),
+        "empty DEFLATE dir must record codec, not a content blob"
+    );
+    assert!(m.jars[0].exact_restore());
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_bit_identical(&jar, &dest.join("store-maven-dir.jar"));
+}
+
+#[test]
+fn maven_empty_deflate_dir_does_not_force_cdata_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("maven-dirs.jar");
+    let payload = vec![b'a'; 256];
+    write_deflate_miss_plus_empty_deflate_dir(&jar, "a.txt", &payload);
+    let out = dir.path().join("out.ayz");
+    let summary = dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    for e in &m.jars[0].entries {
+        assert!(
+            e.cdata_blob.is_none(),
+            "{} must not store cdata_blob just because dirs are empty DEFLATE",
+            e.name
+        );
+        assert!(e.cdata_codec.is_none());
+    }
+    assert!(m.jars[0].metadata_rebuild());
+    assert!(
+        summary.bytes_unique_blobs < summary.bytes_in_jars + 4096,
+        "empty-deflate dirs must not store a second copy of every file payload"
+    );
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_functional_identity(&jar, &dest.join("maven-dirs.jar"));
+}
+
+#[test]
+fn class4_miss_plus_dir_cdata_keeps_cdata_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("class4.jar");
+    let payload = vec![b'a'; 256];
+    write_deflate_miss_plus_dir_cdata(&jar, "a.txt", &payload);
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()]))
+        .expect("class-4 fixture must be dehydratable (dir-with-cdata + stored-block miss)");
+    let m = manifest_from_records(&read_archive(&out).2);
+    let file = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.name == "a.txt")
+        .expect("file");
+    let dir_ent = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.is_dir || e.name.ends_with('/'))
+        .expect("dir");
+    assert!(file.cdata_blob.is_some(), "class 4 file keeps cdata_blob");
+    assert!(
+        dir_ent.cdata_blob.is_some(),
+        "class 4 dir-with-cdata keeps cdata_blob"
+    );
+    assert!(file.cdata_codec.is_none());
+    assert!(dir_ent.cdata_codec.is_none());
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    assert!(m.jars[0].exact_restore());
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_bit_identical(&jar, &dest.join("class4.jar"));
+}
+
+#[test]
+fn signed_rebuild_is_not_exact_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("signed-miss.jar");
+    let payload = vec![b'a'; 256];
+    write_stored_block_deflate_zip(&jar, "META-INF/FOO.SF", &payload);
+    let out = dir.path().join("out.ayz");
+    let summary = dehydrate(&opts(&out, vec![jar])).unwrap();
+    assert_eq!(summary.signed_jars, vec!["signed-miss.jar".to_string()]);
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert!(m.jars[0].signed);
+    assert!(
+        !m.jars[0].exact_restore(),
+        "signed + rebuild must use the existing rebuild-breaks-signature warning path"
     );
 }
 

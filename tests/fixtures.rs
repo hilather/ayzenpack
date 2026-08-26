@@ -95,8 +95,20 @@ fn wrapped_zip64_bytes(launcher: &[u8], files: &[(&str, &[u8])]) -> Vec<u8> {
     out
 }
 
+/// Prepend `launcher` to an existing ZIP/JAR. `zip_a` applies Info-ZIP `zip -A`
+/// (classic u32 CD/EOCD only — do not use on Zip64).
+pub fn prepend_launcher(zip: &[u8], launcher: &[u8], zip_a: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(launcher.len() + zip.len());
+    out.extend_from_slice(launcher);
+    out.extend_from_slice(zip);
+    if zip_a {
+        adjust_self_extracting_offsets(&mut out, u32::try_from(launcher.len()).unwrap());
+    }
+    out
+}
+
 /// Info-ZIP `zip -A`: CD/local offsets become file-absolute (include the stub).
-fn adjust_self_extracting_offsets(buf: &mut [u8], delta: u32) {
+pub fn adjust_self_extracting_offsets(buf: &mut [u8], delta: u32) {
     const EOCD_MIN: usize = 22;
     let eocd = {
         assert!(buf.len() >= EOCD_MIN);
@@ -416,6 +428,220 @@ pub fn write_signed_looking_jar(path: &Path) {
             ),
             ("META-INF/FOO.RSA", b"pkcs7-placeholder"),
             ("com/App.class", b"class-bytes"),
+        ],
+    );
+}
+
+/// Raw stored-block DEFLATE (RFC 1951). miniz_oxide levels 1/3/6/9 will not match
+/// this for a compressible payload (repeated bytes).
+pub fn raw_stored_deflate(plain: &[u8]) -> Vec<u8> {
+    let len = u16::try_from(plain.len()).expect("stored-block fixture payload fits u16");
+    let mut out = vec![0x01];
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&(!len).to_le_bytes());
+    out.extend_from_slice(plain);
+    out
+}
+
+struct BuiltLocal {
+    name: Vec<u8>,
+    method: u16,
+    crc: u32,
+    uncomp: u32,
+    cdata: Vec<u8>,
+    extra: Vec<u8>,
+}
+
+fn write_locals_and_cd(path: &Path, entries: &[BuiltLocal]) {
+    let mut local = Vec::new();
+    let mut central = Vec::new();
+    for e in entries {
+        let off = local.len() as u32;
+        local.extend_from_slice(b"PK\x03\x04");
+        local.extend_from_slice(&20u16.to_le_bytes());
+        local.extend_from_slice(&0u16.to_le_bytes());
+        local.extend_from_slice(&e.method.to_le_bytes());
+        local.extend_from_slice(&0u16.to_le_bytes());
+        local.extend_from_slice(&0u16.to_le_bytes());
+        local.extend_from_slice(&e.crc.to_le_bytes());
+        local.extend_from_slice(&(e.cdata.len() as u32).to_le_bytes());
+        local.extend_from_slice(&e.uncomp.to_le_bytes());
+        local.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
+        local.extend_from_slice(&(e.extra.len() as u16).to_le_bytes());
+        local.extend_from_slice(&e.name);
+        local.extend_from_slice(&e.extra);
+        local.extend_from_slice(&e.cdata);
+
+        central.extend_from_slice(b"PK\x01\x02");
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&e.method.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&e.crc.to_le_bytes());
+        central.extend_from_slice(&(e.cdata.len() as u32).to_le_bytes());
+        central.extend_from_slice(&e.uncomp.to_le_bytes());
+        central.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
+        central.extend_from_slice(&(e.extra.len() as u16).to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&off.to_le_bytes());
+        central.extend_from_slice(&e.name);
+        central.extend_from_slice(&e.extra);
+    }
+    let cd_off = local.len() as u32;
+    let cd_len = central.len() as u32;
+    let n = entries.len() as u16;
+    local.extend_from_slice(&central);
+    local.extend_from_slice(b"PK\x05\x06");
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(&n.to_le_bytes());
+    local.extend_from_slice(&n.to_le_bytes());
+    local.extend_from_slice(&cd_len.to_le_bytes());
+    local.extend_from_slice(&cd_off.to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    std::fs::write(path, local).unwrap();
+}
+
+/// Compressible payload + stored-block DEFLATE. Built from a ZipWriter template
+/// so zip 2.4 can find the EOCD; only the bitstream and sizes change.
+pub fn write_stored_block_deflate_zip(path: &Path, name: &str, data: &[u8]) {
+    let tmp = path.with_extension("tpl.jar");
+    {
+        let mut z = ZipWriter::new(File::create(&tmp).unwrap());
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        z.start_file(name, opts).unwrap();
+        z.write_all(data).unwrap();
+        z.finish().unwrap();
+    }
+    let tpl = std::fs::read(&tmp).unwrap();
+    std::fs::remove_file(&tmp).unwrap();
+    let patched = replace_first_cdata_with_stored_block(&tpl, data);
+    std::fs::write(path, patched).unwrap();
+}
+
+fn replace_first_cdata_with_stored_block(zip: &[u8], plain: &[u8]) -> Vec<u8> {
+    assert_eq!(&zip[..4], b"PK\x03\x04");
+    let name_len = u16::from_le_bytes([zip[26], zip[27]]) as usize;
+    let extra_len = u16::from_le_bytes([zip[28], zip[29]]) as usize;
+    let old_csize = u32::from_le_bytes(zip[18..22].try_into().unwrap()) as usize;
+    let header_end = 30 + name_len + extra_len;
+    let old_end = header_end + old_csize;
+    let new_cdata = raw_stored_deflate(plain);
+    let delta = new_cdata.len() as i64 - old_csize as i64;
+
+    let mut out = Vec::with_capacity((zip.len() as i64 + delta) as usize);
+    out.extend_from_slice(&zip[..18]);
+    out.extend_from_slice(&(new_cdata.len() as u32).to_le_bytes());
+    out.extend_from_slice(&zip[22..header_end]);
+    out.extend_from_slice(&new_cdata);
+    out.extend_from_slice(&zip[old_end..]);
+
+    // Patch CD compressed size and EOCD CD offset.
+    let eocd = {
+        let mut i = out.len() - 22;
+        loop {
+            if out[i..i + 4] == *b"PK\x05\x06" {
+                break i;
+            }
+            i -= 1;
+        }
+    };
+    let old_cd = u32::from_le_bytes(out[eocd + 16..eocd + 20].try_into().unwrap());
+    let new_cd = (old_cd as i64 + delta) as u32;
+    out[eocd + 16..eocd + 20].copy_from_slice(&new_cd.to_le_bytes());
+    let i = new_cd as usize;
+    out[i + 20..i + 24].copy_from_slice(&(new_cdata.len() as u32).to_le_bytes());
+    out
+}
+
+pub fn write_stored_block_deflate_wrapped(path: &Path, launcher: &[u8], name: &str, data: &[u8]) {
+    let tmp = path.with_extension("inner.jar");
+    write_stored_block_deflate_zip(&tmp, name, data);
+    let zip = std::fs::read(&tmp).unwrap();
+    std::fs::remove_file(&tmp).unwrap();
+    let mut out = launcher.to_vec();
+    out.extend_from_slice(&zip);
+    std::fs::write(path, out).unwrap();
+}
+
+/// STORE file plus a Maven-style empty DEFLATE directory (`03 00`).
+pub fn write_store_file_plus_empty_deflate_dir(path: &Path, name: &str, data: &[u8]) {
+    write_locals_and_cd(
+        path,
+        &[
+            BuiltLocal {
+                name: name.as_bytes().to_vec(),
+                method: 0,
+                crc: crc32fast::hash(data),
+                uncomp: data.len() as u32,
+                cdata: data.to_vec(),
+                extra: Vec::new(),
+            },
+            BuiltLocal {
+                name: b"META-INF/".to_vec(),
+                method: 8,
+                crc: 0,
+                uncomp: 0,
+                cdata: vec![0x03, 0x00],
+                extra: Vec::new(),
+            },
+        ],
+    );
+}
+
+/// Stored-block DEFLATE file plus a Maven-style empty DEFLATE directory (`03 00`).
+pub fn write_deflate_miss_plus_empty_deflate_dir(path: &Path, name: &str, data: &[u8]) {
+    let cdata = raw_stored_deflate(data);
+    write_locals_and_cd(
+        path,
+        &[
+            BuiltLocal {
+                name: name.as_bytes().to_vec(),
+                method: 8,
+                crc: crc32fast::hash(data),
+                uncomp: data.len() as u32,
+                cdata,
+                extra: Vec::new(),
+            },
+            BuiltLocal {
+                name: b"META-INF/".to_vec(),
+                method: 8,
+                crc: 0,
+                uncomp: 0,
+                cdata: vec![0x03, 0x00],
+                extra: Vec::new(),
+            },
+        ],
+    );
+}
+
+/// Stored-block DEFLATE file plus a directory whose local record has non-empty cdata.
+pub fn write_deflate_miss_plus_dir_cdata(path: &Path, name: &str, data: &[u8]) {
+    let cdata = raw_stored_deflate(data);
+    write_locals_and_cd(
+        path,
+        &[
+            BuiltLocal {
+                name: name.as_bytes().to_vec(),
+                method: 8,
+                crc: crc32fast::hash(data),
+                uncomp: data.len() as u32,
+                cdata,
+                extra: Vec::new(),
+            },
+            BuiltLocal {
+                name: b"marked/".to_vec(),
+                method: 0,
+                crc: 0,
+                uncomp: 4,
+                cdata: b"DIRC".to_vec(),
+                extra: Vec::new(),
+            },
         ],
     );
 }

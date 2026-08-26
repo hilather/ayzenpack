@@ -12,12 +12,15 @@ use std::path::Path;
 use crate::error::{AyzenpackError, Result};
 use crate::scan::{detect_zip_layout, find_cd_bounds, find_eocd, io_at, ZipLayout};
 
-const LOCAL_FILE_MAGIC: [u8; 4] = *b"PK\x03\x04";
-const CD_MAGIC: [u8; 4] = *b"PK\x01\x02";
-const DATA_DESC_MAGIC: [u8; 4] = *b"PK\x07\x08";
-const ZIP64_EXTRA_ID: u16 = 0x0001;
+pub(crate) const LOCAL_FILE_MAGIC: [u8; 4] = *b"PK\x03\x04";
+pub(crate) const CD_MAGIC: [u8; 4] = *b"PK\x01\x02";
+pub(crate) const DATA_DESC_MAGIC: [u8; 4] = *b"PK\x07\x08";
+pub(crate) const EOCD_MAGIC: [u8; 4] = *b"PK\x05\x06";
+pub(crate) const ZIP64_LOCATOR_MAGIC: [u8; 4] = *b"PK\x06\x07";
+pub(crate) const ZIP64_EOCD_MAGIC: [u8; 4] = *b"PK\x06\x06";
+pub(crate) const ZIP64_EXTRA_ID: u16 = 0x0001;
 const GPBF_ENCRYPTED: u16 = 0x0001;
-const GPBF_DATA_DESC: u16 = 0x0008;
+pub(crate) const GPBF_DATA_DESC: u16 = 0x0008;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExactLocal {
@@ -226,7 +229,7 @@ fn cd_offset_to_zip_rel(recorded: u64, layout: &ZipLayout) -> Option<u64> {
     }
 }
 
-fn resolve_cd_zip64(
+pub(crate) fn resolve_cd_zip64(
     extra: &[u8],
     uncomp32: u32,
     comp32: u32,
@@ -275,7 +278,7 @@ fn resolve_cd_zip64(
     Some((uncomp, comp, off, disk))
 }
 
-fn find_extra(extra: &[u8], id: u16) -> Option<&[u8]> {
+pub(crate) fn find_extra(extra: &[u8], id: u16) -> Option<&[u8]> {
     let mut i = 0usize;
     while i + 4 <= extra.len() {
         let tag = u16::from_le_bytes(extra[i..i + 2].try_into().ok()?);
@@ -385,7 +388,7 @@ fn read_local(
     })
 }
 
-fn split_descriptor(
+pub(crate) fn split_descriptor(
     after: &[u8],
     crc: u32,
     zip64_likely: bool,
@@ -426,6 +429,384 @@ fn slice_fail(path: &Path, why: &str) -> AyzenpackError {
         "exact zip slice failed for {}: {why}",
         path.display()
     ))
+}
+
+/// First CD record's resolved local-header offset (ZIP- or file-relative as stored).
+pub(crate) fn first_cd_local_offset(tail: &[u8]) -> Option<u64> {
+    if tail.len() < 46 || tail[..4] != CD_MAGIC {
+        return None;
+    }
+    let uncomp32 = u32::from_le_bytes(tail[24..28].try_into().ok()?);
+    let comp32 = u32::from_le_bytes(tail[20..24].try_into().ok()?);
+    let off32 = u32::from_le_bytes(tail[42..46].try_into().ok()?);
+    let disk16 = u16::from_le_bytes(tail[34..36].try_into().ok()?);
+    let name_len = u16::from_le_bytes(tail[28..30].try_into().ok()?) as usize;
+    let extra_len = u16::from_le_bytes(tail[30..32].try_into().ok()?) as usize;
+    if 46 + name_len + extra_len > tail.len() {
+        return None;
+    }
+    let extra = &tail[46 + name_len..46 + name_len + extra_len];
+    let (_u, _c, off, _d) = resolve_cd_zip64(extra, uncomp32, comp32, off32, disk16)?;
+    Some(off)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OffsetMode {
+    ZipRel,
+    FileAbs,
+}
+
+pub(crate) fn detect_offset_mode(
+    tail: &[u8],
+    first_local: u64,
+    prefix_len: u64,
+    jar_name: &str,
+) -> Result<OffsetMode> {
+    let cd_off = first_cd_local_offset(tail).ok_or_else(|| {
+        AyzenpackError::FormatOwned(format!("{jar_name}: cannot read first CD local offset"))
+    })?;
+    if cd_off == first_local {
+        Ok(OffsetMode::ZipRel)
+    } else if prefix_len > 0 && cd_off == prefix_len + first_local {
+        Ok(OffsetMode::FileAbs)
+    } else {
+        Err(AyzenpackError::FormatOwned(format!(
+            "{jar_name}: CD local offset {cd_off} matches neither zip-rel {first_local} nor file-abs {}",
+            prefix_len + first_local
+        )))
+    }
+}
+
+pub(crate) fn encode_offset(mode: OffsetMode, zip_rel: u64, prefix_len: u64) -> u64 {
+    match mode {
+        OffsetMode::ZipRel => zip_rel,
+        OffsetMode::FileAbs => prefix_len + zip_rel,
+    }
+}
+
+/// Patch compressed size + local offset on each CD record. Returns CD byte length.
+pub(crate) fn patch_central_directory(
+    tail: &mut [u8],
+    updates: &[(u64, u64)],
+    mode: OffsetMode,
+    prefix_len: u64,
+    jar_name: &str,
+) -> Result<usize> {
+    let mut i = 0usize;
+    for (idx, &(new_zip_rel, new_csize)) in updates.iter().enumerate() {
+        if i + 46 > tail.len() || tail[i..i + 4] != CD_MAGIC {
+            return Err(AyzenpackError::FormatOwned(format!(
+                "{jar_name}: CD record {idx} missing"
+            )));
+        }
+        let name_len = u16::from_le_bytes([tail[i + 28], tail[i + 29]]) as usize;
+        let extra_len = u16::from_le_bytes([tail[i + 30], tail[i + 31]]) as usize;
+        let comment_len = u16::from_le_bytes([tail[i + 32], tail[i + 33]]) as usize;
+        let rec_end = i
+            .checked_add(46)
+            .and_then(|n| n.checked_add(name_len))
+            .and_then(|n| n.checked_add(extra_len))
+            .and_then(|n| n.checked_add(comment_len))
+            .ok_or_else(|| AyzenpackError::FormatOwned(format!("{jar_name}: CD overflow")))?;
+        if rec_end > tail.len() {
+            return Err(AyzenpackError::FormatOwned(format!(
+                "{jar_name}: CD record {idx} truncated"
+            )));
+        }
+        let extra_start = 46 + name_len;
+        let rec = &mut tail[i..rec_end];
+        let comp32 = u32::from_le_bytes(rec[20..24].try_into().unwrap());
+        let uncomp32 = u32::from_le_bytes(rec[24..28].try_into().unwrap());
+        let off32 = u32::from_le_bytes(rec[42..46].try_into().unwrap());
+        let new_off = encode_offset(mode, new_zip_rel, prefix_len);
+        let (head, rest) = rec.split_at_mut(extra_start);
+        let extra = &mut rest[..extra_len];
+        patch_size32_or_zip64(
+            &mut head[20..24],
+            extra,
+            uncomp32,
+            comp32,
+            new_csize,
+            SizeSlot::Compressed,
+            jar_name,
+        )?;
+        patch_offset32_or_zip64(
+            &mut head[42..46],
+            extra,
+            uncomp32,
+            comp32,
+            off32,
+            new_off,
+            jar_name,
+        )?;
+        i = rec_end;
+    }
+    Ok(i)
+}
+
+enum SizeSlot {
+    Compressed,
+}
+
+fn patch_size32_or_zip64(
+    field32: &mut [u8],
+    extra: &mut [u8],
+    uncomp32: u32,
+    comp32: u32,
+    new_val: u64,
+    slot: SizeSlot,
+    jar_name: &str,
+) -> Result<()> {
+    let _ = slot;
+    if comp32 == u32::MAX {
+        patch_zip64_u64(extra, uncomp32 == u32::MAX, true, false, new_val, jar_name)?;
+        return Ok(());
+    }
+    if new_val > u64::from(u32::MAX) {
+        return Err(AyzenpackError::FormatOwned(format!(
+            "{jar_name}: compressed size {new_val} needs Zip64 extra the source did not have"
+        )));
+    }
+    field32.copy_from_slice(&(new_val as u32).to_le_bytes());
+    Ok(())
+}
+
+fn patch_offset32_or_zip64(
+    field32: &mut [u8],
+    extra: &mut [u8],
+    uncomp32: u32,
+    comp32: u32,
+    off32: u32,
+    new_off: u64,
+    jar_name: &str,
+) -> Result<()> {
+    if off32 == u32::MAX {
+        patch_zip64_u64(
+            extra,
+            uncomp32 == u32::MAX,
+            comp32 == u32::MAX,
+            true,
+            new_off,
+            jar_name,
+        )?;
+        return Ok(());
+    }
+    if new_off > u64::from(u32::MAX) {
+        return Err(AyzenpackError::FormatOwned(format!(
+            "{jar_name}: local offset {new_off} needs Zip64 extra the source did not have"
+        )));
+    }
+    field32.copy_from_slice(&(new_off as u32).to_le_bytes());
+    Ok(())
+}
+
+/// Write `value` into the Zip64 extra slot selected by which 32-bit fields were sentinels.
+fn patch_zip64_u64(
+    extra: &mut [u8],
+    has_uncomp: bool,
+    has_comp: bool,
+    has_off: bool,
+    value: u64,
+    jar_name: &str,
+) -> Result<()> {
+    let mut i = 0usize;
+    while i + 4 <= extra.len() {
+        let tag = u16::from_le_bytes(extra[i..i + 2].try_into().unwrap());
+        let size = u16::from_le_bytes(extra[i + 2..i + 4].try_into().unwrap()) as usize;
+        let start = i + 4;
+        let end = start
+            .checked_add(size)
+            .ok_or_else(|| AyzenpackError::FormatOwned(format!("{jar_name}: Zip64 extra")))?;
+        if end > extra.len() {
+            return Err(AyzenpackError::FormatOwned(format!(
+                "{jar_name}: truncated Zip64 extra"
+            )));
+        }
+        if tag == ZIP64_EXTRA_ID {
+            let mut off = 0usize;
+            if has_uncomp {
+                off += 8;
+            }
+            if has_comp && !has_off {
+                if off + 8 > size {
+                    return Err(AyzenpackError::FormatOwned(format!(
+                        "{jar_name}: Zip64 extra missing compressed size"
+                    )));
+                }
+                extra[start + off..start + off + 8].copy_from_slice(&value.to_le_bytes());
+                return Ok(());
+            }
+            if has_comp {
+                off += 8;
+            }
+            if has_off {
+                if off + 8 > size {
+                    return Err(AyzenpackError::FormatOwned(format!(
+                        "{jar_name}: Zip64 extra missing offset"
+                    )));
+                }
+                extra[start + off..start + off + 8].copy_from_slice(&value.to_le_bytes());
+                return Ok(());
+            }
+            return Err(AyzenpackError::FormatOwned(format!(
+                "{jar_name}: Zip64 extra has no matching slot"
+            )));
+        }
+        i = end;
+    }
+    Err(AyzenpackError::FormatOwned(format!(
+        "{jar_name}: missing Zip64 extra 0x0001"
+    )))
+}
+
+pub(crate) fn patch_local_compressed_size(
+    header: &mut [u8],
+    new_csize: u64,
+    jar_name: &str,
+) -> Result<()> {
+    if header.len() < 30 {
+        return Err(AyzenpackError::FormatOwned(format!(
+            "{jar_name}: local header too short"
+        )));
+    }
+    let flags = u16::from_le_bytes([header[6], header[7]]);
+    if flags & GPBF_DATA_DESC != 0 {
+        return Ok(());
+    }
+    let comp32 = u32::from_le_bytes(header[18..22].try_into().unwrap());
+    let uncomp32 = u32::from_le_bytes(header[22..26].try_into().unwrap());
+    let name_len = u16::from_le_bytes([header[26], header[27]]) as usize;
+    let extra_len = u16::from_le_bytes([header[28], header[29]]) as usize;
+    if 30 + name_len + extra_len != header.len() {
+        return Err(AyzenpackError::FormatOwned(format!(
+            "{jar_name}: local header extra length mismatch"
+        )));
+    }
+    let extra = &mut header[30 + name_len..];
+    if comp32 == u32::MAX {
+        patch_zip64_u64(
+            extra,
+            uncomp32 == u32::MAX,
+            true,
+            false,
+            new_csize,
+            jar_name,
+        )?;
+        return Ok(());
+    }
+    if new_csize > u64::from(u32::MAX) {
+        return Err(AyzenpackError::FormatOwned(format!(
+            "{jar_name}: compressed size {new_csize} needs Zip64 extra the source did not have"
+        )));
+    }
+    header[18..22].copy_from_slice(&(new_csize as u32).to_le_bytes());
+    Ok(())
+}
+
+pub(crate) fn patch_data_descriptor(
+    desc: &[u8],
+    new_csize: u64,
+    jar_name: &str,
+) -> Result<Vec<u8>> {
+    let mut d = desc.to_vec();
+    let has_sig = d.starts_with(&DATA_DESC_MAGIC);
+    let crc_off = if has_sig { 4 } else { 0 };
+    let csize_off = crc_off + 4;
+    match d.len() {
+        12 | 16 => {
+            if new_csize > u64::from(u32::MAX) {
+                return Err(AyzenpackError::FormatOwned(format!(
+                    "{jar_name}: descriptor compressed size does not fit u32"
+                )));
+            }
+            d[csize_off..csize_off + 4].copy_from_slice(&(new_csize as u32).to_le_bytes());
+        }
+        20 | 24 => {
+            d[csize_off..csize_off + 8].copy_from_slice(&new_csize.to_le_bytes());
+        }
+        _ => {
+            return Err(AyzenpackError::FormatOwned(format!(
+                "{jar_name}: unsupported data descriptor length {}",
+                d.len()
+            )));
+        }
+    }
+    Ok(d)
+}
+
+/// Patch classic EOCD (and Zip64 EOCD + locator) CD start after locals change length.
+pub(crate) fn patch_eocd_cd_start(
+    tail: &mut [u8],
+    cd_size: usize,
+    new_cd_start_encoded: u64,
+    jar_name: &str,
+) -> Result<()> {
+    let eocd = find_eocd_in(tail).ok_or_else(|| {
+        AyzenpackError::FormatOwned(format!("{jar_name}: rebuild tail missing EOCD"))
+    })?;
+    let cd_off32 = u32::from_le_bytes(tail[eocd + 16..eocd + 20].try_into().unwrap());
+    if cd_off32 != u32::MAX {
+        if new_cd_start_encoded > u64::from(u32::MAX) {
+            return Err(AyzenpackError::FormatOwned(format!(
+                "{jar_name}: new CD offset does not fit classic EOCD"
+            )));
+        }
+        tail[eocd + 16..eocd + 20].copy_from_slice(&(new_cd_start_encoded as u32).to_le_bytes());
+    }
+    if eocd >= 20 && tail[eocd - 20..eocd][..4] == ZIP64_LOCATOR_MAGIC {
+        let loc = eocd - 20;
+        let zip64_eocd_encoded = new_cd_start_encoded + cd_size as u64;
+        tail[loc + 8..loc + 16].copy_from_slice(&zip64_eocd_encoded.to_le_bytes());
+        // Zip64 EOCD immediately precedes the locator when the record size matches.
+        if loc >= 56 && tail[loc - 56..loc - 52] == ZIP64_EOCD_MAGIC {
+            let z64 = loc - 56;
+            tail[z64 + 48..z64 + 56].copy_from_slice(&new_cd_start_encoded.to_le_bytes());
+        } else {
+            // Variable-length Zip64 EOCD: scan backward for magic whose record ends at loc.
+            let mut found = false;
+            let mut i = loc.saturating_sub(56);
+            loop {
+                if tail[i..i + 4] == ZIP64_EOCD_MAGIC {
+                    let rec_size = u64::from_le_bytes(tail[i + 4..i + 12].try_into().unwrap());
+                    let rec_len = 12u64.saturating_add(rec_size);
+                    if i as u64 + rec_len == loc as u64 {
+                        tail[i + 48..i + 56].copy_from_slice(&new_cd_start_encoded.to_le_bytes());
+                        found = true;
+                        break;
+                    }
+                }
+                if i == 0 {
+                    break;
+                }
+                i -= 1;
+            }
+            if !found {
+                return Err(AyzenpackError::FormatOwned(format!(
+                    "{jar_name}: Zip64 locator without Zip64 EOCD"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn find_eocd_in(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 22 {
+        return None;
+    }
+    let mut i = buf.len() - 22;
+    loop {
+        if buf[i..i + 4] == EOCD_MAGIC {
+            let comment_len = u16::from_le_bytes([buf[i + 20], buf[i + 21]]) as usize;
+            if i + 22 + comment_len == buf.len() {
+                return Some(i);
+            }
+        }
+        if i == 0 {
+            return None;
+        }
+        i -= 1;
+    }
 }
 
 #[cfg(test)]

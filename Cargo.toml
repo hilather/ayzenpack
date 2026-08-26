@@ -1,6 +1,6 @@
 [package]
 name = "ayzenpack"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
@@ -49,6 +49,9 @@ walkdir = "2.5"
 # 2.2.x is yanked; 2.4.2 is the last 2.4 (crate MSRV 1.73).
 zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
 zstd = "0.13"
+# Already in the tree via zip 2.4.2 (miniz_oxide rust_backend). Direct pin for raw deflate.
+# Do not enable zlib / zlib-ng (C backend, different bitstream).
+flate2 = "=1.1.9"
 
 [dev-dependencies]
 # 2.1.3+ is edition 2024 / MSRV 1.85; 2.1.2 deprecates cargo_bin under clippy -D.

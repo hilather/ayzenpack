@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cas;
+mod deflate;
 pub mod dehydrate;
 pub mod error;
 mod exact;
@@ -174,29 +175,28 @@ pub fn verify(input: &Path) -> Result<()> {
             }
         }
         for e in &jar.entries {
-            if e.is_dir {
-                continue;
-            }
-            let hex = e.blob.as_deref().ok_or_else(|| {
-                AyzenpackError::HashMismatch(format!("{}!{} missing blob id", jar.name, e.name))
-            })?;
-            let hash = parse_blake3_hex(hex)?;
-            let data = payloads.get(&hash).ok_or_else(|| {
-                AyzenpackError::HashMismatch(format!(
-                    "missing blob {} for {}!{}",
-                    hex_prefix(&hash),
-                    jar.name,
-                    e.name
-                ))
-            })?;
-            let crc = crc32fast::hash(data);
-            if crc != e.crc32 {
-                return Err(AyzenpackError::HashMismatch(format!(
-                    "blob {} {}!{} crc32",
-                    hex_prefix(&hash),
-                    jar.name,
-                    e.name
-                )));
+            if !e.is_dir {
+                let hex = e.blob.as_deref().ok_or_else(|| {
+                    AyzenpackError::HashMismatch(format!("{}!{} missing blob id", jar.name, e.name))
+                })?;
+                let hash = parse_blake3_hex(hex)?;
+                let data = payloads.get(&hash).ok_or_else(|| {
+                    AyzenpackError::HashMismatch(format!(
+                        "missing blob {} for {}!{}",
+                        hex_prefix(&hash),
+                        jar.name,
+                        e.name
+                    ))
+                })?;
+                let crc = crc32fast::hash(data);
+                if crc != e.crc32 {
+                    return Err(AyzenpackError::HashMismatch(format!(
+                        "blob {} {}!{} crc32",
+                        hex_prefix(&hash),
+                        jar.name,
+                        e.name
+                    )));
+                }
             }
             for hex in [
                 e.cdata_blob.as_deref(),

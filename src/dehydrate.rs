@@ -910,6 +910,7 @@ fn entry_from_scan(meta: &ScannedEntry, blob: Option<String>, sha256: Option<Str
         utf8_flag: meta.utf8_flag,
         name_raw_hex: meta.name_raw_hex.clone(),
         cdata_blob: None,
+        cdata_codec: None,
         local_header_offset: None,
         local_header_hex: None,
         local_header_blob: None,
@@ -922,8 +923,20 @@ fn entry_from_scan(meta: &ScannedEntry, blob: Option<String>, sha256: Option<Str
 fn attach_exact(sink: &mut BlobSink<'_>, path: &Path, jar: &mut Jar) -> Result<()> {
     match capture_zip_exact(path)? {
         ZipExact::Sliced(slice) if slice.locals.len() == jar.entries.len() => {
-            for (entry, local) in jar.entries.iter_mut().zip(slice.locals.iter()) {
-                fill_exact_entry(sink, entry, local)?;
+            let classes: Vec<LocalClass> = jar
+                .entries
+                .iter()
+                .zip(slice.locals.iter())
+                .map(|(entry, local)| classify_local(entry, local))
+                .collect();
+            let policy = jar_store_policy(&classes);
+            for ((entry, local), class) in jar
+                .entries
+                .iter_mut()
+                .zip(slice.locals.iter())
+                .zip(classes.iter())
+            {
+                fill_exact_entry(sink, entry, local, policy, *class)?;
             }
             let (b3, s256) = hash_both(&slice.tail);
             remember_blob(sink, &slice.tail, b3, s256)?;
@@ -980,7 +993,88 @@ fn read_zip_after_prefix(path: &Path, prefix_len: u64) -> Result<Vec<u8>> {
     Ok(zip)
 }
 
-fn fill_exact_entry(sink: &mut BlobSink<'_>, entry: &mut Entry, local: &ExactLocal) -> Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalClass {
+    EmptyDir,
+    Store,
+    DeflateHit(u32),
+    DeflateMiss,
+    Unreproducible,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StorePolicy {
+    /// STORE + codec hits only.
+    CleanExact,
+    /// Hits keep codec; unreproducible entries keep `cdata_blob`.
+    ExactWithExotic,
+    /// Whole-jar metadata rebuild; no cdata copy/codec.
+    CleanMiss,
+    /// Miss + unreproducible sibling: `cdata_blob` on DEFLATE and unreproducible.
+    MixedExact,
+}
+
+fn classify_local(entry: &Entry, local: &ExactLocal) -> LocalClass {
+    if entry.is_dir {
+        if local.cdata.is_empty() {
+            return LocalClass::EmptyDir;
+        }
+        // Maven/Java commonly DEFLATE empty directories (`03 00`, usize 0).
+        // That is not exotic payload — trial-encode like a file. A directory
+        // with actual uncompressed bytes stays unreproducible (class 4).
+        if entry.uncompressed_size != 0 || entry.method_code != 8 {
+            return LocalClass::Unreproducible;
+        }
+    } else if entry.method_code == 0 {
+        let Some(blob) = entry.blob.as_deref() else {
+            return LocalClass::Unreproducible;
+        };
+        let (b3, _) = hash_both(&local.cdata);
+        if hex_lower(&b3) == blob {
+            return LocalClass::Store;
+        }
+        return LocalClass::Unreproducible;
+    }
+    if entry.method_code != 8 {
+        return LocalClass::Unreproducible;
+    }
+    let Ok(plain) = crate::deflate::inflate_raw(&local.cdata) else {
+        return LocalClass::Unreproducible;
+    };
+    if plain.len() as u64 != entry.uncompressed_size || crc32fast::hash(&plain) != entry.crc32 {
+        return LocalClass::Unreproducible;
+    }
+    if local.header.len() < 8 {
+        return LocalClass::Unreproducible;
+    }
+    let flags = u16::from_le_bytes([local.header[6], local.header[7]]);
+    match crate::deflate::match_deflate(&plain, &local.cdata, flags) {
+        Ok(Some(level)) => LocalClass::DeflateHit(level),
+        Ok(None) => LocalClass::DeflateMiss,
+        Err(_) => LocalClass::Unreproducible,
+    }
+}
+
+fn jar_store_policy(classes: &[LocalClass]) -> StorePolicy {
+    let unreproducible = classes
+        .iter()
+        .any(|c| matches!(c, LocalClass::Unreproducible));
+    let deflate_miss = classes.iter().any(|c| matches!(c, LocalClass::DeflateMiss));
+    match (deflate_miss, unreproducible) {
+        (false, false) => StorePolicy::CleanExact,
+        (false, true) => StorePolicy::ExactWithExotic,
+        (true, false) => StorePolicy::CleanMiss,
+        (true, true) => StorePolicy::MixedExact,
+    }
+}
+
+fn fill_exact_entry(
+    sink: &mut BlobSink<'_>,
+    entry: &mut Entry,
+    local: &ExactLocal,
+    policy: StorePolicy,
+    class: LocalClass,
+) -> Result<()> {
     entry.local_header_offset = Some(local.zip_rel_offset);
     if local.header.len() <= HEX_INLINE_MAX {
         entry.local_header_hex = Some(hex_lower(&local.header));
@@ -989,10 +1083,23 @@ fn fill_exact_entry(sink: &mut BlobSink<'_>, entry: &mut Entry, local: &ExactLoc
         remember_blob(sink, &local.header, b3, s256)?;
         entry.local_header_blob = Some(hex_lower(&b3));
     }
-    if !entry.is_dir || !local.cdata.is_empty() {
+    let store_cdata = matches!(
+        (policy, class),
+        (StorePolicy::ExactWithExotic, LocalClass::Unreproducible)
+            | (StorePolicy::MixedExact, LocalClass::Unreproducible)
+            | (StorePolicy::MixedExact, LocalClass::DeflateHit(_))
+            | (StorePolicy::MixedExact, LocalClass::DeflateMiss)
+    );
+    if store_cdata {
         let (b3, s256) = hash_both(&local.cdata);
         remember_blob(sink, &local.cdata, b3, s256)?;
         entry.cdata_blob = Some(hex_lower(&b3));
+    } else if let (
+        StorePolicy::CleanExact | StorePolicy::ExactWithExotic,
+        LocalClass::DeflateHit(level),
+    ) = (policy, class)
+    {
+        entry.cdata_codec = Some(crate::deflate::codec_string(level));
     }
     if let Some(desc) = &local.descriptor {
         entry.data_descriptor_hex = Some(hex_lower(desc));
@@ -1214,6 +1321,192 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jar_store_policy_covers_all_four_classes() {
+        assert_eq!(
+            jar_store_policy(&[LocalClass::Store, LocalClass::DeflateHit(6)]),
+            StorePolicy::CleanExact
+        );
+        assert_eq!(
+            jar_store_policy(&[LocalClass::DeflateHit(6), LocalClass::Unreproducible]),
+            StorePolicy::ExactWithExotic
+        );
+        assert_eq!(
+            jar_store_policy(&[LocalClass::DeflateHit(6), LocalClass::DeflateMiss]),
+            StorePolicy::CleanMiss
+        );
+        assert_eq!(
+            jar_store_policy(&[LocalClass::DeflateMiss, LocalClass::Unreproducible]),
+            StorePolicy::MixedExact
+        );
+    }
+
+    #[test]
+    fn classify_empty_deflate_dir_is_hit_or_miss_not_unreproducible() {
+        let cdata = crate::deflate::deflate_raw(&[], 6).unwrap();
+        let mut header = vec![0u8; 30];
+        header[0..4].copy_from_slice(b"PK\x03\x04");
+        header[8..10].copy_from_slice(&8u16.to_le_bytes());
+        let entry = Entry {
+            name: "META-INF/".into(),
+            is_dir: true,
+            blob: None,
+            sha256: None,
+            crc32: crc32fast::hash(&[]),
+            method: "deflated".into(),
+            method_code: 8,
+            uncompressed_size: 0,
+            compressed_size: cdata.len() as u64,
+            dos_date: 0,
+            dos_time: 0,
+            unix_mode: None,
+            utf8_flag: true,
+            name_raw_hex: None,
+            cdata_blob: None,
+            cdata_codec: None,
+            local_header_offset: None,
+            local_header_hex: None,
+            local_header_blob: None,
+            data_descriptor_hex: None,
+            pad_zeros: None,
+            pad_blob: None,
+        };
+        let local = ExactLocal {
+            zip_rel_offset: 0,
+            header,
+            cdata,
+            descriptor: None,
+            pad: Vec::new(),
+        };
+        assert_eq!(classify_local(&entry, &local), LocalClass::DeflateHit(6));
+    }
+
+    #[test]
+    fn classify_java_empty_deflate_dir_is_codec_hit() {
+        // Common Maven bitstream for an empty directory: raw empty deflate `03 00`.
+        // miniz_oxide level 6 matches that, so these dirs must not become Unreproducible.
+        let cdata = vec![0x03, 0x00];
+        let mut header = vec![0u8; 30];
+        header[0..4].copy_from_slice(b"PK\x03\x04");
+        header[8..10].copy_from_slice(&8u16.to_le_bytes());
+        let entry = Entry {
+            name: "com/".into(),
+            is_dir: true,
+            blob: None,
+            sha256: None,
+            crc32: 0,
+            method: "deflated".into(),
+            method_code: 8,
+            uncompressed_size: 0,
+            compressed_size: 2,
+            dos_date: 0,
+            dos_time: 0,
+            unix_mode: None,
+            utf8_flag: true,
+            name_raw_hex: None,
+            cdata_blob: None,
+            cdata_codec: None,
+            local_header_offset: None,
+            local_header_hex: None,
+            local_header_blob: None,
+            data_descriptor_hex: None,
+            pad_zeros: None,
+            pad_blob: None,
+        };
+        let local = ExactLocal {
+            zip_rel_offset: 0,
+            header,
+            cdata,
+            descriptor: None,
+            pad: Vec::new(),
+        };
+        assert_eq!(classify_local(&entry, &local), LocalClass::DeflateHit(6));
+    }
+
+    #[test]
+    fn classify_dir_with_cdata_is_unreproducible() {
+        let entry = Entry {
+            name: "d/".into(),
+            is_dir: true,
+            blob: None,
+            sha256: None,
+            crc32: 0,
+            method: "stored".into(),
+            method_code: 0,
+            uncompressed_size: 4,
+            compressed_size: 4,
+            dos_date: 0,
+            dos_time: 0,
+            unix_mode: None,
+            utf8_flag: true,
+            name_raw_hex: None,
+            cdata_blob: None,
+            cdata_codec: None,
+            local_header_offset: None,
+            local_header_hex: None,
+            local_header_blob: None,
+            data_descriptor_hex: None,
+            pad_zeros: None,
+            pad_blob: None,
+        };
+        let local = ExactLocal {
+            zip_rel_offset: 0,
+            header: vec![0; 30],
+            cdata: b"deco".to_vec(),
+            descriptor: None,
+            pad: Vec::new(),
+        };
+        assert_eq!(classify_local(&entry, &local), LocalClass::Unreproducible);
+    }
+
+    #[test]
+    fn classify_stored_block_deflate_is_miss() {
+        let plain = vec![b'a'; 256];
+        let cdata = {
+            let len = u16::try_from(plain.len()).unwrap();
+            let mut out = vec![0x01];
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(!len).to_le_bytes());
+            out.extend_from_slice(&plain);
+            out
+        };
+        let mut header = vec![0u8; 30];
+        header[0..4].copy_from_slice(b"PK\x03\x04");
+        header[8..10].copy_from_slice(&8u16.to_le_bytes());
+        let entry = Entry {
+            name: "a.txt".into(),
+            is_dir: false,
+            blob: Some("unused".into()),
+            sha256: None,
+            crc32: crc32fast::hash(&plain),
+            method: "deflated".into(),
+            method_code: 8,
+            uncompressed_size: plain.len() as u64,
+            compressed_size: cdata.len() as u64,
+            dos_date: 0,
+            dos_time: 0,
+            unix_mode: None,
+            utf8_flag: true,
+            name_raw_hex: None,
+            cdata_blob: None,
+            cdata_codec: None,
+            local_header_offset: None,
+            local_header_hex: None,
+            local_header_blob: None,
+            data_descriptor_hex: None,
+            pad_zeros: None,
+            pad_blob: None,
+        };
+        let local = ExactLocal {
+            zip_rel_offset: 0,
+            header,
+            cdata,
+            descriptor: None,
+            pad: Vec::new(),
+        };
+        assert_eq!(classify_local(&entry, &local), LocalClass::DeflateMiss);
+    }
 
     #[test]
     fn unique_basename_collides_to_underscore_n() {

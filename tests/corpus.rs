@@ -8,8 +8,12 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use ayzenpack::hashutil::{hash_reader, hex_lower};
 use ayzenpack::{dehydrate, list, rehydrate, verify, DehydrateOptions, RehydrateOptions};
 use zip::ZipArchive;
+
+#[path = "fixtures.rs"]
+mod fixtures;
 
 const LOCK_JSON: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ci/corpus.lock.json"));
 const DOWNLOAD_SH: &str = include_str!(concat!(
@@ -258,8 +262,8 @@ fn corpus_yml_linux_timeout_cache_dev_profile() {
         "corpus.yml must not run on Windows"
     );
     assert!(
-        CORPUS_YML.contains("timeout-minutes: 20"),
-        "corpus job timeout-minutes must be 20"
+        CORPUS_YML.contains("timeout-minutes: 25"),
+        "corpus job timeout-minutes must be 25"
     );
     assert!(
         CORPUS_YML.contains("hashFiles('ci/corpus.lock.json')"),
@@ -405,4 +409,202 @@ fn corpus_guava_copies_unique_blobs_eq_one_jar_file_entries() {
         "content blobs for duplicated guava copies must equal one JAR's file-entry count"
     );
     assert!(summary.unique_blob_count >= one_jar_files);
+}
+
+/// Regular Maven JARs + official launch.script wraps (unadjusted, zip -A, Zip64 nested-lib).
+/// Whole-file blake3/sha256 is the bit-identical gate. Proven codec-miss rebuilds may
+/// change the file hash but must still be a valid ZIP with matching entry bytes.
+#[test]
+fn corpus_mix_regular_and_spring_whole_file_hashes() {
+    let Some(corpus) = corpus_dir() else {
+        eprintln!(
+            "skipping corpus_mix_regular_and_spring_whole_file_hashes: AYZENPACK_CORPUS_DIR not set"
+        );
+        return;
+    };
+    assert!(
+        corpus.is_dir(),
+        "AYZENPACK_CORPUS_DIR={} is not a directory",
+        corpus.display()
+    );
+
+    let launcher = fixtures::spring_boot_launch_script();
+    assert!(
+        launcher.starts_with(b"#!/bin/bash"),
+        "official launch.script must be a bash prefix"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mix = tmp.path().join("mix");
+    fs::create_dir_all(&mix).unwrap();
+
+    let regular = [
+        ("failureaccess-1.0.2.jar", "plain-failureaccess.jar"),
+        ("slf4j-api-2.0.16.jar", "plain-slf4j.jar"),
+        (
+            "jackson-annotations-2.17.2.jar",
+            "plain-jackson-annotations.jar",
+        ),
+    ];
+    for (src_name, dest_name) in regular {
+        let src = corpus.join(src_name);
+        assert!(src.is_file(), "missing pinned artifact {}", src.display());
+        fs::copy(&src, mix.join(dest_name)).unwrap();
+    }
+
+    let jackson_core = fs::read(corpus.join("jackson-core-2.17.2.jar")).unwrap();
+    fs::write(
+        mix.join("spring-jackson-core.jar"),
+        fixtures::prepend_launcher(&jackson_core, launcher, false),
+    )
+    .unwrap();
+
+    let slf4j = fs::read(corpus.join("slf4j-api-2.0.16.jar")).unwrap();
+    fs::write(
+        mix.join("spring-zipa-slf4j.jar"),
+        fixtures::prepend_launcher(&slf4j, launcher, true),
+    )
+    .unwrap();
+
+    let failureaccess = fs::read(corpus.join("failureaccess-1.0.2.jar")).unwrap();
+    fixtures::write_wrapped_zip64_jar(
+        &mix.join("spring-zip64-nested.jar"),
+        launcher,
+        &[
+            ("BOOT-INF/lib/failureaccess.jar", failureaccess.as_slice()),
+            ("App.class", b"zip64-app"),
+        ],
+    );
+
+    let out = tmp.path().join("mix.ayz");
+    let restored = tmp.path().join("restored");
+    let summary = dehydrate(&dehydrate_opts(&out, vec![mix.clone()])).unwrap();
+    assert_eq!(summary.jar_count, 6, "mix must pack all six members");
+    verify(&out).unwrap();
+    rehydrate(&rehydrate_opts(&out, &restored)).unwrap();
+    let manifest = list(&out).unwrap();
+    assert_eq!(manifest.jars.len(), 6);
+    let names: BTreeMap<_, _> = manifest
+        .jars
+        .iter()
+        .map(|j| (j.name.as_str(), ()))
+        .collect();
+    for expected in [
+        "plain-failureaccess.jar",
+        "plain-slf4j.jar",
+        "plain-jackson-annotations.jar",
+        "spring-jackson-core.jar",
+        "spring-zipa-slf4j.jar",
+        "spring-zip64-nested.jar",
+    ] {
+        assert!(
+            names.contains_key(expected),
+            "mix missing {expected}; got {:?}",
+            manifest.jars.iter().map(|j| &j.name).collect::<Vec<_>>()
+        );
+    }
+
+    let mut codec_hit = 0u64;
+    let mut codec_miss = 0u64;
+    let mut cdata_blob = 0u64;
+    let mut hash_match = 0u64;
+    let mut hash_mismatch_proven_miss = 0u64;
+    for jar in &manifest.jars {
+        for e in &jar.entries {
+            if e.is_dir || e.method_code != 8 {
+                continue;
+            }
+            if e.cdata_codec.is_some() {
+                codec_hit += 1;
+            } else if e.cdata_blob.is_some() {
+                cdata_blob += 1;
+            } else {
+                codec_miss += 1;
+            }
+        }
+        let src = PathBuf::from(&jar.source_path);
+        let dest = restored.join(&jar.name);
+        assert!(src.is_file(), "source {}", src.display());
+        assert!(dest.is_file(), "restored {}", dest.display());
+        let (src_b3, src_sha) = hash_reader(File::open(&src).unwrap()).unwrap();
+        let (dest_b3, dest_sha) = hash_reader(File::open(&dest).unwrap()).unwrap();
+        println!(
+            "hash {} identical={} bit_identical={} rebuild={} raw_zip={} blake3 {} -> {} sha256 {} -> {}",
+            jar.name,
+            src_b3 == dest_b3 && src_sha == dest_sha,
+            jar.bit_identical_restore(),
+            jar.metadata_rebuild(),
+            jar.raw_zip_blob.is_some(),
+            hex_lower(&src_b3),
+            hex_lower(&dest_b3),
+            hex_lower(&src_sha),
+            hex_lower(&dest_sha)
+        );
+        let hashes_eq = src_b3 == dest_b3 && src_sha == dest_sha;
+        if jar.name == "spring-zip64-nested.jar" {
+            assert!(
+                jar.bit_identical_restore(),
+                "zip-crate Zip64 fat must be bit-identical, not rebuild"
+            );
+            assert!(hashes_eq, "Zip64 nested-lib fat whole-file hash must match");
+        }
+        if jar.bit_identical_restore() {
+            assert!(
+                hashes_eq,
+                "{} is bit_identical_restore but blake3/sha256 changed",
+                jar.name
+            );
+            hash_match += 1;
+            continue;
+        }
+        assert!(
+            jar.metadata_rebuild(),
+            "{} hash mismatch must be metadata_rebuild (got neither exact nor rebuild)",
+            jar.name
+        );
+        let proven_miss = jar.entries.iter().all(|e| {
+            e.is_dir || e.method_code != 8 || (e.cdata_codec.is_none() && e.cdata_blob.is_none())
+        });
+        assert!(
+            proven_miss,
+            "{} is not bit-identical but a method-8 file still has cdata_codec/cdata_blob (codec not proven miss)",
+            jar.name
+        );
+        assert_functional_identity(&src, &dest);
+        if jar.prefix_size.unwrap_or(0) > 0 {
+            let dest_bytes = fs::read(&dest).unwrap();
+            assert!(
+                dest_bytes.starts_with(launcher),
+                "{} must keep official launch.script prefix",
+                jar.name
+            );
+        }
+        if hashes_eq {
+            hash_match += 1;
+        } else {
+            hash_mismatch_proven_miss += 1;
+        }
+    }
+
+    println!(
+        "mix stats jars={} bytes_in_jars={} unique_blobs={} ayz={} ratio={:.4} codec_hit={} codec_miss={} cdata_blob={} hash_match={} hash_mismatch_proven_miss={}",
+        summary.jar_count,
+        summary.bytes_in_jars,
+        summary.bytes_unique_blobs,
+        summary.output_len,
+        summary.output_len as f64 / summary.bytes_in_jars.max(1) as f64,
+        codec_hit,
+        codec_miss,
+        cdata_blob,
+        hash_match,
+        hash_mismatch_proven_miss
+    );
+    assert!(
+        hash_match >= 1,
+        "mix must include at least the Zip64 fat as a hash match"
+    );
+    assert!(
+        summary.output_len < summary.bytes_in_jars * 3,
+        "mix .ayz must not balloon toward cdata-full"
+    );
 }
