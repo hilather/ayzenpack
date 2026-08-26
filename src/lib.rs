@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
-use crate::format::read_ayz_file;
+use crate::format::{read_ayz_file, read_manifest_records};
 use crate::hashutil::{blake3_bytes, hex_lower, parse_blake3_hex, sha256_bytes};
 use crate::manifest::MANIFEST_FORMAT;
 
@@ -51,9 +51,13 @@ fn hex_prefix(hash: &[u8; 32]) -> String {
     hex.get(..12).unwrap_or(hex.as_str()).to_string()
 }
 
-/// Read the MANIFEST. v1 always decompresses the zstd payload (no trailer-only listing).
+/// Read the MANIFEST. v1 decompresses the full zstd payload; v2 seeks the last frame via the TOC.
 pub fn list(input: &Path) -> Result<Manifest> {
-    let (_header, _trailer, records) = open_ayz(input)?;
+    let mut file = File::open(input).map_err(|source| AyzenpackError::Io {
+        source,
+        path: Some(input.to_path_buf()),
+    })?;
+    let (_layout, records) = read_manifest_records(&mut file)?;
     manifest_from_records(&records)
 }
 

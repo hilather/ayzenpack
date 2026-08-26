@@ -199,7 +199,7 @@ fn run_job(path: &Path) -> anyhow::Result<()> {
 }
 ```
 
-`list()` is the other “state load”: it reads the MANIFEST out of the archive. Use that when the catalog *is* the state, not a YAML file you authored.
+`list()` is the other “state load”: it reads the MANIFEST out of the archive (v2: last zstd frame via the TOC; v1: full payload decode). Use that when the catalog *is* the state, not a YAML file you authored.
 
 ```rust
 let manifest = ayzenpack::list(std::path::Path::new("libs.ayz"))?;

@@ -587,9 +587,10 @@ fn corpus_mix_regular_and_spring_whole_file_hashes() {
     }
 
     println!(
-        "mix stats jars={} bytes_in_jars={} unique_blobs={} ayz={} ratio={:.4} codec_hit={} codec_miss={} cdata_blob={} hash_match={} hash_mismatch_proven_miss={}",
+        "mix stats jars={} bytes_in_jars={} unique_blob_count={} bytes_unique_blobs={} ayz={} ratio={:.4} codec_hit={} codec_miss={} cdata_blob={} hash_match={} hash_mismatch_proven_miss={}",
         summary.jar_count,
         summary.bytes_in_jars,
+        summary.unique_blob_count,
         summary.bytes_unique_blobs,
         summary.output_len,
         summary.output_len as f64 / summary.bytes_in_jars.max(1) as f64,
@@ -606,5 +607,12 @@ fn corpus_mix_regular_and_spring_whole_file_hashes() {
     assert!(
         summary.output_len < summary.bytes_in_jars * 3,
         "mix .ayz must not balloon toward cdata-full"
+    );
+    const MIX_V019_BYTES: u64 = 569539;
+    assert!(
+        summary.output_len <= MIX_V019_BYTES * 115 / 100,
+        "mix output_len {} exceeds 569539 * 115/100 ({})",
+        summary.output_len,
+        MIX_V019_BYTES * 115 / 100
     );
 }

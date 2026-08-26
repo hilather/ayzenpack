@@ -1,6 +1,6 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use super::{io_error, map_truncated, TRAILER_LEN, TRAILER_MAGIC};
+use super::{io_error, map_truncated, supported_write_version, TRAILER_LEN, TRAILER_MAGIC};
 use crate::error::{AyzenpackError, Result};
 
 const ZIP_LOCAL: &[u8] = b"PK\x03\x04";
@@ -27,6 +27,8 @@ pub struct Trailer {
     pub jar_count: u64,
     pub header_len: u32,
     pub version: u32,
+    /// v1: 0. v2: encoded TOC length (`28+n*56`).
+    pub toc_len: u64,
 }
 
 impl Trailer {
@@ -40,6 +42,7 @@ impl Trailer {
         buf[40..48].copy_from_slice(&self.jar_count.to_le_bytes());
         buf[48..52].copy_from_slice(&self.header_len.to_le_bytes());
         buf[52..56].copy_from_slice(&self.version.to_le_bytes());
+        buf[56..64].copy_from_slice(&self.toc_len.to_le_bytes());
         buf
     }
 
@@ -48,7 +51,7 @@ impl Trailer {
             return Err(invalid_trailer_error(buf, &[]));
         }
         let version = u32_le(buf, 52);
-        if version != 1 {
+        if !supported_write_version(version) {
             return Err(AyzenpackError::Format("unsupported trailer version"));
         }
         Ok(Self {
@@ -59,6 +62,7 @@ impl Trailer {
             jar_count: u64_le(buf, 40),
             header_len: u32_le(buf, 48),
             version,
+            toc_len: u64_le(buf, 56),
         })
     }
 
@@ -267,5 +271,22 @@ mod tests {
             );
             assert_eq!(err.to_string(), "truncated trailer");
         }
+    }
+
+    #[test]
+    fn v2_trailer_roundtrips_toc_len() {
+        let t = Trailer {
+            payload_bytes: 10,
+            manifest_len: 20,
+            blob_count: 1,
+            blob_bytes: 4,
+            jar_count: 1,
+            header_len: 80,
+            version: 2,
+            toc_len: 28,
+        };
+        let bytes = t.to_bytes();
+        assert_eq!(&bytes[56..64], &28u64.to_le_bytes());
+        assert_eq!(Trailer::from_bytes(&bytes).unwrap(), t);
     }
 }

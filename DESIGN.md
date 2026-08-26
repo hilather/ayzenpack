@@ -1,14 +1,14 @@
 # Design
 
-ayzenpack dehydrates a set of JAR/ZIP/WAR/EAR files into one `.ayz` archive and rehydrates them. Dedup is **BLAKE3 of uncompressed entry bytes**. The container is a single file: uncompressed header, one zstd frame of records, uncompressed 64-byte trailer.
+ayzenpack dehydrates a set of JAR/ZIP/WAR/EAR files into one `.ayz` archive and rehydrates them. Dedup is **BLAKE3 of uncompressed entry bytes**. New packs are **format v2**: uncompressed header, record-aligned zstd BLOB groups, a final zstd frame of MANIFEST+END, an uncompressed TOC, and a 64-byte trailer. v1 files (one zstd frame, no TOC) still read and rehydrate.
 
-This is the v1 format and library contract. CLI flag names live in `src/cli.rs` and the README.
+This is the v2 format and library contract. CLI flag names live in `src/cli.rs` and the README. Manifest JSON field names are unchanged from v1.
 
 | | |
 |---|---|
 | Binary / crate | `ayzenpack` |
 | Extension | `.ayz` (recommended; magic identifies the file) |
-| File magic | `AYZP\x01\x00\x00\x00` |
+| File magic | `AYZP\x02\x00\x00\x00` (v1: `AYZP\x01\x00\x00\x00`) |
 | Trailer magic | `AYZPTLR1` |
 | Manifest `format` | `ayzenpack-manifest` |
 | MSRV | Rust 1.80, edition 2021, stable only |
@@ -21,7 +21,7 @@ This is the v1 format and library contract. CLI flag names live in `src/cli.rs` 
 
 A set of application classpaths repeats the same `.class` and resource bytes tens or hundreds of times. `tar`/`zip` of a `lib/` directory does not content-dedup across archives. Exploding JARs to a class forest is slow, huge, and drops ZIP metadata (order, DOS time, CRC).
 
-Storing **uncompressed** entry bytes into **one zstd frame** usually beats concatenating already-deflated ZIP members: DEFLATE is not a concatenable input for a second compressor. Identical class files across JARs collapse to one BLOB. The manifest is inside the archive so rehydrate is one file in, N JARs out.
+Storing **uncompressed** entry bytes into **zstd frames** usually beats concatenating already-deflated ZIP members: DEFLATE is not a concatenable input for a second compressor. Identical class files across JARs collapse to one BLOB. The manifest is inside the archive so rehydrate is one file in, N JARs out. v2 groups BLOBs into record-aligned frames (flush at 4 MiB uncompressed BLOB record bytes) so `list` can seek the last frame via the TOC instead of decoding every blob.
 
 The tool never unpacks JARs to a forest of `.class` files, never talks to the network, and contains no `unsafe`.
 
@@ -36,10 +36,10 @@ JARs  →  zip::ZipArchive by_index
       →  first-seen? write BLOB : bump ref_count
       →  append ZipEntry metadata to Manifest
       →  compact MANIFEST + END
-      →  zstd frame + trailer
+      →  zstd BLOB frames + MANIFEST/END frame + TOC + trailer
 ```
 
-Rehydrate seeks the trailer, decodes the zstd frame into a content-addressed directory (`xx/yy/hex`), then rebuilds each JAR with `ZipWriter`.
+Rehydrate seeks the trailer, decodes every zstd frame in `payload_bytes` into a content-addressed directory (`xx/yy/hex`), then rebuilds each JAR. `list` on v2 seeks `header_total + manifest_zstd_off` and decodes only that last frame (`REC_MANIFEST` + JSON + `REC_END`).
 
 Scan is sequential (central-directory order). `--jobs` hashes on a pool; a single writer emits BLOBs in first-seen order so END digest and `blobs[]` stay deterministic. `--sort-inputs` archives are byte-identical at any `--jobs`.
 
@@ -54,34 +54,41 @@ Little-endian. No protobuf. Manual length-prefixed records.
 │  FileHeader (uncompressed)                  │
 │    magic[8]  header_len:u32  header_json    │
 ├─────────────────────────────────────────────┤
-│  zstd frame (one standard frame)            │
-│    Record*   type:u8 + payload              │
+│  zstd frames (v2): record-aligned BLOB      │
+│    groups, flush at 4 MiB uncompressed      │
+│    BLOB record bytes                        │
+├─────────────────────────────────────────────┤
+│  final zstd frame: MANIFEST + END only      │
+├─────────────────────────────────────────────┤
+│  TOC (uncompressed) AYZPTOC2                │
 ├─────────────────────────────────────────────┤
 │  Trailer (uncompressed, last 64 bytes)      │
 └─────────────────────────────────────────────┘
 ```
 
+v1 is one zstd frame of BLOB* + MANIFEST + END and no TOC (`toc_len = 0`). An empty v2 pack (no BLOBs) is **one** zstd frame of MANIFEST+END; do not append MANIFEST onto a partial blob frame.
+
 ### File header
 
 | Offset | Size | Field |
 |--------|------|--------|
-| 0 | 8 | `AYZP\x01\x00\x00\x00` |
+| 0 | 8 | `AYZP{ver}\0\0\0` derived from `header.version` |
 | 8 | 4 | `header_len` u32le |
 | 12 | `header_len` | UTF-8 JSON, no NUL pad |
 
-Unknown header keys are ignored. Version byte (offset 4) `> 1` is `unsupported version`. Version `0` is invalid.
+Unknown header keys are ignored. Write versions `{1,2}`. Read: `magic[0..4]==AYZP`, `magic[4]∈{1,2}`, `magic[5..8]==0`, and `header.version == u32::from(magic[4]) == trailer.version`. Version `0` is invalid. Version byte `> 2` is `unsupported version`. Magic / JSON / trailer disagreement is `VersionSkew` (the file is still an ayzenpack file).
 
 ```json
 {
   "format": "ayzenpack",
-  "version": 1,
+  "version": 2,
   "hash": "blake3",
   "sha256": true,
   "mode": "content",
   "zstd_level": 3,
   "created_unix": 1710000000,
   "tool": "ayzenpack",
-  "tool_version": "0.1.9"
+  "tool_version": "0.2.0"
 }
 ```
 
@@ -95,25 +102,37 @@ Unknown header keys are ignored. Version byte (offset 4) `> 1` is `unsupported v
 | `0x02` | MANIFEST | `size:u64le + json[size]` |
 | `0x03` | END | `blake3[32]` of concat(first-seen blob hashes) |
 
-BLOBs before MANIFEST. Exactly one MANIFEST. Exactly one END, last. Empty blobs are valid. Duplicate BLAKE3 BLOBs are not written. Unknown type bytes error.
+BLOBs before MANIFEST. Exactly one MANIFEST. Exactly one END, last. Empty blobs are valid. Duplicate BLAKE3 BLOBs are not written. Unknown type bytes error. Default is **grouped** frames, not per-blob frames.
+
+### TOC (v2, uncompressed)
+
+```
+"AYZPTOC2" n:u32le
+n × { blake3[32], zstd_off:u64le, zstd_len:u64le, rec_off:u64le }
+manifest_zstd_off:u64le  manifest_zstd_len:u64le
+```
+
+Length = `28 + n*56`. Offsets are **payload-relative** (0 = first zstd byte after the header). `manifest_zstd_len` is the compressed last-frame size — never a copy of `Trailer.manifest_len` (uncompressed JSON). Pending `{blake3,zstd_off,rec_off}` during a frame; back-fill `zstd_len` after `Encoder::finish` + `BufWriter::flush`.
 
 ### Trailer (64 bytes at EOF)
 
 | Off | Size | Field |
 |-----|------|--------|
 | 0 | 8 | `AYZPTLR1` |
-| 8 | 8 | `payload_bytes` — zstd frame size |
-| 16 | 8 | `manifest_len` |
+| 8 | 8 | `payload_bytes` — sum of zstd frames only |
+| 16 | 8 | `manifest_len` (uncompressed JSON) |
 | 24 | 8 | `blob_count` |
 | 32 | 8 | `blob_bytes` — sum of uncompressed blob sizes |
 | 40 | 8 | `jar_count` |
 | 48 | 4 | `header_len` (repeat) |
-| 52 | 4 | `version` = 1 |
-| 56 | 8 | reserved, zero |
+| 52 | 4 | `version` = 1 or 2 |
+| 56 | 8 | v1: reserved zero. v2: `toc_len` u64le |
 
-`payload_bytes` is measured **after** `Encoder::finish()` + `BufWriter::flush()`, **before** the trailer is written: `file_len - header_total`. Never write the trailer to a raw `File` while the `BufWriter` still holds zstd bytes.
+`payload_bytes` is the sum of finished zstd frames, each measured **after** `Encoder::finish()` + `BufWriter::flush()`. `file_len = header_total + payload_bytes + toc_len + 64`. `header_total` is `12+header_len` / `stream_position` after `read_header`.
 
-Reader: `seek(End(-64))`, parse trailer, `seek(Start(0))`, parse header, decode the middle as one zstd frame of length `payload_bytes`.
+Read invariant (checked-sub): `expected_toc = file_len - 64 - header_total - payload_bytes` and `trailer.toc_len == expected_toc`. v1: `toc_len == 0`. v2: `toc_len == 28+n*56` and `>= 28`.
+
+Reader: `seek(End(-64))`, parse trailer, `seek(Start(0))`, parse header, check versions + `toc_len`, `take(payload_bytes)`. v1: `.single_frame()`. v2: multi-frame (no `single_frame`).
 
 ---
 
@@ -273,12 +292,14 @@ Treat a `.ayz` as sensitive as the input JARs: it contains file contents and ori
 
 ---
 
-## Non-goals (v1)
+## Non-goals (v2)
 
 - Recursively exploding nested JARs
 - A `--verbatim` / `--exact-cdata` CLI flag (metadata-only is the default; bit-identical when the codec hits)
 - HTTP CAS, S3, split archives, GUI, Maven/Gradle plugins
-- Renaming v1 manifest fields
+- Renaming v1 manifest fields (`blob`, `uncompressed_size`, `local_header_offset`, …)
+- Per-blob zstd frames as the default
+- zstd-framed / edition-2024 dependencies
 - Tokio, reqwest, openssl
 
-Future: `--explode-nested`, seekable zstd + TOC for `list` without full decode, a class-file zstd dictionary.
+Future: `--explode-nested`, a class-file zstd dictionary.

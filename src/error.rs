@@ -34,6 +34,12 @@ pub enum AyzenpackError {
     },
     #[error("unsupported ayzenpack version {0}")]
     UnsupportedVersion(u8),
+    #[error("ayzenpack version skew (magic {magic}, header {header}, trailer {trailer})")]
+    VersionSkew {
+        magic: u8,
+        header: u32,
+        trailer: u32,
+    },
     #[error("not an ayzenpack file")]
     NotAyzenpack,
     #[error("path rejected: {0}")]
@@ -70,5 +76,19 @@ mod tests {
         let err = AyzenpackError::NotAyzenpack;
         assert_eq!(err.to_string(), "not an ayzenpack file");
         assert!(!err.to_string().contains("jded"));
+    }
+
+    #[test]
+    fn version_skew_display_smoke() {
+        let err = AyzenpackError::VersionSkew {
+            magic: 1,
+            header: 2,
+            trailer: 1,
+        };
+        assert_eq!(
+            err.to_string(),
+            "ayzenpack version skew (magic 1, header 2, trailer 1)"
+        );
+        assert!(!err.to_string().contains("not an ayzenpack"));
     }
 }

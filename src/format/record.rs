@@ -1,14 +1,21 @@
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 
+use super::toc::{read_toc, Toc, TOC_OVERHEAD};
+use super::writer::AyzWriter;
 use super::{
     io_error, map_truncated, read_header, read_trailer, write_header, write_trailer, FileHeader,
-    Trailer, REC_BLOB, REC_END, REC_MANIFEST,
+    Trailer, REC_BLOB, REC_END, REC_MANIFEST, TRAILER_LEN,
 };
 use crate::error::{AyzenpackError, Result};
 
 /// Capacity of the `BufWriter` under the zstd encoder. Trailer is written on this same writer.
 pub const BUF_WRITER_CAP: usize = 256 * 1024;
+
+/// Uncompressed BLOB record size: type + blake3 + size + payload.
+pub fn blob_record_len(data_len: u64) -> u64 {
+    1 + 32 + 8 + data_len
+}
 
 /// One record in the decompressed zstd payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,6 +23,15 @@ pub enum Record {
     Blob { hash: [u8; 32], data: Vec<u8> },
     Manifest { json: Vec<u8> },
     End { digest: [u8; 32] },
+}
+
+/// Header + trailer + measured layout after version / toc_len checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AyzLayout {
+    pub header: FileHeader,
+    pub trailer: Trailer,
+    pub header_total: u64,
+    pub file_len: u64,
 }
 
 pub fn write_record<W: Write>(w: &mut W, r: &Record) -> Result<()> {
@@ -106,16 +122,30 @@ pub fn read_records<R: Read>(r: &mut R) -> Result<Vec<Record>> {
     }
 }
 
-/// Write header + one zstd record frame + trailer.
-///
-/// `payload_bytes` is measured after `enc.finish()`+flush and **before** the trailer is
-/// serialized, so the field is filled rather than patched from `file_len - 64`.
+/// Write header + records. Dispatches on `header.version` (1 = one frame, 2 = grouped + TOC).
 pub fn write_ayz_file(
     file: &mut File,
     header: &FileHeader,
     records: &[Record],
     jar_count: u64,
 ) -> Result<Trailer> {
+    match header.version {
+        1 => write_ayz_file_v1(file, header, records, jar_count),
+        2 => write_ayz_file_v2(file, header, records, jar_count),
+        other => Err(AyzenpackError::UnsupportedVersion(other as u8)),
+    }
+}
+
+/// One zstd frame of all records, no TOC. `header.version` must be 1.
+pub fn write_ayz_file_v1(
+    file: &mut File,
+    header: &FileHeader,
+    records: &[Record],
+    jar_count: u64,
+) -> Result<Trailer> {
+    if header.version != 1 {
+        return Err(AyzenpackError::UnsupportedVersion(header.version as u8));
+    }
     validate_record_stream(records)?;
     let header_len = write_header(file, header)?;
     let header_total = file.stream_position().map_err(io_error)?;
@@ -134,23 +164,153 @@ pub fn write_ayz_file(
     let mid_len = w.get_ref().metadata().map_err(io_error)?.len();
     let payload_bytes = mid_len - header_total;
 
-    let trailer = trailer_from_records(records, payload_bytes, header_len, jar_count);
+    let mut trailer = trailer_from_records(records, payload_bytes, header_len, jar_count);
+    trailer.version = 1;
+    trailer.toc_len = 0;
     write_trailer(&mut w, &trailer)?;
     w.flush().map_err(io_error)?;
     Ok(trailer)
 }
 
-/// Read trailer, header, then decode the single zstd frame of records (stop after END).
-pub fn read_ayz_file<R: Read + Seek>(r: &mut R) -> Result<(FileHeader, Trailer, Vec<Record>)> {
+fn write_ayz_file_v2(
+    file: &mut File,
+    header: &FileHeader,
+    records: &[Record],
+    jar_count: u64,
+) -> Result<Trailer> {
+    validate_record_stream(records)?;
+    let header_len = write_header(file, header)?;
+    let header_total = file.stream_position().map_err(io_error)?;
+    let mut writer = AyzWriter::after_header(file, header_len, header_total, header.zstd_level);
+    let mut manifest_json = None;
+    let mut digest = None;
+    let mut blob_count = 0u64;
+    let mut blob_bytes = 0u64;
+    for rec in records {
+        match rec {
+            Record::Blob { hash, data } => {
+                writer.write_blob(hash, data)?;
+                blob_count += 1;
+                blob_bytes += data.len() as u64;
+            }
+            Record::Manifest { json } => manifest_json = Some(json.as_slice()),
+            Record::End { digest: d } => digest = Some(*d),
+        }
+    }
+    let json = manifest_json.ok_or(AyzenpackError::Format("missing MANIFEST record"))?;
+    let digest = digest.ok_or(AyzenpackError::Format("missing END record"))?;
+    let (trailer, _) = writer.finish(json, digest, blob_count, blob_bytes, jar_count, 2)?;
+    Ok(trailer)
+}
+
+/// Read trailer + header, check version agreement and `toc_len`, leave `r` after the header.
+pub fn open_ayz_layout<R: Read + Seek>(r: &mut R) -> Result<AyzLayout> {
+    let file_len = r.seek(SeekFrom::End(0)).map_err(io_error)?;
     let trailer = read_trailer(r)?;
     r.seek(SeekFrom::Start(0)).map_err(io_error)?;
     let header = read_header(r)?;
-    let limited = Read::take(r, trailer.payload_bytes);
-    let mut decoder = zstd::stream::Decoder::new(limited)
-        .map_err(io_error)?
-        .single_frame();
+    let header_total = r.stream_position().map_err(io_error)?;
+    let from_lens = 12u64
+        .checked_add(u64::from(trailer.header_len))
+        .ok_or(AyzenpackError::Format("header_len overflow"))?;
+    if header_total != from_lens {
+        return Err(AyzenpackError::Format("header_total != 12+header_len"));
+    }
+    if header.version != trailer.version {
+        return Err(AyzenpackError::VersionSkew {
+            magic: header.version as u8,
+            header: header.version,
+            trailer: trailer.version,
+        });
+    }
+    let expected_toc = file_len
+        .checked_sub(TRAILER_LEN)
+        .and_then(|x| x.checked_sub(header_total))
+        .and_then(|x| x.checked_sub(trailer.payload_bytes))
+        .ok_or(AyzenpackError::Format("toc_len overflow"))?;
+    if trailer.toc_len != expected_toc {
+        return Err(AyzenpackError::Format("toc_len mismatch"));
+    }
+    match header.version {
+        1 => {
+            if trailer.toc_len != 0 {
+                return Err(AyzenpackError::Format("v1 toc_len must be 0"));
+            }
+        }
+        2 => {
+            if trailer.toc_len == 0 {
+                return Err(AyzenpackError::Format("v2 toc_len must not be 0"));
+            }
+            if trailer.toc_len < TOC_OVERHEAD {
+                return Err(AyzenpackError::Format("truncated TOC"));
+            }
+            if (trailer.toc_len - TOC_OVERHEAD) % crate::format::TOC_ENTRY_SIZE != 0 {
+                return Err(AyzenpackError::Format("v2 toc_len not 28+n*56"));
+            }
+        }
+        other => return Err(AyzenpackError::UnsupportedVersion(other as u8)),
+    }
+    Ok(AyzLayout {
+        header,
+        trailer,
+        header_total,
+        file_len,
+    })
+}
+
+/// Decode every zstd frame in `payload_bytes` (v1: one frame; v2: blob groups + manifest).
+pub fn decode_payload<R: Read>(
+    r: R,
+    version: u32,
+) -> Result<zstd::stream::read::Decoder<'static, std::io::BufReader<R>>> {
+    let dec = zstd::stream::Decoder::new(r).map_err(io_error)?;
+    if version == 1 {
+        Ok(dec.single_frame())
+    } else {
+        Ok(dec)
+    }
+}
+
+/// Read trailer, header, then decode all record frames (stop after END).
+pub fn read_ayz_file<R: Read + Seek>(r: &mut R) -> Result<(FileHeader, Trailer, Vec<Record>)> {
+    let layout = open_ayz_layout(r)?;
+    let limited = Read::take(r, layout.trailer.payload_bytes);
+    let mut decoder = decode_payload(limited, layout.header.version)?;
     let records = read_records(&mut decoder)?;
-    Ok((header, trailer, records))
+    Ok((layout.header, layout.trailer, records))
+}
+
+/// Seek the last (MANIFEST+END) v2 frame via the TOC. v1 falls back to a full decode.
+pub fn read_manifest_records<R: Read + Seek>(r: &mut R) -> Result<(AyzLayout, Vec<Record>)> {
+    let layout = open_ayz_layout(r)?;
+    if layout.header.version == 1 {
+        let limited = Read::take(r, layout.trailer.payload_bytes);
+        let mut decoder = decode_payload(limited, 1)?;
+        let records = read_records(&mut decoder)?;
+        return Ok((layout, records));
+    }
+    r.seek(SeekFrom::Start(
+        layout.header_total + layout.trailer.payload_bytes,
+    ))
+    .map_err(io_error)?;
+    let toc = read_toc(r, layout.trailer.toc_len)?;
+    let frame_abs = layout
+        .header_total
+        .checked_add(toc.manifest_zstd_off)
+        .ok_or(AyzenpackError::Format("manifest_zstd_off overflow"))?;
+    r.seek(SeekFrom::Start(frame_abs)).map_err(io_error)?;
+    let limited = Read::take(r, toc.manifest_zstd_len);
+    let mut decoder = zstd::stream::Decoder::new(limited).map_err(io_error)?;
+    let records = read_records(&mut decoder)?;
+    Ok((layout, records))
+}
+
+pub fn read_toc_at<R: Read + Seek>(r: &mut R, layout: &AyzLayout) -> Result<Toc> {
+    r.seek(SeekFrom::Start(
+        layout.header_total + layout.trailer.payload_bytes,
+    ))
+    .map_err(io_error)?;
+    read_toc(r, layout.trailer.toc_len)
 }
 
 fn read_u64le<R: Read>(r: &mut R, msg: &'static str) -> Result<u64> {
@@ -212,12 +372,14 @@ fn trailer_from_records(
         jar_count,
         header_len,
         version: 1,
+        toc_len: 0,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::{FILE_MAGIC, TOC_ENTRY_SIZE, TOC_OVERHEAD, TRAILER_LEN};
     use crate::hashutil::blake3_bytes;
     use std::io::Cursor;
 
@@ -252,9 +414,7 @@ mod tests {
         data
     }
 
-    #[test]
-    fn zstd_record_roundtrip_two_blobs_manifest_end() {
-        // Guards per-blob zstd (must be one frame) and length-prefix endian.
+    fn sample_records() -> (Vec<u8>, Vec<u8>, Vec<Record>) {
         let d0 = b"hello blob one".to_vec();
         let d1 = b"second blob payload".to_vec();
         let h0 = blake3_bytes(&d0);
@@ -274,6 +434,17 @@ mod tests {
                 digest: order_digest(&[h0, h1]),
             },
         ];
+        (d0, d1, records)
+    }
+
+    #[test]
+    fn zstd_record_roundtrip_two_blobs_manifest_end() {
+        // Guards per-blob zstd (must be one blob frame) and length-prefix endian.
+        let (d0, d1, records) = sample_records();
+        let json = match &records[2] {
+            Record::Manifest { json } => json.clone(),
+            _ => panic!("manifest"),
+        };
 
         let mut raw = Vec::new();
         for rec in &records {
@@ -294,19 +465,42 @@ mod tests {
         assert_eq!(trailer.blob_count, 2);
         assert_eq!(trailer.blob_bytes, (d0.len() + d1.len()) as u64);
         assert_eq!(trailer.manifest_len, json.len() as u64);
-        assert_eq!(trailer.version, 1);
+        assert_eq!(trailer.version, 2);
+        assert_eq!(trailer.toc_len, TOC_OVERHEAD + 2 * TOC_ENTRY_SIZE);
 
         let file_len = file.metadata().unwrap().len();
         let header_total = 12 + u64::from(trailer.header_len);
         assert_eq!(
             file_len,
-            header_total + trailer.payload_bytes + crate::format::TRAILER_LEN
+            header_total + trailer.payload_bytes + trailer.toc_len + TRAILER_LEN
         );
 
+        file.seek(SeekFrom::Start(0)).unwrap();
         let (got_header, got_trailer, got_records) = read_ayz_file(&mut file).unwrap();
         assert_eq!(got_header, header);
         assert_eq!(got_trailer, trailer);
         assert_eq!(got_records, records);
+
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let layout = open_ayz_layout(&mut file).unwrap();
+        let toc = read_toc_at(&mut file, &layout).unwrap();
+        assert_eq!(toc.entries.len(), 2);
+        assert_eq!(toc.entries[0].zstd_off, 0, "payload-relative origin");
+        assert_eq!(
+            toc.entries[0].zstd_off, toc.entries[1].zstd_off,
+            "two small blobs must share one zstd frame (not per-blob)"
+        );
+        assert_eq!(toc.entries[0].zstd_len, toc.entries[1].zstd_len);
+        assert_eq!(toc.entries[0].rec_off, 0);
+        assert_eq!(toc.entries[1].rec_off, blob_record_len(d0.len() as u64));
+        assert_ne!(
+            toc.manifest_zstd_len, trailer.manifest_len,
+            "TOC must not copy uncompressed Trailer.manifest_len"
+        );
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut magic = [0u8; 8];
+        file.read_exact(&mut magic).unwrap();
+        assert_eq!(&magic, &FILE_MAGIC);
     }
 
     #[test]
@@ -425,7 +619,8 @@ mod tests {
         ];
 
         let mut file = tempfile::tempfile().unwrap();
-        let header = FileHeader::new(3, 0);
+        let mut header = FileHeader::new(3, 0);
+        header.version = 1;
         let header_len = write_header(&mut file, &header).unwrap();
         let header_total = file.stream_position().unwrap();
         assert_eq!(header_total, 12 + u64::from(header_len));
@@ -456,6 +651,7 @@ mod tests {
             jar_count: 0,
             header_len,
             version: 1,
+            toc_len: 0,
         };
         write_trailer(&mut w, &trailer).unwrap();
         w.flush().unwrap();
@@ -477,5 +673,99 @@ mod tests {
         assert_eq!(got_header, header);
         assert_eq!(got_trailer, trailer);
         assert_eq!(got_records, records);
+    }
+
+    #[test]
+    fn v2_last_frame_is_manifest_and_end_only() {
+        let (_, _, records) = sample_records();
+        let mut file = tempfile::tempfile().unwrap();
+        let header = FileHeader::new(3, 0);
+        write_ayz_file(&mut file, &header, &records, 0).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let (layout, last) = read_manifest_records(&mut file).unwrap();
+        assert_eq!(layout.header.version, 2);
+        assert!(matches!(last[0], Record::Manifest { .. }));
+        assert!(matches!(last[1], Record::End { .. }));
+        assert_eq!(last.len(), 2);
+        assert!(!last.iter().any(|r| matches!(r, Record::Blob { .. })));
+    }
+
+    #[test]
+    fn write_ayz_file_v1_is_one_frame_version_1() {
+        let (_, _, records) = sample_records();
+        let mut file = tempfile::tempfile().unwrap();
+        let mut header = FileHeader::new(3, 0);
+        header.version = 1;
+        let trailer = write_ayz_file_v1(&mut file, &header, &records, 0).unwrap();
+        assert_eq!(trailer.version, 1);
+        assert_eq!(trailer.toc_len, 0);
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut magic = [0u8; 8];
+        file.read_exact(&mut magic).unwrap();
+        assert_eq!(&magic, crate::format::FILE_MAGIC_V1.as_ref());
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let (got_h, got_t, got_r) = read_ayz_file(&mut file).unwrap();
+        assert_eq!(got_h.version, 1);
+        assert_eq!(got_t.version, 1);
+        assert_eq!(got_r, records);
+    }
+
+    #[test]
+    fn synthetic_two_blob_frames() {
+        let d0 = fill_incompressible(3 * 1024 * 1024);
+        let d1 = fill_incompressible(3 * 1024 * 1024);
+        let h0 = blake3_bytes(&d0);
+        let h1 = blake3_bytes(&d1);
+        let json = br#"{"format":"ayzenpack-manifest","two_frames":true}"#.to_vec();
+        let records = vec![
+            Record::Blob {
+                hash: h0,
+                data: d0,
+            },
+            Record::Blob {
+                hash: h1,
+                data: d1,
+            },
+            Record::Manifest { json },
+            Record::End {
+                digest: order_digest(&[h0, h1]),
+            },
+        ];
+        let mut file = tempfile::tempfile().unwrap();
+        let header = FileHeader::new(3, 0);
+        let trailer = write_ayz_file(&mut file, &header, &records, 0).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let layout = open_ayz_layout(&mut file).unwrap();
+        let toc = read_toc_at(&mut file, &layout).unwrap();
+        assert_eq!(toc.entries.len(), 2);
+        assert_eq!(toc.entries[0].zstd_off, 0);
+        assert_ne!(
+            toc.entries[0].zstd_off, toc.entries[1].zstd_off,
+            "3 MiB + 3 MiB must flush into two blob frames"
+        );
+        assert_ne!(toc.manifest_zstd_off, toc.entries[1].zstd_off);
+        assert_ne!(toc.manifest_zstd_len, trailer.manifest_len);
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let (_, _, got) = read_ayz_file(&mut file).unwrap();
+        assert_eq!(got.len(), 4);
+    }
+
+    #[test]
+    fn empty_v2_is_one_manifest_frame() {
+        let json = b"{}".to_vec();
+        let records = vec![
+            Record::Manifest { json: json.clone() },
+            Record::End { digest: [0u8; 32] },
+        ];
+        let mut file = tempfile::tempfile().unwrap();
+        let header = FileHeader::new(3, 0);
+        let trailer = write_ayz_file(&mut file, &header, &records, 0).unwrap();
+        assert_eq!(trailer.toc_len, TOC_OVERHEAD);
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let layout = open_ayz_layout(&mut file).unwrap();
+        let toc = read_toc_at(&mut file, &layout).unwrap();
+        assert!(toc.entries.is_empty());
+        assert_eq!(toc.manifest_zstd_off, 0);
+        assert_eq!(toc.manifest_zstd_len, trailer.payload_bytes);
     }
 }

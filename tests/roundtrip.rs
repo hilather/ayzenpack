@@ -250,8 +250,13 @@ fn dehydrate_payload_bytes_measured_before_trailer_write() {
     );
     let header_total = 12 + u64::from(trailer.header_len);
     let file_len = fs::metadata(&out).unwrap().len();
-    assert_eq!(file_len, header_total + trailer.payload_bytes + TRAILER_LEN);
+    assert_eq!(
+        file_len,
+        header_total + trailer.payload_bytes + trailer.toc_len + TRAILER_LEN
+    );
     assert_eq!(summary.output_len, file_len);
+    assert_eq!(trailer.version, 2);
+    assert!(trailer.toc_len >= 28);
     assert!(matches!(&records[0], Record::Blob { data: d, .. } if d.len() == data.len()));
 }
 
