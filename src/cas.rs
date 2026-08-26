@@ -138,13 +138,19 @@ mod tests {
                 "CAS path component must be lowercase hex: {name}"
             );
         }
-        let upper = dir
-            .path()
-            .join(hex[0..2].to_ascii_uppercase())
-            .join(hex[2..4].to_ascii_uppercase())
-            .join(hex.to_ascii_uppercase());
-        if upper != dir.path().join(&hex[0..2]).join(&hex[2..4]).join(&hex) {
-            assert!(!upper.is_file(), "must not write uppercase hex filenames");
+        // NTFS is case-insensitive: Path != is case-sensitive but is_file()
+        // follows the same bytes we wrote. Only assert a distinct uppercase
+        // path on case-sensitive filesystems.
+        #[cfg(unix)]
+        {
+            let upper = dir
+                .path()
+                .join(hex[0..2].to_ascii_uppercase())
+                .join(hex[2..4].to_ascii_uppercase())
+                .join(hex.to_ascii_uppercase());
+            if upper != dir.path().join(&hex[0..2]).join(&hex[2..4]).join(&hex) {
+                assert!(!upper.is_file(), "must not write uppercase hex filenames");
+            }
         }
     }
 }

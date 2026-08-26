@@ -51,13 +51,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # Cargo 1.80 cannot parse edition-2024 manifests that appear in the
+      # lockfile as unused target-only crates (getrandom -> wasip2 ->
+      # wit-bindgen). Fetch with stable, then check with 1.80 offline.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: "1.80"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: cargo fetch
-        run: cargo fetch --locked
+        run: cargo +stable fetch --locked
       - name: cargo check
-        run: cargo check --locked
+        run: cargo +1.80 check --locked
         env:
           CARGO_NET_OFFLINE: "true"

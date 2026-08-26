@@ -1,6 +1,6 @@
 [package]
 name = "ayzenpack"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
@@ -34,6 +34,8 @@ indicatif = "0.17"
 indexmap = "=2.11.4"
 # 1.11 lists MSRV 1.80 but pulls newer deps; 1.10 is crate MSRV 1.63 and stays on 1.80 lockfile pins.
 rayon = "~1.10"
+# cc -> jobserver 0.1.35 pulls getrandom 0.4 / wit-bindgen (edition 2024, MSRV 1.85).
+jobserver = "=0.1.32"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

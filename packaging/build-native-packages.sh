@@ -166,12 +166,34 @@ pack_with_nfpm() {
     )
 }
 
+rename_rpm_with_distro() {
+    # nfpm emits ayzenpack-VERSION-1.x86_64.rpm for every distro. Matrix jobs
+    # would clobber each other in the GitHub Release flatten step.
+    shopt -s nullglob
+    local f bn dest
+    for f in "$OUT_DIR"/*.rpm; do
+        bn="$(basename "$f")"
+        case "$bn" in
+            *."${DISTRO_LABEL}".*) continue ;;
+        esac
+        if [[ "$bn" =~ ^(.*)\.(x86_64|aarch64|noarch)\.rpm$ ]]; then
+            dest="${BASH_REMATCH[1]}.${DISTRO_LABEL}.${BASH_REMATCH[2]}.rpm"
+            mv -f "$f" "$OUT_DIR/$dest"
+            echo "Renamed RPM $bn -> $dest"
+        fi
+    done
+}
+
 case "$FAMILY" in
     deb) pack_with_nfpm deb ;;
-    rpm) pack_with_nfpm rpm ;;
+    rpm)
+        pack_with_nfpm rpm
+        rename_rpm_with_distro
+        ;;
     both)
         pack_with_nfpm deb || echo "warning: deb packaging failed"
         pack_with_nfpm rpm || echo "warning: rpm packaging failed"
+        rename_rpm_with_distro
         ;;
     *)
         echo "Unknown PACKAGE_FAMILY=$FAMILY; tarball only"

@@ -38,6 +38,9 @@ fi
 grep -q 'cargo build --release --locked' "$YML" "$ROOT/packaging/build-native-packages.sh" \
   && pass "release build is cargo build --release --locked" \
   || bad "missing cargo build --release --locked"
+grep -q 'rename_rpm_with_distro' "$ROOT/packaging/build-native-packages.sh" \
+  && pass "RPMs renamed with DISTRO_LABEL so Rocky 8/9 do not clobber" \
+  || bad "RPM flatten would overwrite rocky-8 with rocky-9"
 
 [[ "$fail" -eq 0 ]] || exit 1
 echo "OK: Rocky dnf / packages.yml hardening ($ROOT)"
