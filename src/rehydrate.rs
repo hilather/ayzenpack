@@ -322,6 +322,10 @@ fn create_parent_dirs_0755(dest: &Path) -> Result<()> {
     let mut acc = PathBuf::new();
     for comp in parent.components() {
         acc.push(comp);
+        // Windows canonicalize is `\\?\C:\...`. Stat of `\\?\C:` is ERROR_INVALID_FUNCTION.
+        if matches!(comp, Component::Prefix(_) | Component::RootDir) {
+            continue;
+        }
         match fs::symlink_metadata(&acc) {
             Ok(_) => continue,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -951,5 +955,14 @@ mod tests {
         restore_dest(&jar_restore("/abs/a.jar")).unwrap();
         #[cfg(windows)]
         restore_dest(&jar_restore(r"C:\abs\a.jar")).unwrap();
+    }
+
+    #[test]
+    fn create_parent_dirs_skips_prefix_and_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("missing").join("nested").join("a.jar");
+        create_parent_dirs_0755(&dest).unwrap();
+        assert!(dest.parent().unwrap().is_dir());
+        create_parent_dirs_0755(&dest).unwrap();
     }
 }
