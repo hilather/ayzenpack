@@ -1,0 +1,35 @@
+# Pack-job state for ayzenpack.
+#
+# The crate does not read this file. Deserialize it (serde_yaml) and map the
+# fields onto DehydrateOptions / RehydrateOptions. See docs/library.md.
+
+format: ayzenpack-job
+version: 1
+
+dehydrate:
+  output: dist/libs.ayz
+  inputs:
+    - app.jar
+    - lib
+  recursive: true
+  sort_inputs: true
+  level: 3
+  jobs: 0
+  max_inflight_bytes: 67108864
+  fail_on_signed: true
+  strict: false
+  dry_run: false
+  follow_symlinks: false
+  exclude:
+    - "*.sources.jar"
+    - "*.javadoc.jar"
+  write_sidecar_manifest: dist/libs.ayz.manifest.json
+  pretty_manifest: true
+
+rehydrate:
+  input: dist/libs.ayz
+  dir: restored
+  overwrite: true
+  store_all: false
+  deflate_level: 6
+  keep_cas: false

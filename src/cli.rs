@@ -14,7 +14,7 @@ use ayzenpack::{
 #[command(
     name = "ayzenpack",
     version,
-    about = "Dehydrate / rehydrate JAR sets with BLAKE3 + zstd"
+    about = "Pack many JARs into one BLAKE3 + zstd archive and restore them"
 )]
 pub struct Cli {
     /// No stderr progress
