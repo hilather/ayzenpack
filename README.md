@@ -156,11 +156,13 @@ See [docs/library.md](docs/library.md#load-a-yaml-job-file) for the loader.
 
 ---
 
-## Reconstruction guarantee
+## Reconstruction
 
-New packs keep ZIP metadata (local headers, descriptors, padding, CD tail) and restore **bit-identical** files when every DEFLATE member matches a pinned flate2 raw-deflate codec (`cdata_codec`) or is STORE. Then blake3, sha256, and size match `jars[].source_*`. Spring Boot fully-executable JARs stay `[official launch.script][zip]`.
+**Storage efficiency is of the utmost importance.** New packs store **one** CAS blob per unique uncompressed entry (BLAKE3 of those bytes) and a ZIP-slot **index** (name, CD order, method, CRC, sizes, local header / descriptor / pad, tail, prefix, blob hash). Format v2 zstd-compresses those uncompressed blobs in 4 MiB record-aligned groups. The original already-deflated ZIP payload must **not** be stored a second time. Crate 0.2.0 still writes leftover `cdata_blob` on MixedExact / class-4; that is a defect (`PLAN.md` 0.2.1).
 
-Uncompressed entry blobs are still stored (listing, CRC, cross-jar dedup). The original already-deflated ZIP payload is **not** stored a second time. If flate2 cannot reproduce a member, rehydrate rebuilds a valid ZIP with the same names, order, timestamps, and extras (new compressed sizes; `source_*` will not match). 0.1.6–0.1.8 packs that still have `cdata_blob` keep working. If a zip cannot be sliced, the zip portion after the prefix is stored as `raw_zip_blob` and copied.
+Rehydrate rebuilds a **valid ZIP** from index + blobs: STORE splice, or a flate2 `cdata_codec` hit if one happened at pack time, otherwise a rebuild (new compressed sizes). Whole-file `source_*` hashes may change. That is acceptable. Do not store `cdata_blob` or `raw_zip` a healthy jar to keep hashes. Spring Boot fully-executable JARs keep `[official launch.script][zip]`.
+
+0.1.6–0.1.8 packs that still have `cdata_blob` still read. New packs must not write that shape. If a zip cannot be sliced (spanning / parse failure / count mismatch), the zip portion after the prefix is stored as `raw_zip_blob` and copied — that is the only `raw_zip` case.
 
 **Old archives** (0.1.4 / 0.1.5, no `tail` / `raw_zip` fields) still rehydrate via `ZipWriter`: uncompressed bytes, names, CD order, and CRC match; the deflate bitstream and extras do not. `--verbatim` is **not** a CLI flag.
 
@@ -168,11 +170,13 @@ Spring Boot launchers (including after `zip -A` and Zip64) keep the existing pre
 
 The content-mode `ZipWriter` path still uses deflate for file entries and store for directories, unless `--store-all`.
 
+Agent rules: [`AGENTS.md`](AGENTS.md). Design: [`DESIGN.md`](DESIGN.md).
+
 ---
 
 ## Signed JARs
 
-Exact restore keeps `META-INF/*.SF` / `*.RSA` / `*.DSA` / `*.EC` bytes, so those signatures still verify. ayzenpack does not re-sign.
+STORE / codec-hit / legacy-`cdata_blob` splice keeps `META-INF/*.SF` / `*.RSA` / `*.DSA` / `*.EC` bytes, so those signatures can still verify. Rebuild changes compressed sizes and will break them. That is acceptable — do not store a second payload copy to keep a signature. ayzenpack does not re-sign.
 
 `dehydrate` notes signed JARs and still packs. Pass `--fail-on-signed` to abort instead. `--strict` does not promote the signed notice by itself. Content-mode rebuild of an old archive can still break a signature.
 

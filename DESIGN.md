@@ -1,8 +1,8 @@
 # Design
 
-ayzenpack dehydrates a set of JAR/ZIP/WAR/EAR files into one `.ayz` archive and rehydrates them. Dedup is **BLAKE3 of uncompressed entry bytes**. New packs are **format v2**: uncompressed header, record-aligned zstd BLOB groups, a final zstd frame of MANIFEST+END, an uncompressed TOC, and a 64-byte trailer. v1 files (one zstd frame, no TOC) still read and rehydrate.
+ayzenpack dehydrates a set of JAR/ZIP/WAR/EAR files into one `.ayz` archive and rehydrates them. **Storage efficiency is of the utmost importance.** Dedup is **BLAKE3 of uncompressed entry bytes** — one CAS blob per unique payload. The manifest is a ZIP-slot **index** (ratarmount-style pointers), not a second copy of file bytes. New packs are **format v2**: uncompressed header, record-aligned zstd BLOB groups (the only pack compression), a final zstd frame of MANIFEST+END, an uncompressed TOC, and a 64-byte trailer. v1 files (one zstd frame, no TOC) still read and rehydrate.
 
-This is the v2 format and library contract. CLI flag names live in `src/cli.rs` and the README. Manifest JSON field names are unchanged from v1.
+This is the v2 format and library contract. Standing agent rules: [`AGENTS.md`](AGENTS.md). CLI flag names live in `src/cli.rs` and the README. Manifest JSON field names are unchanged from v1. Do not rename `blob`, `local_header_offset`, `cdata_blob`, ….
 
 | | |
 |---|---|
@@ -21,7 +21,9 @@ This is the v2 format and library contract. CLI flag names live in `src/cli.rs` 
 
 A set of application classpaths repeats the same `.class` and resource bytes tens or hundreds of times. `tar`/`zip` of a `lib/` directory does not content-dedup across archives. Exploding JARs to a class forest is slow, huge, and drops ZIP metadata (order, DOS time, CRC).
 
-Storing **uncompressed** entry bytes into **zstd frames** usually beats concatenating already-deflated ZIP members: DEFLATE is not a concatenable input for a second compressor. Identical class files across JARs collapse to one BLOB. The manifest is inside the archive so rehydrate is one file in, N JARs out. v2 groups BLOBs into record-aligned frames (flush at 4 MiB uncompressed BLOB record bytes) so `list` can seek the last frame via the TOC instead of decoding every blob.
+Storing **uncompressed** entry bytes into **record-aligned zstd groups** usually beats concatenating already-deflated ZIP members: DEFLATE is not a concatenable input for a second compressor, and a second copy of those streams is why packs ballooned (200MB → ~3GB). Identical class files across JARs collapse to one BLOB. The manifest is an index of ZIP slots pointing at those blobs — one file in, N JARs out. v2 groups BLOBs into record-aligned frames (flush at 4 MiB uncompressed BLOB **record** bytes) so the zstd window stays warm and `list` can seek the last frame via the TOC.
+
+Never store a second encoding of the same entry (`cdata_blob` next to the content blob, or `raw_zip` of a jar that parsed). Never switch to per-file/per-blob zstd frames.
 
 The tool never unpacks JARs to a forest of `.class` files, never talks to the network, and contains no `unsafe`.
 
@@ -167,40 +169,58 @@ Root: `format`, `version`, `hash_algo`, `mode`, `jars[]`, `blobs[]`, `stats`.
 
 v1 **content** rebuild (old archives) uses `name` (Unicode from `ZipFile::name()`), `is_dir`, `blob`, `crc32`, `dos_*` via `DateTime::try_from_msdos` with `DateTime::default()` fallback, and `unix_mode`. `utf8_flag` is recorded only. `name_raw_hex` is not used on write. `method` is advisory: rebuilt files deflate, directories store, unless `--store-all`.
 
-New packs also store optional exact-reconstruction fields (omitted when absent, same style as `prefix_blob`). Unknown keys stay ignored on read.
+New packs store optional ZIP-slot index fields (omitted when absent, same style as `prefix_blob`). Unknown keys stay ignored on read. These fields point at CAS blobs and record local-header / tail bytes. They are not a license to store a second copy of entry payloads.
 
 `--restore-paths` dehydrate adds optional `jars[].restore_path` (canonical absolute path), `restore_mode`, and on Unix `restore_uid` / `restore_gid`. Omitted when the flag is off. Default rehydrate still writes `dir/name`. `--restore-paths` rehydrate writes `restore_path` (overwrites; dest symlink is replaced, not followed).
 
 ---
 
+## Storage (locked)
+
+North star: **one CAS blob + ZIP index + zstd blocks**. Not metadata-only exact. Not codec-hit as a requirement. Not Java-zlib bit-identical files.
+
+The original JAR is gone after dehydrate. What remains:
+
+| Kind | What it is |
+|------|------------|
+| Data | One BLOB per unique **uncompressed** entry. Dedup key = BLAKE3 of those bytes. |
+| Index | Manifest ZIP slots: `name`, CD order, `method` / `method_code`, `crc32`, compressed/uncompressed sizes, GPBF (inside `local_header_*`, not a new JSON field), `local_header_offset`, local header / data-descriptor / pad, `tail_blob` (CD through EOF), `prefix_blob` if any, `blob` hash. |
+| Pack compression | Format v2 record-aligned zstd **groups** of those uncompressed BLOB records (flush at 4 MiB record bytes), then MANIFEST+END, uncompressed TOC. |
+
+**Forbidden on write:** a second encoding of the same entry. No default `cdata_blob` beside the content blob. No `raw_zip` except unlistable zips (spanning / parse failure / ZipArchive count ≠ CD count). Do not store pre-deflated ZIP cdata as the CAS payload. Do not switch to per-file zstd frames.
+
+Crate 0.2.0 still writes leftover `cdata_blob` on `MixedExact` / class-4 (`ExactWithExotic`). That is a defect, not a policy. [`PLAN.md`](PLAN.md) / [`AGENTS.md`](AGENTS.md). New work must not add more dual copies.
+
+---
+
 ## Reconstruction
 
-New packs default to **metadata-only** exact restore. Uncompressed entry `blob`s are still stored for listing, CRC checks, and cross-jar content dedup. The original DEFLATE payload is **not** stored a second time.
+Rehydrate builds a **valid ZIP** from index + blobs. Paths, in order:
 
-Per file entry, dehydrate records local-header metadata (`local_header_hex` / `local_header_blob`, `data_descriptor_hex`, `pad_*`, `local_header_offset`) plus one of:
+- **STORE:** splice the content `blob` at the recorded local offset. No `cdata_blob`.
+- **DEFLATE codec hit:** optional `cdata_codec` (`deflate-raw:flate2:<level>`) when a pinned flate2 raw-deflate trial already matched at pack time (GPBF bits 1–2 as a level hint, then 6, 9, 1). Rehydrate encodes and splices. A hit is luck, not a goal.
+- **Otherwise rebuild:** neither `cdata_blob` nor `cdata_codec`. Patch local header / data descriptor / CD / EOCD (and Zip64 extras that already exist). Same names, CD order, timestamps, extras, uncompressed bytes. New compressed sizes. **`source_*` may change. That is acceptable.** Signed JARs on this path use the existing “rebuild will break the signature” warning.
+- **Legacy `cdata_blob`:** read 0.1.6–0.1.8 dual-copy packs and 0.2.0 MixedExact leftovers. **Never write this shape again.** Maven/Java empty DEFLATE directories (`03 00`, usize 0) are codec/empty, not exotic.
 
-- **STORE:** no `cdata_blob`; rehydrate splices the content `blob`
-- **DEFLATE codec hit:** optional `cdata_codec` (`deflate-raw:flate2:<level>`) when a pinned flate2 raw-deflate trial matches the original `cdata` byte-for-byte (GPBF bits 1–2 as a level hint, then 6, 9, 1). Rehydrate encodes and splices at the original offsets. `source_blake3` / `source_sha256` / `source_size` still match.
-- **DEFLATE codec miss:** neither `cdata_blob` nor `cdata_codec`. Rehydrate rebuilds a valid ZIP: same names/order/timestamps/extras, new compressed sizes, patched local header / data descriptor / CD / EOCD (and Zip64 extras that already exist). **Do not** claim `source_*` match. A signed JAR on this path uses the existing “rebuild will break the signature” warning.
-- **Legacy `cdata_blob`:** 0.1.6–0.1.8 packs, plus exotic / unreproducible methods (non-STORE/DEFLATE, or a directory with actual uncompressed payload). Maven/Java empty DEFLATE directories (`03 00`, usize 0) are a codec hit/miss, not exotic. Resolution order: `cdata_blob`, else `cdata_codec`, else STORE/content blob, else rebuild.
+Per jar: `tail_blob` / `tail_size` is the CD-through-EOF index blob (structural, not a second copy of entry payloads).
 
-Per jar: `tail_blob` / `tail_size` is bytes from the start of the central directory through zip EOF.
-
-If a zip cannot be sliced cleanly (spanning, parse failure, ZipArchive entry count ≠ CD count): store `raw_zip_blob` of the entire zip portion after the prefix and copy it. `raw_zip` is not the deflate-miss path.
+`raw_zip_blob` is only for a zip that cannot be sliced. It is not the codec-miss path and not the exotic-sibling path.
 
 **Old archives** (no tail / `raw_zip`): keep the 0.1.x `ZipWriter` path. `--verbatim` is not a CLI flag.
 
 ```
-∀ jar (codec-hit / STORE / cdata_blob / raw_zip):
+∀ jar (STORE splice / codec-hit / legacy cdata_blob / raw_zip):
   restored_bytes == source_bytes
   blake3(restored) == jars[].source_blake3
   sha256(restored) == jars[].source_sha256
   len(restored) == jars[].source_size
 
-∀ jar (metadata rebuild):
+∀ jar (rebuild):
   ZipArchive opens; names, CD order, uncompressed bytes match
   source_* are the original file and are not verified
 ```
+
+Do not add a Java/zlib deflater or `cdata_blob` for misses to move a rebuild jar into the first block.
 
 Invalid DOS pairs including `0,0` still fall back to 1980-01-01 on the content path. Never `from_msdos_unchecked`.
 
@@ -223,9 +243,9 @@ extra = (eocd_file_offset - cd_size) - recorded_cd_offset
 
 The prefix is stored as a first-seen CAS BLOB (same `hash_both` path as entry payloads). Shared launchers across JARs dedup (`ref_count > 1`). Manifest `jars[]` may include optional `prefix_blob` (hex BLAKE3) and `prefix_size`. Omitted on normal ZIPs so old archives still list/rehydrate.
 
-Rehydrate writes the prefix bytes first. Bit-identical packs then splice locals + tail (or `raw_zip`) so the file stays `[official launch.script][zip]` with original offsets. Metadata-rebuild packs rewrite the zip portion after the prefix and patch CD offsets (zip-relative or file-absolute after `zip -A`). On Unix the restored file is `chmod 0755` so it stays executable.
+Rehydrate writes the prefix bytes first. Splice packs (STORE / codec-hit / legacy `cdata_blob` / `raw_zip`) keep `[official launch.script][zip]` at original offsets. Rebuild packs rewrite the zip portion after the prefix and patch CD offsets (zip-relative or file-absolute after `zip -A`). On Unix the restored file is `chmod 0755` so it stays executable.
 
-`source_blake3` / `source_sha256` / `source_size` remain hashes/size of the **whole** input (prefix + ZIP) and are checked after bit-identical restore only.
+`source_blake3` / `source_sha256` / `source_size` remain hashes/size of the **whole** input (prefix + ZIP) and are checked after splice restore only. Rebuild may change them.
 
 Nested `BOOT-INF/lib/*.jar` entries stay opaque blobs.
 
@@ -233,9 +253,9 @@ Nested `BOOT-INF/lib/*.jar` entries stay opaque blobs.
 
 ## Signed JARs
 
-`META-INF/*.SF` plus `*.RSA` / `*.DSA` / `*.EC` digest compressed or stored bytes. Bit-identical restore keeps those bytes, so file-level signatures (JAR `.SF`, SHA256SUMS, cosign, vendor checksums) survive. Metadata rebuild changes compressed sizes, so those signatures will not verify. ayzenpack does not re-sign.
+`META-INF/*.SF` plus `*.RSA` / `*.DSA` / `*.EC` digest compressed or stored bytes. Splice restore (STORE / codec-hit / legacy `cdata_blob` / `raw_zip`) keeps those bytes, so file-level signatures can survive. Rebuild changes compressed sizes, so those signatures will not verify. That is acceptable. ayzenpack does not re-sign. Do not store `cdata_blob` or `raw_zip` a healthy jar just to keep a signature.
 
-Dehydrate still notes signed JARs and packs. `--fail-on-signed` aborts. `--strict` does not promote the signed notice. The “rebuild will break the signature” warning is for metadata-rebuild jars and the content/`ZipWriter` fallback (not for codec-hit / STORE / `cdata_blob` / `raw_zip` restores).
+Dehydrate still notes signed JARs and packs. `--fail-on-signed` aborts. `--strict` does not promote the signed notice. The “rebuild will break the signature” warning is for rebuild jars and the content/`ZipWriter` fallback.
 
 ---
 
@@ -283,7 +303,7 @@ Rehydrate spills blobs to a CAS directory. Peak is the largest blob being copied
 | Zip-slip (`../` in entry or `jar.name`) | Reject `jar.name` with `/`, `\`, `..`. Skip entry components `..`. |
 | Zip bomb | `--max-entry-bytes` |
 | Encrypted ZIP | Fail with path; do not decrypt |
-| Signed JAR silently broken | Detect; warn; exact restore keeps bytes; `--fail-on-signed` |
+| Signed JAR silently broken | Detect; warn; splice may keep bytes; rebuild will not; `--fail-on-signed` |
 | Traversal via `--cas-dir` / output | `--clean` only deletes names we write. CAS paths are hex |
 | `unsafe` | `forbid(unsafe_code)` |
 | SSRF | No network in the crate |
@@ -292,14 +312,16 @@ Treat a `.ayz` as sensitive as the input JARs: it contains file contents and ori
 
 ---
 
-## Non-goals (v2)
+## Non-goals (v2 / 0.2.1)
 
 - Recursively exploding nested JARs
-- A `--verbatim` / `--exact-cdata` CLI flag (metadata-only is the default; bit-identical when the codec hits)
+- A `--verbatim` / `--exact-cdata` CLI flag
+- Java/zlib bit-identical whole-file hashes (Matt locked this out)
+- Dual `cdata_blob` + content; `raw_zip` of jars that parse
+- Per-blob zstd frames as the default
 - HTTP CAS, S3, split archives, GUI, Maven/Gradle plugins
 - Renaming v1 manifest fields (`blob`, `uncompressed_size`, `local_header_offset`, …)
-- Per-blob zstd frames as the default
 - zstd-framed / edition-2024 dependencies
 - Tokio, reqwest, openssl
 
-Future: `--explode-nested`, a class-file zstd dictionary.
+Future: `--explode-nested`, a class-file zstd dictionary. Implement [`PLAN.md`](PLAN.md) (crate 0.2.1 writer: never emit `cdata_blob`) before any of those.
