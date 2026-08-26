@@ -1200,6 +1200,44 @@ fn mixed_regular_and_spring_pack_trailer_is_ayzptlr1_and_rehydrates() {
 }
 
 #[test]
+fn roundtrip_decoy_pk_in_launcher_stub() {
+    // Issue #24: decoy PK\x03\x04 at offset 20 must not truncate a 37-byte prefix.
+    let prefix = b"#!/bin/bash\n# decoy PK\x03\x04 here\nexit 0\n";
+    assert_eq!(prefix.len(), 37);
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("falsepk.jar");
+    write_wrapped_jar(&jar, prefix, &[("App.class", b"hello-app")]);
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert_eq!(m.jars[0].prefix_size, Some(prefix.len() as u64));
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("falsepk.jar");
+    assert_eq!(&fs::read(&restored).unwrap()[..prefix.len()], prefix);
+    assert_bit_identical(&jar, &restored);
+}
+
+#[test]
+fn roundtrip_empty_prefixed_zip_a() {
+    // Issue #25: empty ZIP after zip -A must pack and restore the prefix.
+    let prefix = b"#!/bin/bash\nexit 0\n";
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("empty_zipA.jar");
+    write_wrapped_jar_adjusted(&jar, prefix, &[]);
+    let out = dir.path().join("emptyA.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()]))
+        .expect("empty prefixed ZIP after zip -A must not be NotZip");
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert_eq!(m.jars[0].prefix_size, Some(prefix.len() as u64));
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("empty_zipA.jar");
+    assert_eq!(&fs::read(&restored).unwrap()[..prefix.len()], prefix);
+    assert_bit_identical(&jar, &restored);
+}
+
+#[test]
 fn two_wrapped_jars_share_one_prefix_blob() {
     let dir = tempfile::tempdir().unwrap();
     let a = dir.path().join("a.jar");
