@@ -4,9 +4,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufWriter, Seek, Write};
+use std::io::{self, BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use walkdir::WalkDir;
 
 use crate::error::{AyzenpackError, Result};
 use crate::format::{
@@ -92,11 +94,7 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
         )));
     }
 
-    let mut inputs = opts.inputs.clone();
-    if opts.sort_inputs {
-        inputs.sort();
-    }
-    inputs = dedupe_inputs(inputs, opts);
+    let inputs = expand_inputs(opts)?;
 
     let created_unix = if opts.sort_inputs { 0 } else { unix_now() };
     let header = FileHeader::new(opts.level, created_unix);
@@ -426,6 +424,110 @@ fn entry_from_scan(
     }
 }
 
+/// Expand CLI inputs: optional recursive walk, `--exclude`, then sort + dedupe.
+/// Exclude matches the path as given or the basename; glob `*` does not cross `/`.
+fn expand_inputs(opts: &DehydrateOptions) -> Result<Vec<PathBuf>> {
+    let patterns = compile_excludes(&opts.exclude)?;
+    let mut out = Vec::new();
+    for path in &opts.inputs {
+        if path_excluded(path, &patterns) {
+            continue;
+        }
+        if path.is_dir() && opts.recursive {
+            expand_dir(path, opts, &patterns, &mut out)?;
+        } else {
+            out.push(path.clone());
+        }
+    }
+    if opts.sort_inputs {
+        out.sort();
+    }
+    Ok(dedupe_inputs(out, opts))
+}
+
+/// glob 0.3 defaults let `*` cross `/` and treat `**` as globstar.
+/// v1: `*` is one path component; `**` is not recursive.
+const EXCLUDE_MATCH: glob::MatchOptions = glob::MatchOptions {
+    case_sensitive: true,
+    require_literal_separator: true,
+    require_literal_leading_dot: false,
+};
+
+fn compile_excludes(globs: &[String]) -> Result<Vec<glob::Pattern>> {
+    let mut out = Vec::with_capacity(globs.len());
+    for g in globs {
+        glob::Pattern::new(g)
+            .map_err(|err| AyzenpackError::Usage(format!("invalid --exclude glob '{g}': {err}")))?;
+        let flattened = g.replace("**", "*");
+        out.push(glob::Pattern::new(&flattened).map_err(|err| {
+            AyzenpackError::Usage(format!("invalid --exclude glob '{g}': {err}"))
+        })?);
+    }
+    Ok(out)
+}
+
+fn path_excluded(path: &Path, patterns: &[glob::Pattern]) -> bool {
+    let path_str = path.to_string_lossy();
+    patterns.iter().any(|pat| {
+        pat.matches_with(&path_str, EXCLUDE_MATCH)
+            || path
+                .file_name()
+                .is_some_and(|n| pat.matches_with(&n.to_string_lossy(), EXCLUDE_MATCH))
+    })
+}
+
+fn is_archive_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "jar" | "zip" | "war" | "ear"
+            )
+        })
+}
+
+fn expand_dir(
+    dir: &Path,
+    opts: &DehydrateOptions,
+    patterns: &[glob::Pattern],
+    out: &mut Vec<PathBuf>,
+) -> Result<()> {
+    // follow_links default off: symlink directories are listed, not entered.
+    let walker = WalkDir::new(dir).follow_links(opts.follow_symlinks);
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                let e = map_walk_error(err);
+                if opts.strict {
+                    return Err(e);
+                }
+                warn(opts, &e.to_string());
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if !is_archive_path(path) || path_excluded(path, patterns) {
+            continue;
+        }
+        out.push(path.to_path_buf());
+    }
+    Ok(())
+}
+
+fn map_walk_error(err: walkdir::Error) -> AyzenpackError {
+    let path = err.path().map(Path::to_path_buf);
+    let source = match err.io_error() {
+        Some(ioe) => io::Error::new(ioe.kind(), ioe.to_string()),
+        None => io::Error::other(err.to_string()),
+    };
+    AyzenpackError::Io { source, path }
+}
+
 fn unique_basename(path: &Path, used: &mut HashMap<String, u32>) -> Result<String> {
     let base = path
         .file_name()
@@ -516,5 +618,25 @@ mod tests {
         let mut used = HashMap::new();
         let err = unique_basename(Path::new(".."), &mut used).unwrap_err();
         assert!(matches!(err, AyzenpackError::UnsafePath(_)));
+    }
+
+    #[test]
+    fn exclude_glob_matches_cli_path_or_basename_not_globstar() {
+        // Guards treating * as globstar or matching only the full path.
+        let cases = [
+            ("*.sources.jar", "apps/web/lib/foo.sources.jar", true),
+            ("*/secret/*", "vendor/secret/x.jar", true),
+            ("apps/web/lib/foo.jar", "apps/web/lib/foo.jar", true),
+            ("*.sources.jar", "foo.sources.jar", true),
+            ("vendor/**", "vendor/a/b.jar", false),
+        ];
+        for (glob_s, path, want) in cases {
+            let pats = compile_excludes(&[glob_s.to_string()]).unwrap();
+            assert_eq!(
+                path_excluded(Path::new(path), &pats),
+                want,
+                "{glob_s} vs {path}"
+            );
+        }
     }
 }
