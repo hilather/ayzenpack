@@ -70,8 +70,16 @@ fn ci_yml_has_windows_test_and_msrv_1_80() {
         "MSRV job must pin toolchain 1.80 (quoted so YAML is not 1.8)"
     );
     assert!(
-        CI_YML.contains("cargo check --locked") || CI_YML.contains("cargo test --locked"),
-        "MSRV job must cargo check --locked (or test)"
+        CI_YML.contains("cargo +1.80 fetch --locked --target x86_64-unknown-linux-gnu"),
+        "MSRV must fetch with 1.80 for the host target (skips wasip2/wit-bindgen)"
+    );
+    assert!(
+        CI_YML.contains("cargo +1.80 check --locked --target x86_64-unknown-linux-gnu"),
+        "MSRV must cargo +1.80 check --locked --target (same graph as fetch)"
+    );
+    assert!(
+        !CI_YML.contains("cargo +stable fetch"),
+        "MSRV must not fetch with stable then check 1.80 offline (index mismatch)"
     );
 }
 
