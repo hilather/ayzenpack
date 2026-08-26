@@ -93,6 +93,111 @@ fn stdout_quiet_on_success() {
 }
 
 #[test]
+fn stats_line_on_stderr_not_stdout() {
+    // Guards stats/progress on stdout breaking pipes.
+    let dir = tempfile::tempdir().unwrap();
+    let jar = sample_jar(dir.path());
+    let out = dir.path().join("out.ayz");
+    let output = ayzenpack()
+        .arg("dehydrate")
+        .arg("-o")
+        .arg(&out)
+        .arg(&jar)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .get_output()
+        .clone();
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("ayzenpack:")
+            && err.contains("jars")
+            && err.contains("entries")
+            && err.contains("unique blobs")
+            && err.contains("unique, zstd")
+            && err.contains("of jar bytes"),
+        "stats line missing from stderr: {err}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("entries") && !stdout.contains("["),
+        "progress/stats leaked to stdout: {stdout:?}"
+    );
+}
+
+#[test]
+fn quiet_suppresses_progress() {
+    // Guards progress on stdout, or still drawing under -q.
+    let dir = tempfile::tempdir().unwrap();
+    let jar = sample_jar(dir.path());
+
+    let noisy_out = dir.path().join("noisy.ayz");
+    let noisy = ayzenpack()
+        .arg("dehydrate")
+        .arg("-o")
+        .arg(&noisy_out)
+        .arg(&jar)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .get_output()
+        .clone();
+    let noisy_err = String::from_utf8_lossy(&noisy.stderr);
+    assert!(
+        noisy_err.contains("a.jar:"),
+        "expected per-JAR progress on stderr, got: {noisy_err}"
+    );
+
+    let quiet_out = dir.path().join("quiet.ayz");
+    ayzenpack()
+        .arg("-q")
+        .arg("dehydrate")
+        .arg("-o")
+        .arg(&quiet_out)
+        .arg(&jar)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("a.jar:").not())
+        .stderr(predicate::str::contains("[").not());
+}
+
+#[test]
+fn json_logs_one_object_per_event() {
+    // Guards mixing human lines with --json-logs, or events on stdout.
+    let dir = tempfile::tempdir().unwrap();
+    let jar = sample_jar(dir.path());
+    let out = dir.path().join("out.ayz");
+    let output = ayzenpack()
+        .arg("--json-logs")
+        .arg("dehydrate")
+        .arg("-o")
+        .arg(&out)
+        .arg(&jar)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .get_output()
+        .clone();
+    let err = String::from_utf8(output.stderr.clone()).unwrap();
+    let mut saw_jar_done = false;
+    for line in err.lines().filter(|l| !l.is_empty()) {
+        let v: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("stderr line is not one JSON object ({e}): {line}"));
+        assert!(
+            v.get("event").and_then(|e| e.as_str()).is_some(),
+            "JSON event missing event field: {line}"
+        );
+        if v["event"] == "jar_done" {
+            saw_jar_done = true;
+            assert_eq!(v["name"], "a.jar");
+            assert!(v["entries"].as_u64().unwrap_or(0) >= 1);
+        }
+    }
+    assert!(saw_jar_done, "missing jar_done JSON event in stderr: {err}");
+}
+
+#[test]
 fn dehydrate_o_overwrites_existing_ayz() {
     let dir = tempfile::tempdir().unwrap();
     let jar = sample_jar(dir.path());

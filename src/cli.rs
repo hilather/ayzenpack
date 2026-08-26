@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::anyhow;
 use clap::{Parser, Subcommand};
 
+use ayzenpack::stats::{fmt_bytes, format_stats_line, json_event};
 use ayzenpack::{
     dehydrate, list, rehydrate, verify, AyzenpackError, DehydrateOptions, DehydrateSummary,
     Manifest, RehydrateOptions, Trailer,
@@ -16,10 +17,13 @@ use ayzenpack::{
     about = "Dehydrate / rehydrate JAR sets with BLAKE3 + zstd"
 )]
 pub struct Cli {
+    /// No stderr progress
     #[arg(short, long, global = true)]
     quiet: bool,
+    /// Extra stderr (each JAR path)
     #[arg(short, long, global = true)]
     verbose: bool,
+    /// One JSON object per event on stderr
     #[arg(long, global = true)]
     json_logs: bool,
     #[command(subcommand)]
@@ -298,35 +302,33 @@ fn print_human_list(manifest: &Manifest, trailer: &Trailer) {
 }
 
 fn print_dehydrate_stats(opts: &DehydrateOptions, summary: &DehydrateSummary) {
+    if opts.json_logs {
+        json_event(&serde_json::json!({
+            "event": "stats",
+            "jars": summary.jar_count,
+            "entries": summary.entry_count,
+            "unique_blobs": summary.unique_blob_count,
+            "bytes_uncompressed_entries": summary.bytes_uncompressed_entries,
+            "bytes_unique_blobs": summary.bytes_unique_blobs,
+            "zstd_bytes": summary.output_len,
+            "bytes_in_jars": summary.bytes_in_jars,
+            "dedup_ratio": summary.dedup_ratio,
+        }));
+        return;
+    }
     if opts.quiet {
         return;
     }
-    let ratio = if summary.bytes_in_jars == 0 {
-        0.0
-    } else {
-        summary.output_len as f64 / summary.bytes_in_jars as f64
-    };
     eprintln!(
-        "ayzenpack: {} jars, {} entries, {} unique blobs, {} → {} unique, zstd {} ({:.3} of jar bytes)",
-        summary.jar_count,
-        summary.entry_count,
-        summary.unique_blob_count,
-        fmt_bytes(summary.bytes_uncompressed_entries),
-        fmt_bytes(summary.bytes_unique_blobs),
-        fmt_bytes(summary.output_len),
-        ratio,
+        "{}",
+        format_stats_line(
+            summary.jar_count,
+            summary.entry_count,
+            summary.unique_blob_count,
+            summary.bytes_uncompressed_entries,
+            summary.bytes_unique_blobs,
+            summary.output_len,
+            summary.bytes_in_jars,
+        )
     );
-}
-
-fn fmt_bytes(n: u64) -> String {
-    const MIB: f64 = 1024.0 * 1024.0;
-    const KIB: f64 = 1024.0;
-    let x = n as f64;
-    if x >= MIB {
-        format!("{:.1} MiB", x / MIB)
-    } else if x >= KIB {
-        format!("{:.1} KiB", x / KIB)
-    } else {
-        format!("{n} B")
-    }
 }

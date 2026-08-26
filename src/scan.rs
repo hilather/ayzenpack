@@ -57,8 +57,22 @@ pub fn scan_jar(path: &Path, max_entry: u64) -> Result<ScannedJar> {
 
 /// Inflate one entry at a time. `payload` is `None` for directories and
 /// `Some` for files; the slice is invalid after `f` returns.
-pub fn for_each_jar_entry<F>(path: &Path, max_entry: u64, mut f: F) -> Result<ScannedJar>
+pub fn for_each_jar_entry<F>(path: &Path, max_entry: u64, f: F) -> Result<ScannedJar>
 where
+    F: FnMut(&ScannedEntry, Option<&[u8]>) -> Result<()>,
+{
+    for_each_jar_entry_with_len(path, max_entry, |_| {}, f)
+}
+
+/// Same as [`for_each_jar_entry`], then `on_len(archive.len())` before the first entry.
+pub(crate) fn for_each_jar_entry_with_len<L, F>(
+    path: &Path,
+    max_entry: u64,
+    mut on_len: L,
+    mut f: F,
+) -> Result<ScannedJar>
+where
+    L: FnMut(u64),
     F: FnMut(&ScannedEntry, Option<&[u8]>) -> Result<()>,
 {
     let mut file = File::open(path).map_err(|source| io_at(source, path))?;
@@ -72,6 +86,7 @@ where
     let reader = BufReader::with_capacity(ZIP_BUF, file);
     let mut archive = ZipArchive::new(reader).map_err(|err| map_archive_open_err(err, path))?;
     let comment = String::from_utf8_lossy(archive.comment()).into_owned();
+    on_len(archive.len() as u64);
 
     let mut entries = Vec::with_capacity(archive.len());
     let mut signed = false;

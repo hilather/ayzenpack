@@ -17,8 +17,8 @@ use crate::format::{
 };
 use crate::hashutil::{hash_both, hex_lower};
 use crate::manifest::{Blob, Entry, Jar, Manifest, Stats, MANIFEST_FORMAT};
-use crate::scan::for_each_jar_entry;
-use crate::stats::dedup_ratio;
+use crate::scan::for_each_jar_entry_with_len;
+use crate::stats::{dedup_ratio, json_event, PackProgress};
 
 const DEFAULT_LEVEL: i32 = 3;
 const DEFAULT_MAX_ENTRY: u64 = 2_147_483_647;
@@ -115,6 +115,7 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
     let mut file_entry_count = 0u64;
     let mut bytes_in_jars = 0u64;
     let mut bytes_uncompressed_entries = 0u64;
+    let progress = PackProgress::new(opts.quiet, opts.json_logs);
 
     for path in &inputs {
         match fs::metadata(path) {
@@ -143,72 +144,80 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
             Ok(_) => {}
         }
 
-        let mut jar_entries = Vec::new();
-        let scanned = for_each_jar_entry(path, opts.max_entry_bytes, |meta, payload| {
-            entry_count += 1;
-            if meta.is_dir {
-                jar_entries.push(entry_from_scan(meta, None, None));
-                return Ok(());
-            }
-            let buf = payload.ok_or_else(|| {
-                AyzenpackError::FormatOwned(format!(
-                    "missing payload for file entry {}!{}",
-                    path.display(),
-                    meta.name
-                ))
-            })?;
-            file_entry_count += 1;
-            bytes_uncompressed_entries += buf.len() as u64;
-
-            if opts.strict && meta.name_raw_hex.is_some() {
-                return Err(AyzenpackError::FormatOwned(format!(
-                    "non-UTF-8 entry name in {}!{}",
-                    path.display(),
-                    meta.name
-                )));
-            }
-
-            let recomputed = crc32fast::hash(buf);
-            if recomputed != meta.crc32 {
-                let msg = format!(
-                    "CRC mismatch for {}!{}: header {:#x} computed {:#x}",
-                    path.display(),
-                    meta.name,
-                    meta.crc32,
-                    recomputed
-                );
-                if opts.strict {
-                    return Err(AyzenpackError::FormatOwned(msg));
-                }
-                warn(opts, &msg);
-            }
-
-            let (b3, s256) = hash_both(buf);
-            if let Some(&i) = seen.get(&b3) {
-                blobs[i].ref_count += 1;
-            } else {
-                if let Some(ref mut w) = writer {
-                    // Write from the scan buffer; do not clone a second payload Vec.
-                    write_blob_record(&mut w.enc, &b3, buf)?;
-                }
-                first_seen.update(&b3);
-                seen.insert(b3, blobs.len());
-                blobs.push(Blob {
-                    blake3: hex_lower(&b3),
-                    sha256: hex_lower(&s256),
-                    size: buf.len() as u64,
-                    ref_count: 1,
-                });
-            }
-            jar_entries.push(entry_from_scan(
-                meta,
-                Some(hex_lower(&b3)),
-                Some(hex_lower(&s256)),
-            ));
-            Ok(())
-        })?;
-
         let jar_name = unique_basename(path, &mut used_names)?;
+        verbose(opts, &format!("{}", path.display()));
+        let mut jar_entries = Vec::new();
+        let scanned = for_each_jar_entry_with_len(
+            path,
+            opts.max_entry_bytes,
+            |n| progress.start_jar(&jar_name, n),
+            |meta, payload| {
+                progress.inc_entry();
+                entry_count += 1;
+                if meta.is_dir {
+                    jar_entries.push(entry_from_scan(meta, None, None));
+                    return Ok(());
+                }
+                let buf = payload.ok_or_else(|| {
+                    AyzenpackError::FormatOwned(format!(
+                        "missing payload for file entry {}!{}",
+                        path.display(),
+                        meta.name
+                    ))
+                })?;
+                file_entry_count += 1;
+                bytes_uncompressed_entries += buf.len() as u64;
+
+                if opts.strict && meta.name_raw_hex.is_some() {
+                    return Err(AyzenpackError::FormatOwned(format!(
+                        "non-UTF-8 entry name in {}!{}",
+                        path.display(),
+                        meta.name
+                    )));
+                }
+
+                let recomputed = crc32fast::hash(buf);
+                if recomputed != meta.crc32 {
+                    let msg = format!(
+                        "CRC mismatch for {}!{}: header {:#x} computed {:#x}",
+                        path.display(),
+                        meta.name,
+                        meta.crc32,
+                        recomputed
+                    );
+                    if opts.strict {
+                        return Err(AyzenpackError::FormatOwned(msg));
+                    }
+                    warn(opts, &msg);
+                }
+
+                let (b3, s256) = hash_both(buf);
+                if let Some(&i) = seen.get(&b3) {
+                    blobs[i].ref_count += 1;
+                } else {
+                    if let Some(ref mut w) = writer {
+                        // Write from the scan buffer; do not clone a second payload Vec.
+                        write_blob_record(&mut w.enc, &b3, buf)?;
+                    }
+                    first_seen.update(&b3);
+                    seen.insert(b3, blobs.len());
+                    blobs.push(Blob {
+                        blake3: hex_lower(&b3),
+                        sha256: hex_lower(&s256),
+                        size: buf.len() as u64,
+                        ref_count: 1,
+                    });
+                }
+                jar_entries.push(entry_from_scan(
+                    meta,
+                    Some(hex_lower(&b3)),
+                    Some(hex_lower(&s256)),
+                ));
+                Ok(())
+            },
+        )?;
+        progress.finish_jar(&jar_name, scanned.entries.len() as u64);
+
         if scanned.signed {
             signed_jars.push(jar_name.clone());
             let msg = format!("signed JAR {jar_name} (rebuild will break the signature)");
@@ -566,10 +575,28 @@ fn dedupe_inputs(inputs: Vec<PathBuf>, opts: &DehydrateOptions) -> Vec<PathBuf> 
 }
 
 fn warn(opts: &DehydrateOptions, msg: &str) {
+    if opts.json_logs {
+        json_event(&serde_json::json!({"event": "warning", "message": msg}));
+        return;
+    }
     if opts.quiet {
         return;
     }
     eprintln!("ayzenpack: warning: {msg}");
+}
+
+fn verbose(opts: &DehydrateOptions, msg: &str) {
+    if !opts.verbose {
+        return;
+    }
+    if opts.json_logs {
+        json_event(&serde_json::json!({"event": "verbose", "message": msg}));
+        return;
+    }
+    if opts.quiet {
+        return;
+    }
+    eprintln!("ayzenpack: {msg}");
 }
 
 fn unix_now() -> u64 {
