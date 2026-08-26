@@ -234,3 +234,188 @@ pub fn write_stored_zip(path: &Path, files: &[(&str, &[u8], u32)]) {
     local.extend_from_slice(&0u16.to_le_bytes());
     std::fs::write(path, local).unwrap();
 }
+
+/// Stored ZIP with GPBF bit 3 and a signed data descriptor after the payload.
+pub fn write_data_descriptor_zip(path: &Path, name: &str, data: &[u8]) {
+    let name_b = name.as_bytes();
+    let crc = crc32fast::hash(data);
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"PK\x03\x04");
+    buf.extend_from_slice(&20u16.to_le_bytes());
+    buf.extend_from_slice(&8u16.to_le_bytes()); // GPBF bit 3
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(name_b);
+    buf.extend_from_slice(data);
+    buf.extend_from_slice(b"PK\x07\x08");
+    buf.extend_from_slice(&crc.to_le_bytes());
+    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+
+    let cd_off = buf.len() as u32;
+    buf.extend_from_slice(b"PK\x01\x02");
+    buf.extend_from_slice(&20u16.to_le_bytes());
+    buf.extend_from_slice(&20u16.to_le_bytes());
+    buf.extend_from_slice(&8u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&crc.to_le_bytes());
+    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(name_b);
+
+    let cd_len = buf.len() as u32 - cd_off;
+    buf.extend_from_slice(b"PK\x05\x06");
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.extend_from_slice(&cd_len.to_le_bytes());
+    buf.extend_from_slice(&cd_off.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    std::fs::write(path, buf).unwrap();
+}
+
+/// Two stored locals with zero padding between them (zipalign-style gap).
+pub fn write_padded_locals_zip(
+    path: &Path,
+    first: (&str, &[u8]),
+    second: (&str, &[u8]),
+    pad: usize,
+) {
+    let files = vec![
+        (first.0, first.1, crc32fast::hash(first.1)),
+        (second.0, second.1, crc32fast::hash(second.1)),
+    ];
+    let tmp = path.with_extension("tmp.jar");
+    write_stored_zip(&tmp, &files);
+    let bytes = std::fs::read(&tmp).unwrap();
+    std::fs::remove_file(&tmp).unwrap();
+
+    // Insert `pad` zeros after the first local record (header + name + data).
+    let name_b = first.0.as_bytes();
+    let first_rec = 30 + name_b.len() + first.1.len();
+    let mut out = Vec::with_capacity(bytes.len() + pad);
+    out.extend_from_slice(&bytes[..first_rec]);
+    out.extend(std::iter::repeat(0u8).take(pad));
+    out.extend_from_slice(&bytes[first_rec..]);
+    // Patch second CD local offset and EOCD CD offset (+pad).
+    let eocd = {
+        let mut i = out.len() - 22;
+        loop {
+            if out[i..i + 4] == *b"PK\x05\x06" {
+                break i;
+            }
+            i -= 1;
+        }
+    };
+    let cd_off = u32::from_le_bytes(out[eocd + 16..eocd + 20].try_into().unwrap()) as usize + pad;
+    out[eocd + 16..eocd + 20].copy_from_slice(&(cd_off as u32).to_le_bytes());
+    let mut i = cd_off;
+    let cd_size = u32::from_le_bytes(out[eocd + 12..eocd + 16].try_into().unwrap()) as usize;
+    let cd_end = i + cd_size;
+    let mut n = 0;
+    while i + 46 <= cd_end {
+        let name_len = u16::from_le_bytes([out[i + 28], out[i + 29]]) as usize;
+        let extra_len = u16::from_le_bytes([out[i + 30], out[i + 31]]) as usize;
+        let comment_len = u16::from_le_bytes([out[i + 32], out[i + 33]]) as usize;
+        if n == 1 {
+            let off = u32::from_le_bytes(out[i + 42..i + 46].try_into().unwrap());
+            out[i + 42..i + 46].copy_from_slice(&(off + pad as u32).to_le_bytes());
+        }
+        n += 1;
+        i += 46 + name_len + extra_len + comment_len;
+    }
+    std::fs::write(path, out).unwrap();
+}
+
+pub fn write_jar_with_comment(path: &Path, files: &[(&str, &[u8])], comment: &str) {
+    let mut z = ZipWriter::new(File::create(path).unwrap());
+    z.set_comment(comment);
+    let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    for (name, data) in files {
+        z.start_file(*name, opts).unwrap();
+        z.write_all(data).unwrap();
+    }
+    z.finish().unwrap();
+}
+
+/// Stored ZIP whose file name is not valid UTF-8 (`name_raw_hex` on scan).
+pub fn write_non_utf8_name_zip(path: &Path, data: &[u8]) {
+    let name_b: &[u8] = &[0xff, 0xfe, b'.', b't', b'x', b't'];
+    let crc = crc32fast::hash(data);
+    let mut local = Vec::new();
+    local.extend_from_slice(b"PK\x03\x04");
+    local.extend_from_slice(&20u16.to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(&crc.to_le_bytes());
+    local.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    local.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    local.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(name_b);
+    local.extend_from_slice(data);
+
+    local.extend_from_slice(b"PK\x01\x02");
+    local.extend_from_slice(&20u16.to_le_bytes());
+    local.extend_from_slice(&20u16.to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(&crc.to_le_bytes());
+    local.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    local.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    local.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(&0u32.to_le_bytes());
+    local.extend_from_slice(&0u32.to_le_bytes());
+    local.extend_from_slice(name_b);
+
+    let cd_off = (30 + name_b.len() + data.len()) as u32;
+    let cd_len = (46 + name_b.len()) as u32;
+    local.extend_from_slice(b"PK\x05\x06");
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(&1u16.to_le_bytes());
+    local.extend_from_slice(&1u16.to_le_bytes());
+    local.extend_from_slice(&cd_len.to_le_bytes());
+    local.extend_from_slice(&cd_off.to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    std::fs::write(path, local).unwrap();
+}
+
+pub fn write_signed_looking_jar(path: &Path) {
+    write_jar(
+        path,
+        &[
+            ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n"),
+            (
+                "META-INF/FOO.SF",
+                b"Signature-Version: 1.0\nSHA-256-Digest-Manifest: abc\n",
+            ),
+            ("META-INF/FOO.RSA", b"pkcs7-placeholder"),
+            ("com/App.class", b"class-bytes"),
+        ],
+    );
+}

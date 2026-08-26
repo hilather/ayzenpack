@@ -393,8 +393,16 @@ fn corpus_guava_copies_unique_blobs_eq_one_jar_file_entries() {
     let summary = dehydrate(&opts).unwrap();
     assert_eq!(summary.jar_count, 2);
     assert_eq!(summary.file_entry_count, one_jar_files * 2);
+    let m = ayzenpack::list(&out).unwrap();
+    let content: std::collections::BTreeSet<_> = m
+        .jars
+        .iter()
+        .flat_map(|j| j.entries.iter().filter_map(|e| e.blob.clone()))
+        .collect();
     assert_eq!(
-        summary.unique_blob_count, one_jar_files,
-        "unique blobs for duplicated guava copies must equal one JAR's file-entry count"
+        content.len() as u64,
+        one_jar_files,
+        "content blobs for duplicated guava copies must equal one JAR's file-entry count"
     );
+    assert!(summary.unique_blob_count >= one_jar_files);
 }

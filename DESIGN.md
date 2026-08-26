@@ -81,7 +81,7 @@ Unknown header keys are ignored. Version byte (offset 4) `> 1` is `unsupported v
   "zstd_level": 3,
   "created_unix": 1710000000,
   "tool": "ayzenpack",
-  "tool_version": "0.1.5"
+  "tool_version": "0.1.6"
 }
 ```
 
@@ -146,27 +146,44 @@ Root: `format`, `version`, `hash_algo`, `mode`, `jars[]`, `blobs[]`, `stats`.
 
 `blobs[]` is first-seen order (must match BLOB records and END). `jars[].entries[]` is central-directory order. Directory entries have `blob: null`. `jars[].name` is a single path segment; `..`, `/`, `\` are rejected.
 
-v1 rebuild uses `name` (Unicode from `ZipFile::name()`), `is_dir`, `blob`, `crc32`, `dos_*` via `DateTime::try_from_msdos` with `DateTime::default()` fallback, and `unix_mode`. `utf8_flag` is recorded only. `name_raw_hex` is not used on write. `method` is advisory: rebuilt files deflate, directories store, unless `--store-all`.
+v1 **content** rebuild (old archives) uses `name` (Unicode from `ZipFile::name()`), `is_dir`, `blob`, `crc32`, `dos_*` via `DateTime::try_from_msdos` with `DateTime::default()` fallback, and `unix_mode`. `utf8_flag` is recorded only. `name_raw_hex` is not used on write. `method` is advisory: rebuilt files deflate, directories store, unless `--store-all`.
+
+New packs also store optional exact-reconstruction fields (omitted when absent, same style as `prefix_blob`). Unknown keys stay ignored on read.
 
 ---
 
 ## Reconstruction
 
-Functional identity of uncompressed entries, names, central-directory order, and CRC-32. Not bit-identity of the ZIP container.
+New packs default to **bit-identical** restore. After dehydrate + rehydrate, `source_blake3` / `source_sha256` / `source_size` match and `cmp` is equal.
+
+Uncompressed entry `blob`s are still stored for listing, CRC checks, and cross-jar content dedup (`BOOT-INF/lib`). Nested JARs stay opaque entry blobs.
+
+Per file entry, optional `cdata_blob` is the BLAKE3 of the original compressed payload (read by seeking to the local header from the central directory — not the zip crate's inflating reader). For `method=stored`, `cdata_blob` and `blob` are the same CAS object (one put, two refs).
+
+Each entry also records enough to emit the original local record:
+
+- raw local header (`30 + name + extra`) as `local_header_hex` when small, else `local_header_blob`
+- optional `data_descriptor_hex` when GPBF bit 3 is set
+- pad after the record to the next local (`pad_zeros` if all zeros, else `pad_blob`)
+- zip-relative `local_header_offset`
+
+Per jar: `tail_blob` / `tail_size` is bytes from the start of the central directory through zip EOF (CD + Zip64 EOCD + locator + EOCD + archive comment). Copying the tail is simpler than reconstructing CD extras, which often differ from local extras.
+
+Exact rehydrate: write prefix (existing path), write each local at its offset, write `cdata`, write descriptor, pad, write tail, `chmod 0755` if a prefix is present, then verify whole-file hashes. Fail on mismatch.
+
+If a zip cannot be sliced cleanly (spanning, parse failure, ZipArchive entry count ≠ CD count): store `raw_zip_blob` of the entire zip portion after the prefix and copy it. Prefix stays a separate CAS blob. Whole-file hashes are still verified.
+
+**Old archives** (no `cdata` / `tail` / `raw_zip`): keep the 0.1.x `ZipWriter` path. Functional identity only — deflate bitstream, extras, descriptors, and alignment are not preserved. `--verbatim` is not a CLI flag; new packs do not need one.
 
 ```
-∀ jar, ∀ entry:
-  uncompressed_bytes(rebuilt) == uncompressed_bytes(source)
-  entry.name sequence equal          // Unicode string
-  entry.crc32 equal
-  valid DOS date/time preserved
+∀ jar (exact pack):
+  restored_bytes == source_bytes
+  blake3(restored) == jars[].source_blake3
+  sha256(restored) == jars[].source_sha256
+  len(restored) == jars[].source_size
 ```
 
-Invalid DOS pairs including `0,0` (common in JARs) fall back to 1980-01-01. Never `from_msdos_unchecked`.
-
-Not guaranteed: deflate bitstream, extra fields (dropped; zipalign is not preserved), data descriptors, GPBF bit 11, raw name encoding. `--verbatim` is not in v1.
-
-Nested `.jar` entries are opaque blobs. They are not exploded.
+Invalid DOS pairs including `0,0` still fall back to 1980-01-01 on the content path. Never `from_msdos_unchecked`.
 
 ---
 
@@ -187,19 +204,19 @@ extra = (eocd_file_offset - cd_size) - recorded_cd_offset
 
 The prefix is stored as a first-seen CAS BLOB (same `hash_both` path as entry payloads). Shared launchers across JARs dedup (`ref_count > 1`). Manifest `jars[]` may include optional `prefix_blob` (hex BLAKE3) and `prefix_size`. Omitted on normal ZIPs so old archives still list/rehydrate.
 
-Rehydrate writes the prefix bytes first, then `ZipWriter` on the same file (`[prefix][zip]`). The rebuilt ZIP is unadjusted (offsets ZIP-relative). On Unix the restored file is `chmod 0755` so it stays executable.
+Rehydrate writes the prefix bytes first. Exact packs then splice locals + tail (or `raw_zip`) so the file stays `[official launch.script][zip]` with original offsets. On Unix the restored file is `chmod 0755` so it stays executable.
 
-`source_blake3` / `source_sha256` / `source_size` remain hashes/size of the **whole** input (prefix + ZIP).
+`source_blake3` / `source_sha256` / `source_size` remain hashes/size of the **whole** input (prefix + ZIP) and are checked after exact restore.
 
-v1 still does not promise ZIP bit-identity: prefix bytes are restored exactly; ZIP entries follow the existing functional-identity rules (names, order, CRC, uncompressed bytes). Nested `BOOT-INF/lib/*.jar` entries stay opaque blobs.
+Nested `BOOT-INF/lib/*.jar` entries stay opaque blobs.
 
 ---
 
 ## Signed JARs
 
-`META-INF/*.SF` plus `*.RSA` / `*.DSA` / `*.EC` digest compressed or stored bytes. Rewriting DEFLATE invalidates signatures. ayzenpack does not re-sign.
+`META-INF/*.SF` plus `*.RSA` / `*.DSA` / `*.EC` digest compressed or stored bytes. Exact restore keeps those bytes, so file-level signatures (JAR `.SF`, SHA256SUMS, cosign, vendor checksums) survive. ayzenpack does not re-sign.
 
-Dehydrate warns and still packs. `--fail-on-signed` aborts. `--strict` does not promote the signed notice.
+Dehydrate still notes signed JARs and packs. `--fail-on-signed` aborts. `--strict` does not promote the signed notice. The “rebuild will break the signature” warning is only for the content/`ZipWriter` fallback.
 
 ---
 
@@ -236,7 +253,7 @@ Dehydrate: one entry `Vec` at a time (or a bounded inflight set when `--jobs > 1
 
 `--max-entry-bytes` (default 2 GiB − 1) is the zip-bomb cap. `--max-inflight-bytes` (default 64 MiB) caps uncompressed buffers in the hash pipeline; a single entry larger than the cap is still admitted so the pipeline cannot stall.
 
-Rehydrate spills blobs to a CAS directory. Peak is the largest entry being copied into a `ZipWriter` plus the zstd decoder buffer.
+Rehydrate spills blobs to a CAS directory. Peak is the largest blob being copied (entry, `cdata`, tail, or `raw_zip`) plus the zstd decoder buffer.
 
 ---
 
@@ -247,7 +264,7 @@ Rehydrate spills blobs to a CAS directory. Peak is the largest entry being copie
 | Zip-slip (`../` in entry or `jar.name`) | Reject `jar.name` with `/`, `\`, `..`. Skip entry components `..`. |
 | Zip bomb | `--max-entry-bytes` |
 | Encrypted ZIP | Fail with path; do not decrypt |
-| Signed JAR silently broken | Detect; warn; `--fail-on-signed` |
+| Signed JAR silently broken | Detect; warn; exact restore keeps bytes; `--fail-on-signed` |
 | Traversal via `--cas-dir` / output | `--clean` only deletes names we write. CAS paths are hex |
 | `unsafe` | `forbid(unsafe_code)` |
 | SSRF | No network in the crate |
@@ -259,9 +276,9 @@ Treat a `.ayz` as sensitive as the input JARs: it contains file contents and ori
 ## Non-goals (v1)
 
 - Recursively exploding nested JARs
-- Bit-identical ZIP reconstruction (`--verbatim`)
+- A `--verbatim` CLI flag (new packs are already bit-identical)
 - HTTP CAS, S3, split archives, GUI, Maven/Gradle plugins
 - Renaming v1 manifest fields
 - Tokio, reqwest, openssl
 
-Future: `--verbatim` (CAS key = BLAKE3 of compressed payload ‖ method), `--explode-nested`, seekable zstd + TOC for `list` without full decode, a class-file zstd dictionary.
+Future: `--explode-nested`, seekable zstd + TOC for `list` without full decode, a class-file zstd dictionary.

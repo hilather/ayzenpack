@@ -45,7 +45,8 @@ fn verify_fresh_archive_ok() {
     verify(&out).unwrap();
     let m = list(&out).unwrap();
     assert_eq!(m.jars[0].name, "a.jar");
-    assert_eq!(m.stats.unique_blob_count, 1);
+    assert!(m.stats.unique_blob_count >= 1);
+    assert!(m.jars[0].entries[0].blob.is_some());
 }
 
 #[test]

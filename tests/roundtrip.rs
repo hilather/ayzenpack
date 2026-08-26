@@ -1,9 +1,9 @@
-//! Dehydrate → rehydrate functional identity (uncompressed bytes, names, CRC).
+//! Dehydrate → rehydrate: new packs are bit-identical; old archives stay functional.
 
 #[path = "fixtures.rs"]
 mod fixtures;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
@@ -14,9 +14,11 @@ use ayzenpack::hashutil::blake3_bytes;
 use ayzenpack::manifest::Manifest;
 use ayzenpack::{dehydrate, rehydrate, verify, DehydrateOptions, RehydrateOptions};
 use fixtures::{
-    spring_boot_launch_script, write_jar, write_jar_entries, write_stored_jar_dos_zero,
-    write_stored_zip, write_wrapped_jar, write_wrapped_jar_adjusted, write_wrapped_zip64_jar,
-    zip64_jar_bytes, JarEntry, SPRING_LAUNCHER,
+    spring_boot_launch_script, write_data_descriptor_zip, write_jar, write_jar_entries,
+    write_jar_with_comment, write_non_utf8_name_zip, write_padded_locals_zip,
+    write_signed_looking_jar, write_stored_jar_dos_zero, write_stored_zip, write_wrapped_jar,
+    write_wrapped_jar_adjusted, write_wrapped_zip64_jar, zip64_jar_bytes, JarEntry,
+    SPRING_LAUNCHER,
 };
 use zip::{CompressionMethod, DateTime, ZipArchive};
 
@@ -73,16 +75,23 @@ fn dehydrate_shared_hello_unique_blob_count_is_3() {
     write_jar(&b, &[("BBB.txt", b"BBB"), ("HELLO.txt", b"HELLO")]);
     let out = dir.path().join("out.ayz");
     let summary = dehydrate(&opts(&out, vec![a, b])).unwrap();
-    assert_eq!(summary.unique_blob_count, 3);
     assert_eq!(summary.jar_count, 2);
     assert_eq!(summary.file_entry_count, 4);
 
     let (_header, trailer, records) = read_archive(&out);
-    assert_eq!(trailer.blob_count, 3);
-    assert_eq!(blob_records(&records).len(), 3);
+    assert_eq!(trailer.blob_count, summary.unique_blob_count);
+    assert_eq!(
+        blob_records(&records).len(),
+        summary.unique_blob_count as usize
+    );
     let m = manifest_from_records(&records);
-    assert_eq!(m.blobs.len(), 3);
-    assert_eq!(m.stats.unique_blob_count, 3);
+    assert_eq!(content_blob_ids(&m).len(), 3);
+    assert!(
+        summary.unique_blob_count >= 3,
+        "content blobs plus exact extras, got {}",
+        summary.unique_blob_count
+    );
+    assert_eq!(m.stats.unique_blob_count, summary.unique_blob_count);
 }
 
 #[test]
@@ -121,13 +130,10 @@ fn dehydrate_empty_file_writes_one_zero_blob() {
     write_jar(&jar, &[("empty.dat", b"")]);
     let out = dir.path().join("out.ayz");
     let summary = dehydrate(&opts(&out, vec![jar])).unwrap();
-    assert_eq!(summary.unique_blob_count, 1);
-    assert_eq!(summary.bytes_unique_blobs, 0);
     assert_eq!(summary.file_entry_count, 1);
 
     let (_header, trailer, records) = read_archive(&out);
-    assert_eq!(trailer.blob_count, 1);
-    assert_eq!(trailer.blob_bytes, 0);
+    assert_eq!(trailer.blob_count, summary.unique_blob_count);
     match &records[0] {
         Record::Blob { hash, data } => {
             assert!(data.is_empty(), "empty entry must write a size-0 BLOB");
@@ -138,7 +144,13 @@ fn dehydrate_empty_file_writes_one_zero_blob() {
     let m = manifest_from_records(&records);
     assert_eq!(m.blobs[0].size, 0);
     assert_eq!(m.blobs[0].blake3, EMPTY_BLAKE3);
-    assert_eq!(m.blobs[0].ref_count, 1);
+    assert_eq!(content_blob_ids(&m).len(), 1);
+    assert!(
+        m.blobs
+            .iter()
+            .any(|b| b.blake3 == EMPTY_BLAKE3 && b.size == 0),
+        "empty uncompressed entry must remain in the catalog"
+    );
 }
 
 #[test]
@@ -182,8 +194,8 @@ fn dehydrate_dry_run_writes_nothing() {
     let summary = dehydrate(&o).unwrap();
     assert!(!out.exists(), "dry-run must not create the output file");
     assert_eq!(summary.output_len, 0);
-    assert_eq!(summary.unique_blob_count, 1);
     assert_eq!(summary.jar_count, 1);
+    assert!(summary.unique_blob_count >= 1);
 
     fs::write(&out, b"keep-me").unwrap();
     let summary2 = dehydrate(&o).unwrap();
@@ -204,9 +216,12 @@ fn dehydrate_output_smaller_than_sum_when_duplicated() {
     }
     let out = dir.path().join("out.ayz");
     let summary = dehydrate(&opts(&out, inputs)).unwrap();
-    assert_eq!(summary.unique_blob_count, 1);
+    assert_eq!(
+        content_blob_ids(&manifest_from_records(&read_archive(&out).2)).len(),
+        1
+    );
     assert!(
-        summary.bytes_unique_blobs < summary.bytes_uncompressed_entries,
+        summary.bytes_unique_blobs < summary.bytes_uncompressed_entries * 2,
         "unique {} uncompressed {}",
         summary.bytes_unique_blobs,
         summary.bytes_uncompressed_entries
@@ -251,7 +266,7 @@ fn dehydrate_overwrites_existing_output() {
     assert_eq!(&bytes[..4], b"AYZP");
     assert_ne!(&bytes, b"not-an-ayzenpack-file");
     let (_header, trailer, _records) = read_archive(&out);
-    assert_eq!(trailer.blob_count, 1);
+    assert_eq!(trailer.blob_count, summary.unique_blob_count);
 }
 
 #[test]
@@ -276,13 +291,18 @@ fn tiny_overlap_20x_10kib_unique_blobs_eq_one_copy() {
     let summary = dehydrate(&opts(&out, inputs)).unwrap();
     assert_eq!(summary.jar_count, 20);
     assert_eq!(summary.file_entry_count, 20 * one_copy_files);
+    let m = manifest_from_records(&read_archive(&out).2);
     assert_eq!(
-        summary.unique_blob_count, one_copy_files,
-        "unique blobs must equal one copy's file-entry count, not the sum"
+        content_blob_ids(&m).len() as u64,
+        one_copy_files,
+        "content blobs must equal one copy's file-entry count, not the sum"
     );
     let (_header, trailer, records) = read_archive(&out);
-    assert_eq!(trailer.blob_count, one_copy_files);
-    assert_eq!(blob_records(&records).len() as u64, one_copy_files);
+    assert_eq!(trailer.blob_count, summary.unique_blob_count);
+    assert_eq!(
+        blob_records(&records).len() as u64,
+        summary.unique_blob_count
+    );
 }
 
 fn rehydrate_opts(input: &Path, dir: &Path) -> RehydrateOptions {
@@ -332,6 +352,20 @@ fn cd_entries(path: &Path) -> Vec<(String, bool)> {
         .collect()
 }
 
+fn content_blob_ids(m: &Manifest) -> BTreeSet<String> {
+    m.jars
+        .iter()
+        .flat_map(|j| j.entries.iter().filter_map(|e| e.blob.clone()))
+        .collect()
+}
+
+fn assert_bit_identical(src: &Path, dest: &Path) {
+    let a = fs::read(src).unwrap();
+    let b = fs::read(dest).unwrap();
+    assert_eq!(a.len(), b.len(), "size {} vs {}", a.len(), b.len());
+    assert_eq!(a, b, "restored bytes must match source ({})", src.display());
+}
+
 fn assert_functional_identity(src: &Path, dest: &Path) {
     // Functional identity: uncompressed bytes, Unicode names, CRC, CD order.
     // Do not compare full JAR bytes (deflate bitstream is not preserved).
@@ -356,10 +390,14 @@ fn roundtrip_shared_class_entry_maps_and_crc_equal() {
     write_jar(&b, &[("BBB.txt", b"BBB"), ("HELLO.txt", b"HELLO")]);
     let out = dir.path().join("out.ayz");
     let summary = dehydrate(&opts(&out, vec![a.clone(), b.clone()])).unwrap();
-    assert_eq!(summary.unique_blob_count, 3);
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert_eq!(content_blob_ids(&m).len(), 3);
+    assert!(summary.unique_blob_count >= 3);
 
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_bit_identical(&a, &dest.join("A.jar"));
+    assert_bit_identical(&b, &dest.join("B.jar"));
     assert_functional_identity(&a, &dest.join("A.jar"));
     assert_functional_identity(&b, &dest.join("B.jar"));
 }
@@ -371,12 +409,12 @@ fn roundtrip_empty_file() {
     write_jar(&jar, &[("empty.dat", b"")]);
     let out = dir.path().join("out.ayz");
     let summary = dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
-    assert_eq!(summary.unique_blob_count, 1);
-    assert_eq!(summary.bytes_unique_blobs, 0);
+    assert!(summary.unique_blob_count >= 1);
 
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
     let restored = dest.join("empty.jar");
+    assert_bit_identical(&jar, &restored);
     assert_functional_identity(&jar, &restored);
     let map = entry_map(&restored);
     assert_eq!(map.get("empty.dat").map(|v| v.len()), Some(0));
@@ -409,6 +447,7 @@ fn roundtrip_directories_explicit_only() {
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
 
     let restored_with = dest.join("with_dirs.jar");
+    assert_bit_identical(&with_dirs, &restored_with);
     assert_functional_identity(&with_dirs, &restored_with);
     let with_cd = cd_entries(&restored_with);
     assert!(
@@ -432,6 +471,7 @@ fn roundtrip_directories_explicit_only() {
     assert!(saw_dir);
 
     let restored_no = dest.join("no_dirs.jar");
+    assert_bit_identical(&no_dirs, &restored_no);
     assert_functional_identity(&no_dirs, &restored_no);
     let no_cd = cd_entries(&restored_no);
     assert_eq!(no_cd, vec![("com/example/A.class".into(), false)]);
@@ -451,6 +491,7 @@ fn roundtrip_utf8_names() {
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
     let restored = dest.join("utf8.jar");
+    assert_bit_identical(&jar, &restored);
     assert_functional_identity(&jar, &restored);
     assert!(entry_map(&restored).contains_key("res/名前.txt"));
 }
@@ -466,6 +507,7 @@ fn roundtrip_dos_time_zero_zero_does_not_panic() {
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
     let restored = dest.join("zero.jar");
+    assert_bit_identical(&jar, &restored);
     assert_eq!(entry_map(&jar), entry_map(&restored));
     assert_eq!(
         cd_entries(&jar)
@@ -478,20 +520,24 @@ fn roundtrip_dos_time_zero_zero_does_not_panic() {
             .collect::<Vec<_>>()
     );
 
+    // Exact restore keeps DOS 0,0. zip crate may surface that as None.
     let mut z = ZipArchive::new(File::open(&restored).unwrap()).unwrap();
     for i in 0..z.len() {
         let e = z.by_index(i).unwrap();
-        let dt = e.last_modified().expect("rebuilt entries have a DOS time");
-        assert_eq!(dt, DateTime::default());
-        assert_eq!(dt.year(), 1980);
-        assert_eq!(dt.month(), 1);
-        assert_eq!(dt.day(), 1);
+        match e.last_modified() {
+            None => {}
+            Some(dt) => {
+                assert_eq!(dt, DateTime::default());
+                assert_eq!(dt.year(), 1980);
+                assert_eq!(dt.month(), 1);
+                assert_eq!(dt.day(), 1);
+            }
+        }
     }
 }
 
 #[test]
-fn roundtrip_store_source_may_deflate_rebuilt() {
-    // Content mode discards STORE; rebuilt files may deflate. Maps still equal.
+fn roundtrip_store_source_is_bit_identical() {
     let dir = tempfile::tempdir().unwrap();
     let jar = dir.path().join("stored.jar");
     write_jar_entries(
@@ -513,17 +559,11 @@ fn roundtrip_store_source_may_deflate_rebuilt() {
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
     let restored = dest.join("stored.jar");
-    assert_eq!(entry_map(&jar), entry_map(&restored));
-    assert_eq!(entry_crcs(&jar), entry_crcs(&restored));
-    assert_ne!(
-        fs::read(&jar).unwrap(),
-        fs::read(&restored).unwrap(),
-        "must not require ZIP bit-identity of a stored source"
-    );
+    assert_bit_identical(&jar, &restored);
     let mut out_z = ZipArchive::new(File::open(&restored).unwrap()).unwrap();
     assert_eq!(
         out_z.by_index(0).unwrap().compression(),
-        CompressionMethod::Deflated
+        CompressionMethod::Stored
     );
 }
 
@@ -645,33 +685,46 @@ fn many_small_200_files_two_jars_dedup_to_200_blobs() {
     let b = dir.path().join("b.jar");
     write_jar(&a, &files);
     fs::copy(&a, &b).unwrap();
-    let jar_sum = fs::metadata(&a).unwrap().len() + fs::metadata(&b).unwrap().len();
-
     let out = dir.path().join("out.ayz");
     let summary = dehydrate(&opts(&out, vec![a.clone(), b.clone()])).unwrap();
     assert_eq!(summary.jar_count, 2);
     assert_eq!(summary.file_entry_count, 400);
+    let packed = manifest_from_records(&read_archive(&out).2);
     assert_eq!(
-        summary.unique_blob_count, 200,
-        "two identical JARs must dedup to 200 blobs, not 400"
+        content_blob_ids(&packed).len(),
+        200,
+        "two identical JARs must dedup to 200 content blobs, not 400"
     );
     assert_eq!(
-        summary.bytes_unique_blobs,
+        content_blob_ids(&packed)
+            .iter()
+            .map(|h| packed
+                .blobs
+                .iter()
+                .find(|b| b.blake3 == *h)
+                .map(|b| b.size)
+                .unwrap())
+            .sum::<u64>(),
         summary.bytes_uncompressed_entries / 2
     );
     assert!(
-        summary.output_len < jar_sum,
-        "archive {} must be smaller than sum of JARs {}",
-        summary.output_len,
-        jar_sum
+        summary.bytes_unique_blobs < summary.bytes_in_jars,
+        "unique blob bytes {} must be smaller than two source JARs {}",
+        summary.bytes_unique_blobs,
+        summary.bytes_in_jars
     );
 
     let (_header, trailer, records) = read_archive(&out);
-    assert_eq!(trailer.blob_count, 200);
-    assert_eq!(blob_records(&records).len(), 200);
+    assert_eq!(trailer.blob_count, summary.unique_blob_count);
+    assert_eq!(
+        blob_records(&records).len() as u64,
+        summary.unique_blob_count
+    );
 
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_bit_identical(&a, &dest.join("a.jar"));
+    assert_bit_identical(&b, &dest.join("b.jar"));
     assert_functional_identity(&a, &dest.join("a.jar"));
     assert_functional_identity(&b, &dest.join("b.jar"));
 }
@@ -747,8 +800,10 @@ fn nested_jar_not_exploded() {
     let summary = dehydrate(&opts(&out, vec![outer.clone()])).unwrap();
     assert_eq!(summary.jar_count, 1);
     assert_eq!(summary.file_entry_count, 2);
+    let m = manifest_from_records(&read_archive(&out).2);
     assert_eq!(
-        summary.unique_blob_count, 2,
+        content_blob_ids(&m).len(),
+        2,
         "inner.jar bytes are one blob; do not explode Inner.class"
     );
 
@@ -763,6 +818,7 @@ fn nested_jar_not_exploded() {
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
     let restored = dest.join("outer.jar");
+    assert_bit_identical(&outer, &restored);
     assert_functional_identity(&outer, &restored);
     let map = entry_map(&restored);
     assert_eq!(
@@ -870,9 +926,14 @@ fn first_seen_blob_order_matches_scan_order_with_jobs() {
             _ => None,
         })
         .collect();
+    let got_content: Vec<[u8; 32]> = got
+        .iter()
+        .copied()
+        .filter(|h| expected.contains(h))
+        .collect();
     assert_eq!(
-        got, expected,
-        "BLOB record order must match first-seen scan"
+        got_content, expected,
+        "content BLOB order must match first-seen scan (exact extras may interleave)"
     );
 
     let m = manifest_from_records(&records);
@@ -881,9 +942,13 @@ fn first_seen_blob_order_matches_scan_order_with_jobs() {
         .iter()
         .map(|h| ayzenpack::hashutil::hex_lower(h))
         .collect();
+    let hexes_content: Vec<String> = hexes
+        .into_iter()
+        .filter(|h| expected_hex.contains(h))
+        .collect();
     assert_eq!(
-        hexes, expected_hex,
-        "manifest blobs[] must match first-seen"
+        hexes_content, expected_hex,
+        "manifest blobs[] content hashes must match first-seen"
     );
 }
 
@@ -928,6 +993,7 @@ fn roundtrip_bash_prefixed_executable_jar() {
         SPRING_LAUNCHER,
         "restored file must start with the exact prefix"
     );
+    assert_bit_identical(&jar, &restored);
     assert_functional_identity(&jar, &restored);
 
     #[cfg(unix)]
@@ -967,6 +1033,7 @@ fn roundtrip_zip_a_adjusted_executable_jar() {
         SPRING_LAUNCHER,
         "restored file must start with the exact prefix"
     );
+    assert_bit_identical(&jar, &restored);
     assert_functional_identity(&jar, &restored);
 }
 
@@ -991,6 +1058,7 @@ fn roundtrip_official_launch_script_executable_jar() {
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
     let restored = dest.join("app.jar");
     assert_eq!(&fs::read(&restored).unwrap()[..launcher.len()], launcher);
+    assert_bit_identical(&jar, &restored);
     assert_functional_identity(&jar, &restored);
 }
 
@@ -1016,6 +1084,7 @@ fn roundtrip_official_script_plus_zip64_nested_lib() {
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
     let restored = dest.join("app.jar");
     assert_eq!(&fs::read(&restored).unwrap()[..launcher.len()], launcher);
+    assert_bit_identical(&jar, &restored);
     assert_functional_identity(&jar, &restored);
 }
 
@@ -1028,12 +1097,13 @@ fn two_wrapped_jars_share_one_prefix_blob() {
     write_wrapped_jar(&b, SPRING_LAUNCHER, &[("B.class", b"BBB")]);
     let out = dir.path().join("out.ayz");
     let summary = dehydrate(&opts(&out, vec![a.clone(), b.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
     assert_eq!(
-        summary.unique_blob_count, 3,
+        content_blob_ids(&m).len() + 1,
+        3,
         "shared launcher + two unique entries"
     );
-
-    let m = manifest_from_records(&read_archive(&out).2);
+    assert_eq!(summary.unique_blob_count, m.blobs.len() as u64);
     let pa = m.jars[0].prefix_blob.as_ref().expect("a.jar prefix");
     let pb = m.jars[1].prefix_blob.as_ref().expect("b.jar prefix");
     assert_eq!(pa, pb);
@@ -1045,6 +1115,8 @@ fn two_wrapped_jars_share_one_prefix_blob() {
 
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_bit_identical(&a, &dest.join("a.jar"));
+    assert_bit_identical(&b, &dest.join("b.jar"));
     assert_functional_identity(&a, &dest.join("a.jar"));
     assert_functional_identity(&b, &dest.join("b.jar"));
     assert!(fs::read(dest.join("a.jar"))
@@ -1079,5 +1151,325 @@ fn normal_jar_has_no_prefix_fields_and_roundtrips() {
 
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_bit_identical(&jar, &dest.join("plain.jar"));
     assert_functional_identity(&jar, &dest.join("plain.jar"));
+    assert!(m.jars[0].tail_blob.is_some() || m.jars[0].raw_zip_blob.is_some());
+}
+
+fn strip_exact_fields(records: Vec<Record>) -> Vec<Record> {
+    let mut blobs = Vec::new();
+    let mut manifest_json = None;
+    for rec in records {
+        match rec {
+            Record::Blob { hash, data } => blobs.push((hash, data)),
+            Record::Manifest { json } => manifest_json = Some(json),
+            Record::End { .. } => {}
+        }
+    }
+    let mut m: Manifest = serde_json::from_slice(&manifest_json.expect("MANIFEST")).unwrap();
+    let mut keep = BTreeSet::new();
+    for jar in &mut m.jars {
+        jar.tail_blob = None;
+        jar.tail_size = None;
+        jar.raw_zip_blob = None;
+        jar.raw_zip_size = None;
+        if let Some(p) = &jar.prefix_blob {
+            keep.insert(p.clone());
+        }
+        for e in &mut jar.entries {
+            e.cdata_blob = None;
+            e.local_header_offset = None;
+            e.local_header_hex = None;
+            e.local_header_blob = None;
+            e.data_descriptor_hex = None;
+            e.pad_zeros = None;
+            e.pad_blob = None;
+            if let Some(b) = &e.blob {
+                keep.insert(b.clone());
+            }
+        }
+    }
+    m.blobs.retain(|b| keep.contains(&b.blake3));
+    m.stats.unique_blob_count = m.blobs.len() as u64;
+    m.stats.bytes_unique_blobs = m.blobs.iter().map(|b| b.size).sum();
+
+    let mut hasher = blake3::Hasher::new();
+    let mut out = Vec::new();
+    for (hash, data) in blobs {
+        let hex = ayzenpack::hashutil::hex_lower(&hash);
+        if !keep.contains(&hex) {
+            continue;
+        }
+        hasher.update(&hash);
+        out.push(Record::Blob { hash, data });
+    }
+    out.push(Record::Manifest {
+        json: serde_json::to_vec(&m).unwrap(),
+    });
+    out.push(Record::End {
+        digest: *hasher.finalize().as_bytes(),
+    });
+    out
+}
+
+#[test]
+fn roundtrip_mixed_stored_and_deflated_is_bit_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("mixed.jar");
+    write_jar_entries(
+        &jar,
+        &[
+            JarEntry::File {
+                name: "stored.bin",
+                data: b"store-me-please",
+                method: CompressionMethod::Stored,
+            },
+            JarEntry::File {
+                name: "deflated.bin",
+                data: b"deflate-me-please-aaaaaaaa",
+                method: CompressionMethod::Deflated,
+            },
+        ],
+    );
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_bit_identical(&jar, &dest.join("mixed.jar"));
+}
+
+#[test]
+fn roundtrip_data_descriptor_is_bit_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("desc.jar");
+    write_data_descriptor_zip(&jar, "payload.bin", b"descriptor-payload");
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert!(
+        m.jars[0].entries[0].data_descriptor_hex.is_some() || m.jars[0].raw_zip_blob.is_some(),
+        "GPBF bit 3 must be captured"
+    );
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_bit_identical(&jar, &dest.join("desc.jar"));
+}
+
+#[test]
+fn roundtrip_archive_comment_is_bit_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("comment.jar");
+    write_jar_with_comment(&jar, &[("a.txt", b"hello")], "archive comment here");
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_bit_identical(&jar, &dest.join("comment.jar"));
+}
+
+#[test]
+fn roundtrip_non_utf8_name_is_bit_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("rawname.jar");
+    write_non_utf8_name_zip(&jar, b"payload");
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert!(
+        m.jars[0].entries[0].name_raw_hex.is_some(),
+        "non-UTF-8 name must set name_raw_hex"
+    );
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_bit_identical(&jar, &dest.join("rawname.jar"));
+}
+
+#[test]
+fn roundtrip_signed_looking_entries_are_bit_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("signed.jar");
+    write_signed_looking_jar(&jar);
+    let src_sf = entry_map(&jar).get("META-INF/FOO.SF").unwrap().clone();
+    let out = dir.path().join("out.ayz");
+    let summary = dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    assert_eq!(summary.signed_jars, vec!["signed.jar".to_string()]);
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("signed.jar");
+    assert_bit_identical(&jar, &restored);
+    assert_eq!(
+        entry_map(&restored).get("META-INF/FOO.SF").unwrap(),
+        &src_sf
+    );
+}
+
+#[test]
+fn roundtrip_zipalign_padding_is_bit_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("aligned.jar");
+    write_padded_locals_zip(&jar, ("a.txt", b"aa"), ("b.txt", b"bbbb"), 5);
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    let pad = m.jars[0].entries[0].pad_zeros;
+    assert!(
+        pad == Some(5) || m.jars[0].raw_zip_blob.is_some(),
+        "expected pad_zeros=5 or raw_zip fallback, got {pad:?}"
+    );
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_bit_identical(&jar, &dest.join("aligned.jar"));
+}
+
+#[test]
+fn two_jars_share_nested_lib_cdata_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = dir.path().join("dep.jar");
+    write_jar(&inner, &[("com/Dep.class", b"dep-bytes")]);
+    let inner_bytes = fs::read(&inner).unwrap();
+    let a = dir.path().join("app-a.jar");
+    let b = dir.path().join("app-b.jar");
+    write_jar(
+        &a,
+        &[
+            ("BOOT-INF/lib/dep.jar", inner_bytes.as_slice()),
+            ("A.class", b"aaa"),
+        ],
+    );
+    write_jar(
+        &b,
+        &[
+            ("BOOT-INF/lib/dep.jar", inner_bytes.as_slice()),
+            ("B.class", b"bbb"),
+        ],
+    );
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![a.clone(), b.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    let ca = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.name == "BOOT-INF/lib/dep.jar")
+        .and_then(|e| e.cdata_blob.as_ref())
+        .expect("a cdata");
+    let cb = m.jars[1]
+        .entries
+        .iter()
+        .find(|e| e.name == "BOOT-INF/lib/dep.jar")
+        .and_then(|e| e.cdata_blob.as_ref())
+        .expect("b cdata");
+    assert_eq!(ca, cb);
+    let blob = m
+        .blobs
+        .iter()
+        .find(|b| b.blake3 == *ca)
+        .expect("cdata catalog");
+    assert!(
+        blob.ref_count >= 2,
+        "shared nested lib cdata ref_count, got {}",
+        blob.ref_count
+    );
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_bit_identical(&a, &dest.join("app-a.jar"));
+    assert_bit_identical(&b, &dest.join("app-b.jar"));
+}
+
+#[test]
+fn content_mode_archive_still_rehydrates_via_zipwriter() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("stored.jar");
+    write_jar_entries(
+        &jar,
+        &[JarEntry::File {
+            name: "payload.bin",
+            data: b"content-mode-should-deflate",
+            method: CompressionMethod::Stored,
+        }],
+    );
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+
+    let mut f = File::open(&out).unwrap();
+    let (header, _trailer, records) = read_ayz_file(&mut f).unwrap();
+    let stripped = strip_exact_fields(records);
+    let crafted = dir.path().join("content.ayz");
+    let mut w = File::create(&crafted).unwrap();
+    write_ayz_file(&mut w, &header, &stripped, 1).unwrap();
+
+    let m = manifest_from_records(&stripped);
+    assert!(m.jars[0].tail_blob.is_none());
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    assert!(m.jars[0].entries[0].cdata_blob.is_none());
+
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&crafted, &dest)).unwrap();
+    let restored = dest.join("stored.jar");
+    assert_functional_identity(&jar, &restored);
+    assert_ne!(
+        fs::read(&jar).unwrap(),
+        fs::read(&restored).unwrap(),
+        "content-mode ZipWriter must not be bit-identical for a stored source"
+    );
+    let mut out_z = ZipArchive::new(File::open(&restored).unwrap()).unwrap();
+    assert_eq!(
+        out_z.by_index(0).unwrap().compression(),
+        CompressionMethod::Deflated
+    );
+}
+
+#[test]
+fn exact_rehydrate_fails_if_cdata_blob_swapped() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("two.jar");
+    write_jar(
+        &jar,
+        &[("a.txt", b"AAAA-payload"), ("b.txt", b"BBBB-payload")],
+    );
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar])).unwrap();
+
+    let mut f = File::open(&out).unwrap();
+    let (header, _trailer, records) = read_ayz_file(&mut f).unwrap();
+    let mut new_records = Vec::new();
+    let mut jar_count = 0u64;
+    for rec in records {
+        match rec {
+            Record::Manifest { json } => {
+                let mut m: Manifest = serde_json::from_slice(&json).unwrap();
+                jar_count = m.jars.len() as u64;
+                let a = m.jars[0].entries[0].cdata_blob.clone().expect("cdata a");
+                let b = m.jars[0].entries[1].cdata_blob.clone().expect("cdata b");
+                assert_ne!(a, b);
+                m.jars[0].entries[0].cdata_blob = Some(b);
+                new_records.push(Record::Manifest {
+                    json: serde_json::to_vec(&m).unwrap(),
+                });
+            }
+            other => new_records.push(other),
+        }
+    }
+    let crafted = dir.path().join("swapped.ayz");
+    let mut w = File::create(&crafted).unwrap();
+    write_ayz_file(&mut w, &header, &new_records, jar_count).unwrap();
+
+    let dest = dir.path().join("restored");
+    let err = rehydrate(&rehydrate_opts(&crafted, &dest)).unwrap_err();
+    assert!(
+        matches!(err, AyzenpackError::HashMismatch(_)),
+        "swapped cdata must fail source hash check, got {err:?}"
+    );
+}
+
+#[test]
+fn shebang_without_zip_is_still_not_zip_on_dehydrate() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("script.sh");
+    fs::write(&script, b"#!/bin/bash\necho no zip here\n").unwrap();
+    let out = dir.path().join("out.ayz");
+    let err = dehydrate(&opts(&out, vec![script])).unwrap_err();
+    assert!(
+        matches!(err, AyzenpackError::NotZip { .. }),
+        "#! without a zip must be NotZip, got {err:?}"
+    );
 }

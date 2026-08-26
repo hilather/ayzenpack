@@ -2,7 +2,7 @@
 //!
 //! `proptest` is the ecosystem standard for property tests (highly used).
 //! Guards against ZIP metadata combinations the hand-written fixtures missed.
-//! Compares uncompressed bytes, names, and CD order — not ZIP bit-identity.
+//! Compares uncompressed bytes, names, CD order, and full-file bytes (exact packs).
 
 #[path = "fixtures.rs"]
 mod fixtures;
@@ -154,9 +154,13 @@ proptest! {
         for (i, _) in jars.iter().enumerate() {
             let src = &inputs[i];
             let restored = dest.join(format!("j{i}.jar"));
-            // Functional identity only; deflate bitstream is not preserved.
             prop_assert_eq!(entry_map(src), entry_map(&restored));
             prop_assert_eq!(entry_order(src), entry_order(&restored));
+            prop_assert_eq!(
+                std::fs::read(src).unwrap(),
+                std::fs::read(&restored).unwrap(),
+                "exact pack must restore bit-identical JAR bytes"
+            );
         }
     }
 }

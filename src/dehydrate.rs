@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 use crate::error::{AyzenpackError, Result};
+use crate::exact::{capture_zip_exact, ExactLocal, ZipExact};
 use crate::format::{
     write_header, write_record, write_trailer, FileHeader, Record, Trailer, BUF_WRITER_CAP,
     REC_BLOB, TRAILER_LEN,
@@ -22,6 +23,9 @@ use crate::hashutil::{hash_both, hex_lower};
 use crate::manifest::{Blob, Entry, Jar, Manifest, Stats, MANIFEST_FORMAT};
 use crate::scan::{for_each_jar_entry_with_len, ScannedEntry};
 use crate::stats::{dedup_ratio, json_event, PackProgress};
+
+/// Inline hex for local headers / descriptors under this size; larger values become CAS blobs.
+const HEX_INLINE_MAX: usize = 512;
 
 const DEFAULT_LEVEL: i32 = 3;
 const DEFAULT_MAX_ENTRY: u64 = 2_147_483_647;
@@ -540,11 +544,9 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
 
             if scanned.signed {
                 signed_jars.push(jar_name.clone());
-                let msg = format!("signed JAR {jar_name} (rebuild will break the signature)");
                 if opts.fail_on_signed {
-                    return Err(AyzenpackError::Usage(msg));
+                    return Err(AyzenpackError::Usage(format!("signed JAR {jar_name}")));
                 }
-                warn(opts, &msg);
             }
             bytes_in_jars += scanned.source_size;
             let (prefix_blob, prefix_size) = match &scanned.prefix {
@@ -555,7 +557,7 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
                 }
                 _ => (None, None),
             };
-            jars.push(Jar {
+            let mut jar = Jar {
                 name: jar_name,
                 source_path: path.to_string_lossy().into_owned(),
                 source_size: scanned.source_size,
@@ -565,8 +567,22 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
                 signed: scanned.signed,
                 prefix_blob,
                 prefix_size,
+                tail_blob: None,
+                tail_size: None,
+                raw_zip_blob: None,
+                raw_zip_size: None,
                 entries: jar_entries,
-            });
+            };
+            attach_exact(&mut sink, path, &mut jar)?;
+            if jar.signed && !jar.exact_restore() {
+                warn(
+                    opts,
+                    &format!("signed JAR {} (rebuild will break the signature)", jar.name),
+                );
+            } else if jar.signed {
+                warn(opts, &format!("signed JAR {}", jar.name));
+            }
+            jars.push(jar);
         }
     }
 
@@ -767,7 +783,102 @@ fn entry_from_scan(meta: &ScannedEntry, blob: Option<String>, sha256: Option<Str
         unix_mode: meta.unix_mode,
         utf8_flag: meta.utf8_flag,
         name_raw_hex: meta.name_raw_hex.clone(),
+        cdata_blob: None,
+        local_header_offset: None,
+        local_header_hex: None,
+        local_header_blob: None,
+        data_descriptor_hex: None,
+        pad_zeros: None,
+        pad_blob: None,
     }
+}
+
+fn attach_exact(sink: &mut BlobSink<'_>, path: &Path, jar: &mut Jar) -> Result<()> {
+    match capture_zip_exact(path)? {
+        ZipExact::Sliced(slice) if slice.locals.len() == jar.entries.len() => {
+            for (entry, local) in jar.entries.iter_mut().zip(slice.locals.iter()) {
+                fill_exact_entry(sink, entry, local)?;
+            }
+            let (b3, s256) = hash_both(&slice.tail);
+            remember_blob(sink, &slice.tail, b3, s256)?;
+            jar.tail_blob = Some(hex_lower(&b3));
+            jar.tail_size = Some(slice.tail.len() as u64);
+        }
+        ZipExact::Raw(zip) => {
+            let (b3, s256) = hash_both(&zip);
+            remember_blob(sink, &zip, b3, s256)?;
+            jar.raw_zip_blob = Some(hex_lower(&b3));
+            jar.raw_zip_size = Some(zip.len() as u64);
+        }
+        ZipExact::Sliced(_) => {
+            let zip = read_zip_after_prefix(path, jar.prefix_size.unwrap_or(0))?;
+            let (b3, s256) = hash_both(&zip);
+            remember_blob(sink, &zip, b3, s256)?;
+            jar.raw_zip_blob = Some(hex_lower(&b3));
+            jar.raw_zip_size = Some(zip.len() as u64);
+        }
+    }
+    Ok(())
+}
+
+fn read_zip_after_prefix(path: &Path, prefix_len: u64) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = File::open(path).map_err(|source| AyzenpackError::Io {
+        source,
+        path: Some(path.to_path_buf()),
+    })?;
+    let file_len = file
+        .metadata()
+        .map_err(|source| AyzenpackError::Io {
+            source,
+            path: Some(path.to_path_buf()),
+        })?
+        .len();
+    if file_len < prefix_len {
+        return Err(AyzenpackError::FormatOwned(format!(
+            "prefix longer than file {}",
+            path.display()
+        )));
+    }
+    file.seek(SeekFrom::Start(prefix_len))
+        .map_err(|source| AyzenpackError::Io {
+            source,
+            path: Some(path.to_path_buf()),
+        })?;
+    let mut zip = Vec::new();
+    file.read_to_end(&mut zip)
+        .map_err(|source| AyzenpackError::Io {
+            source,
+            path: Some(path.to_path_buf()),
+        })?;
+    Ok(zip)
+}
+
+fn fill_exact_entry(sink: &mut BlobSink<'_>, entry: &mut Entry, local: &ExactLocal) -> Result<()> {
+    entry.local_header_offset = Some(local.zip_rel_offset);
+    if local.header.len() <= HEX_INLINE_MAX {
+        entry.local_header_hex = Some(hex_lower(&local.header));
+    } else {
+        let (b3, s256) = hash_both(&local.header);
+        remember_blob(sink, &local.header, b3, s256)?;
+        entry.local_header_blob = Some(hex_lower(&b3));
+    }
+    if !entry.is_dir || !local.cdata.is_empty() {
+        let (b3, s256) = hash_both(&local.cdata);
+        remember_blob(sink, &local.cdata, b3, s256)?;
+        entry.cdata_blob = Some(hex_lower(&b3));
+    }
+    if let Some(desc) = &local.descriptor {
+        entry.data_descriptor_hex = Some(hex_lower(desc));
+    }
+    if local.pad.iter().all(|&b| b == 0) && !local.pad.is_empty() {
+        entry.pad_zeros = Some(local.pad.len() as u64);
+    } else if !local.pad.is_empty() {
+        let (b3, s256) = hash_both(&local.pad);
+        remember_blob(sink, &local.pad, b3, s256)?;
+        entry.pad_blob = Some(hex_lower(&b3));
+    }
+    Ok(())
 }
 
 /// Expand CLI inputs: optional recursive walk, `--exclude`, then sort + dedupe.
