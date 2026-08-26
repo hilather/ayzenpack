@@ -557,6 +557,57 @@ pub fn write_stored_block_deflate_wrapped(path: &Path, launcher: &[u8], name: &s
     std::fs::write(path, out).unwrap();
 }
 
+/// STORE file plus a Maven-style empty DEFLATE directory (`03 00`).
+pub fn write_store_file_plus_empty_deflate_dir(path: &Path, name: &str, data: &[u8]) {
+    write_locals_and_cd(
+        path,
+        &[
+            BuiltLocal {
+                name: name.as_bytes().to_vec(),
+                method: 0,
+                crc: crc32fast::hash(data),
+                uncomp: data.len() as u32,
+                cdata: data.to_vec(),
+                extra: Vec::new(),
+            },
+            BuiltLocal {
+                name: b"META-INF/".to_vec(),
+                method: 8,
+                crc: 0,
+                uncomp: 0,
+                cdata: vec![0x03, 0x00],
+                extra: Vec::new(),
+            },
+        ],
+    );
+}
+
+/// Stored-block DEFLATE file plus a Maven-style empty DEFLATE directory (`03 00`).
+pub fn write_deflate_miss_plus_empty_deflate_dir(path: &Path, name: &str, data: &[u8]) {
+    let cdata = raw_stored_deflate(data);
+    write_locals_and_cd(
+        path,
+        &[
+            BuiltLocal {
+                name: name.as_bytes().to_vec(),
+                method: 8,
+                crc: crc32fast::hash(data),
+                uncomp: data.len() as u32,
+                cdata,
+                extra: Vec::new(),
+            },
+            BuiltLocal {
+                name: b"META-INF/".to_vec(),
+                method: 8,
+                crc: 0,
+                uncomp: 0,
+                cdata: vec![0x03, 0x00],
+                extra: Vec::new(),
+            },
+        ],
+    );
+}
+
 /// Stored-block DEFLATE file plus a directory whose local record has non-empty cdata.
 pub fn write_deflate_miss_plus_dir_cdata(path: &Path, name: &str, data: &[u8]) {
     let cdata = raw_stored_deflate(data);

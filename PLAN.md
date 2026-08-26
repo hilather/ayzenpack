@@ -62,7 +62,7 @@ Replace the boolean `exact_restore()` with two helpers used by dehydrate warning
 **Resolution order for one entry’s payload bytes** (must match the request):
 
 1. `cdata_blob` if present (old packs; also exotic / mixed-unreproducible jars)
-2. else `cdata_codec` → load content `blob`, raw-deflate at the recorded level, compare length to `compressed_size`; mismatch is `HashMismatch`
+2. else `cdata_codec` → load content `blob` (or `[]` when `is_dir` and `blob` is absent — Maven empty DEFLATE dirs), raw-deflate at the recorded level, compare length to `compressed_size`; mismatch is `HashMismatch`
 3. else STORE (`method_code == 0`) or empty dir → content `blob` or `[]`
 4. else rebuild fields (jar-level metadata rebuild only)
 
@@ -78,13 +78,15 @@ For each sliced local, still record `local_header_*`, `data_descriptor_hex`, `pa
 
 **Jar-wide policy after pass 1** (picks one mechanism so inference and restore cannot disagree):
 
-Let `unreproducible` = any entry that is `method_code` not in `{0, 8}`, or whose `cdata` fails raw-inflate, or is a directory with **non-empty** cdata (today’s `!is_dir || !cdata.is_empty()` put; do not treat that as empty), or is a STORE **file** whose BLAKE3(`local.cdata`) ≠ `entry.blob` (payload Vec is gone after `commit_blob`; compare hashes). A STORE file whose cdata hashes as the content blob is reproducible via `blob`.
+Let `unreproducible` = any entry that is `method_code` not in `{0, 8}`, or whose `cdata` fails raw-inflate, or is a directory with **actual uncompressed payload** (`uncompressed_size != 0` or STORE dir with non-empty cdata), or is a STORE **file** whose BLAKE3(`local.cdata`) ≠ `entry.blob` (payload Vec is gone after `commit_blob`; compare hashes). A STORE file whose cdata hashes as the content blob is reproducible via `blob`.
 
-Let `deflate_miss` = any `method_code == 8` file whose trial-encode does not match.
+**Maven/Java empty DEFLATE directories** (`method_code == 8`, `uncompressed_size == 0`, typically 2-byte `03 00`) are **not** unreproducible. Trial-encode them like files (`DeflateHit` / `DeflateMiss`). Treating them as exotic forced MixedExact on most Maven JARs and stored every file `cdata_blob` again.
+
+Let `deflate_miss` = any `method_code == 8` file **or empty-content directory** whose trial-encode does not match.
 
 | Jar class | Store | Restore path |
 |---|---|---|
-| no `deflate_miss`, no `unreproducible` | STORE: nothing extra. DEFLATE hit: `cdata_codec` only. empty dir: nothing. | `bit_identical_restore` |
+| no `deflate_miss`, no `unreproducible` | STORE: nothing extra. DEFLATE hit (files **and** empty-content dirs): `cdata_codec` only. empty STORE dir: nothing. | `bit_identical_restore` |
 | no `deflate_miss`, some `unreproducible` | `cdata_blob` **only** on unreproducible file/dir-with-cdata entries. Hits still `cdata_codec`. STORE uses `blob`. | `bit_identical_restore` (every file resolves) |
 | `deflate_miss`, no `unreproducible` | **no** `cdata_blob`, **no** `cdata_codec` (strip hits too). Tail + local headers kept. **Not** `raw_zip`. | `metadata_rebuild` |
 | `deflate_miss` **and** `unreproducible` | **`cdata_blob` for every unreproducible entry and every DEFLATE file** (hits, misses, exotic files, **and dir-with-cdata**). STORE *files* whose `cdata ==` content blob still omit `cdata_blob`. No `cdata_codec`. | `bit_identical_restore`. **Never** metadata-rebuild a jar that has an unreproducible entry — rebuild’s encoder is only STORE-file or `deflate_raw(..., 6)` and must not invent method-8 bytes or drop dir cdata. |

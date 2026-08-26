@@ -14,7 +14,8 @@ use ayzenpack::hashutil::blake3_bytes;
 use ayzenpack::manifest::Manifest;
 use ayzenpack::{dehydrate, rehydrate, verify, DehydrateOptions, RehydrateOptions};
 use fixtures::{
-    spring_boot_launch_script, write_data_descriptor_zip, write_deflate_miss_plus_dir_cdata,
+    spring_boot_launch_script, write_data_descriptor_zip,     write_deflate_miss_plus_dir_cdata,
+    write_deflate_miss_plus_empty_deflate_dir, write_store_file_plus_empty_deflate_dir,
     write_jar, write_jar_entries, write_jar_with_comment, write_non_utf8_name_zip,
     write_padded_locals_zip, write_signed_looking_jar, write_stored_block_deflate_wrapped,
     write_stored_block_deflate_zip, write_stored_jar_dos_zero, write_stored_zip,
@@ -1767,48 +1768,92 @@ fn old_style_cdata_blob_store_still_rehydrates() {
 }
 
 #[test]
+fn store_plus_maven_empty_deflate_dir_is_bit_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("store-maven-dir.jar");
+    write_store_file_plus_empty_deflate_dir(&jar, "a.txt", b"hello-store");
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    let dir_ent = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.is_dir || e.name.ends_with('/'))
+        .expect("dir");
+    assert!(dir_ent.blob.is_none());
+    assert!(dir_ent.cdata_blob.is_none());
+    assert_eq!(
+        dir_ent.cdata_codec.as_deref(),
+        Some("deflate-raw:flate2:6"),
+        "empty DEFLATE dir must record codec, not a content blob"
+    );
+    assert!(m.jars[0].exact_restore());
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_bit_identical(&jar, &dest.join("store-maven-dir.jar"));
+}
+
+#[test]
+fn maven_empty_deflate_dir_does_not_force_cdata_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("maven-dirs.jar");
+    let payload = vec![b'a'; 256];
+    write_deflate_miss_plus_empty_deflate_dir(&jar, "a.txt", &payload);
+    let out = dir.path().join("out.ayz");
+    let summary = dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    for e in &m.jars[0].entries {
+        assert!(
+            e.cdata_blob.is_none(),
+            "{} must not store cdata_blob just because dirs are empty DEFLATE",
+            e.name
+        );
+        assert!(e.cdata_codec.is_none());
+    }
+    assert!(m.jars[0].metadata_rebuild());
+    assert!(
+        summary.bytes_unique_blobs < summary.bytes_in_jars + 4096,
+        "empty-deflate dirs must not store a second copy of every file payload"
+    );
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_functional_identity(&jar, &dest.join("maven-dirs.jar"));
+}
+
+#[test]
 fn class4_miss_plus_dir_cdata_keeps_cdata_blob() {
     let dir = tempfile::tempdir().unwrap();
     let jar = dir.path().join("class4.jar");
     let payload = vec![b'a'; 256];
     write_deflate_miss_plus_dir_cdata(&jar, "a.txt", &payload);
     let out = dir.path().join("out.ayz");
-    match dehydrate(&opts(&out, vec![jar.clone()])) {
-        Ok(_) => {
-            let m = manifest_from_records(&read_archive(&out).2);
-            let file = m
-                .jars[0]
-                .entries
-                .iter()
-                .find(|e| e.name == "a.txt")
-                .expect("file");
-            let dir_ent = m
-                .jars[0]
-                .entries
-                .iter()
-                .find(|e| e.is_dir || e.name.ends_with('/'))
-                .expect("dir");
-            assert!(file.cdata_blob.is_some(), "class 4 file keeps cdata_blob");
-            assert!(
-                dir_ent.cdata_blob.is_some(),
-                "class 4 dir-with-cdata keeps cdata_blob"
-            );
-            assert!(file.cdata_codec.is_none());
-            assert!(m.jars[0].exact_restore());
-            let dest = dir.path().join("restored");
-            rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
-            assert_bit_identical(&jar, &dest.join("class4.jar"));
-        }
-        Err(err) => {
-            // ZipArchive may refuse a directory local with payload; class 4 is then
-            // untestable via dehydrate. The store rule is still covered by unit policy.
-            let msg = err.to_string();
-            assert!(
-                msg.contains("zip") || msg.contains("Zip") || msg.contains("NotZip"),
-                "unexpected dehydrate error for class4 fixture: {err}"
-            );
-        }
-    }
+    dehydrate(&opts(&out, vec![jar.clone()]))
+        .expect("class-4 fixture must be dehydratable (dir-with-cdata + stored-block miss)");
+    let m = manifest_from_records(&read_archive(&out).2);
+    let file = m
+        .jars[0]
+        .entries
+        .iter()
+        .find(|e| e.name == "a.txt")
+        .expect("file");
+    let dir_ent = m
+        .jars[0]
+        .entries
+        .iter()
+        .find(|e| e.is_dir || e.name.ends_with('/'))
+        .expect("dir");
+    assert!(file.cdata_blob.is_some(), "class 4 file keeps cdata_blob");
+    assert!(
+        dir_ent.cdata_blob.is_some(),
+        "class 4 dir-with-cdata keeps cdata_blob"
+    );
+    assert!(file.cdata_codec.is_none());
+    assert!(dir_ent.cdata_codec.is_none());
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    assert!(m.jars[0].exact_restore());
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_bit_identical(&jar, &dest.join("class4.jar"));
 }
 
 #[test]

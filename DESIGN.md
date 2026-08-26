@@ -163,7 +163,7 @@ Per file entry, dehydrate records local-header metadata (`local_header_hex` / `l
 - **STORE:** no `cdata_blob`; rehydrate splices the content `blob`
 - **DEFLATE codec hit:** optional `cdata_codec` (`deflate-raw:flate2:<level>`) when a pinned flate2 raw-deflate trial matches the original `cdata` byte-for-byte (GPBF bits 1–2 as a level hint, then 6, 9, 1). Rehydrate encodes and splices at the original offsets. `source_blake3` / `source_sha256` / `source_size` still match.
 - **DEFLATE codec miss:** neither `cdata_blob` nor `cdata_codec`. Rehydrate rebuilds a valid ZIP: same names/order/timestamps/extras, new compressed sizes, patched local header / data descriptor / CD / EOCD (and Zip64 extras that already exist). **Do not** claim `source_*` match. A signed JAR on this path uses the existing “rebuild will break the signature” warning.
-- **Legacy `cdata_blob`:** 0.1.6–0.1.8 packs, plus exotic / unreproducible methods. Resolution order: `cdata_blob`, else `cdata_codec`, else STORE/content blob, else rebuild.
+- **Legacy `cdata_blob`:** 0.1.6–0.1.8 packs, plus exotic / unreproducible methods (non-STORE/DEFLATE, or a directory with actual uncompressed payload). Maven/Java empty DEFLATE directories (`03 00`, usize 0) are a codec hit/miss, not exotic. Resolution order: `cdata_blob`, else `cdata_codec`, else STORE/content blob, else rebuild.
 
 Per jar: `tail_blob` / `tail_size` is bytes from the start of the central directory through zip EOF.
 

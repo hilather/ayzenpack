@@ -583,7 +583,12 @@ fn resolve_cdata(jar: &Jar, e: &Entry, cas_dir: &Path, allow_rebuild: bool) -> R
     }
     if let Some(codec) = &e.cdata_codec {
         let level = deflate::parse_codec(codec)?;
-        let bytes = read_entry_content(jar, e, cas_dir)?;
+        // Empty DEFLATE directories have no content blob; encode `[]` at the recorded level.
+        let bytes = if e.is_dir && e.blob.is_none() {
+            Vec::new()
+        } else {
+            read_entry_content(jar, e, cas_dir)?
+        };
         let out = deflate::deflate_raw(&bytes, level)?;
         if out.len() as u64 != e.compressed_size {
             return Err(AyzenpackError::HashMismatch(format!(
@@ -597,6 +602,9 @@ fn resolve_cdata(jar: &Jar, e: &Entry, cas_dir: &Path, allow_rebuild: bool) -> R
         return Ok(out);
     }
     if e.is_dir {
+        if allow_rebuild && e.method_code == 8 {
+            return deflate::deflate_raw(&[], deflate::rebuild_level());
+        }
         return Ok(Vec::new());
     }
     if e.method_code == 0 {
@@ -664,9 +672,9 @@ fn write_rebuilt_jar(jar: &Jar, cas_dir: &Path, dest: &Path, apply_prefix_chmod:
                 jar.name, e.name, e.method_code
             )));
         }
-        if e.is_dir && e.cdata_blob.is_some() {
+        if e.is_dir && (e.cdata_blob.is_some() || e.cdata_codec.is_some()) {
             return Err(AyzenpackError::FormatOwned(format!(
-                "cannot rebuild {}!{}: directory has cdata_blob",
+                "cannot rebuild {}!{}: directory has cdata_blob/cdata_codec",
                 jar.name, e.name
             )));
         }

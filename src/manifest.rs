@@ -78,7 +78,9 @@ impl Entry {
             return true;
         }
         if self.is_dir {
-            return true;
+            // Empty STORE / empty-cdata dirs splice `[]`. A method-8 empty
+            // DEFLATE dir (`03 00`) needs `cdata_codec` or rebuild.
+            return self.method_code == 0 || self.compressed_size == 0;
         }
         self.method_code == 0
     }
