@@ -1089,6 +1089,117 @@ fn roundtrip_official_script_plus_zip64_nested_lib() {
 }
 
 #[test]
+fn mixed_regular_and_spring_pack_trailer_is_ayzptlr1_and_rehydrates() {
+    // Field mix: regular JARs + official launch.script (stored/deflated, Zip64, zip -A).
+    let launcher = spring_boot_launch_script();
+    assert!(
+        launcher.starts_with(b"#!/bin/bash"),
+        "official launch.script must be a bash prefix"
+    );
+    let dir = tempfile::tempdir().unwrap();
+
+    let regular_a = dir.path().join("lib-a.jar");
+    let regular_b = dir.path().join("lib-b.jar");
+    write_jar(
+        &regular_a,
+        &[("a.txt", b"regular-a"), ("shared.txt", b"SHARED")],
+    );
+    write_jar(
+        &regular_b,
+        &[("b.txt", b"regular-b"), ("shared.txt", b"SHARED")],
+    );
+
+    let mixed_zip = dir.path().join("mixed-inner.zip");
+    write_jar_entries(
+        &mixed_zip,
+        &[
+            JarEntry::File {
+                name: "BOOT-INF/classes/stored.txt",
+                data: b"store-me",
+                method: CompressionMethod::Stored,
+            },
+            JarEntry::File {
+                name: "App.class",
+                data: b"class-bytes-deflate",
+                method: CompressionMethod::Deflated,
+            },
+        ],
+    );
+    let official_mixed = dir.path().join("official-mixed.jar");
+    let mut mixed_bytes = launcher.to_vec();
+    mixed_bytes.extend(fs::read(&mixed_zip).unwrap());
+    fs::write(&official_mixed, mixed_bytes).unwrap();
+    assert!(fs::read(&official_mixed)
+        .unwrap()
+        .starts_with(b"#!/bin/bash"));
+
+    let zip64 = dir.path().join("official-zip64.jar");
+    write_wrapped_zip64_jar(
+        &zip64,
+        launcher,
+        &[
+            ("BOOT-INF/lib/dep.jar", b"dep-bytes"),
+            ("App.class", b"zip64-app"),
+        ],
+    );
+
+    let adjusted = dir.path().join("official-zip-a.jar");
+    write_wrapped_jar_adjusted(
+        &adjusted,
+        launcher,
+        &[
+            ("App.class", b"zip-a-app"),
+            ("application.properties", b"x=1"),
+        ],
+    );
+
+    let out = dir.path().join("all.ayz");
+    let inputs = vec![
+        regular_a.clone(),
+        regular_b.clone(),
+        official_mixed.clone(),
+        zip64.clone(),
+        adjusted.clone(),
+    ];
+    dehydrate(&opts(&out, inputs)).expect("mixed regular+spring dehydrate");
+    assert!(
+        !dir.path().join("all.ayz.tmp").exists(),
+        "successful dehydrate must not leave all.ayz.tmp"
+    );
+
+    let bytes = fs::read(&out).unwrap();
+    assert!(
+        bytes.len() >= 64,
+        "all.ayz too short for a trailer: {}",
+        bytes.len()
+    );
+    eprintln!(
+        "all.ayz first 16: {:02x?} last 8: {:02x?} trailer magic: {:?}",
+        &bytes[..16.min(bytes.len())],
+        &bytes[bytes.len().saturating_sub(8)..],
+        std::str::from_utf8(&bytes[bytes.len() - 64..bytes.len() - 56])
+    );
+    assert_eq!(&bytes[..4], b"AYZP", "first 16: {:02x?}", &bytes[..16]);
+    assert_eq!(
+        &bytes[bytes.len() - 64..bytes.len() - 56],
+        b"AYZPTLR1",
+        "last 64 must start with AYZPTLR1; last 8={:02x?} first 16={:02x?}",
+        &bytes[bytes.len() - 8..],
+        &bytes[..16]
+    );
+
+    let dest = dir.path().join("out");
+    rehydrate(&rehydrate_opts(&out, &dest))
+        .expect("mixed pack rehydrate must not fail trailer magic");
+    verify(&out).unwrap();
+    assert_bit_identical(&regular_a, &dest.join("lib-a.jar"));
+    assert_bit_identical(&regular_b, &dest.join("lib-b.jar"));
+    assert_bit_identical(&official_mixed, &dest.join("official-mixed.jar"));
+    assert_bit_identical(&zip64, &dest.join("official-zip64.jar"));
+    assert_bit_identical(&adjusted, &dest.join("official-zip-a.jar"));
+}
+
+#[test]
 fn two_wrapped_jars_share_one_prefix_blob() {
     let dir = tempfile::tempdir().unwrap();
     let a = dir.path().join("a.jar");

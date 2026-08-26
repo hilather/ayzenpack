@@ -98,23 +98,21 @@ fn slice_zip(path: &Path) -> Result<ExactSlice> {
     }
     let zip_rel_cd = phys_cd - layout.prefix_len;
 
-    file.seek(SeekFrom::Start(phys_cd))
-        .map_err(|source| io_at(source, path))?;
-    let mut cd = vec![0u8; usize_from_u64(cd_size, path)?];
-    file.read_exact(&mut cd)
-        .map_err(|source| io_at(source, path))?;
-
-    let records = parse_central_directory(&cd, &layout)
-        .ok_or_else(|| slice_fail(path, "central directory parse failed"))?;
-    if u64::try_from(records.len()).unwrap_or(u64::MAX) != entry_count {
-        return Err(slice_fail(path, "central directory entry count mismatch"));
-    }
-
+    // Read CD+EOCD once as `tail`. Do not keep a second copy of the CD in RAM.
     let mut tail = vec![0u8; usize_from_u64(file_len - phys_cd, path)?];
     file.seek(SeekFrom::Start(phys_cd))
         .map_err(|source| io_at(source, path))?;
     file.read_exact(&mut tail)
         .map_err(|source| io_at(source, path))?;
+    let cd_n = usize_from_u64(cd_size, path)?;
+    if tail.len() < cd_n {
+        return Err(slice_fail(path, "central directory truncated in tail"));
+    }
+    let records = parse_central_directory(&tail[..cd_n], &layout)
+        .ok_or_else(|| slice_fail(path, "central directory parse failed"))?;
+    if u64::try_from(records.len()).unwrap_or(u64::MAX) != entry_count {
+        return Err(slice_fail(path, "central directory entry count mismatch"));
+    }
 
     if records.is_empty() {
         return Ok(ExactSlice {
