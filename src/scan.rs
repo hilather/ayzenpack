@@ -437,9 +437,20 @@ fn find_cd_first_local(
     file: &mut (impl Read + Seek),
     file_len: u64,
 ) -> Result<Option<u64>> {
-    let (struct_off, cd_size, _recorded_cd, entries) = match find_cd_bounds(path, file, file_len) {
+    // Prefer Zip64 EOCD when the locator is present, even if classic EOCD
+    // fields are not sentinels (rust zip `large_file` writes sizes as MAX
+    // but leaves a 32-bit CD offset). Classic `eocd - cd_size` then lands
+    // in the Zip64 footer instead of the CD.
+    let (eocd_off, cd_size32, _cd_off32, entries16) = match find_eocd(path, file, file_len) {
         Ok(bounds) => bounds,
         Err(AyzenpackError::NotZip { .. }) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let (struct_off, cd_size, entries) = match find_zip64_cd_bounds(path, file, eocd_off) {
+        Ok((off, size, _, n)) => (off, size, n),
+        Err(AyzenpackError::NotZip { .. }) => {
+            (eocd_off, u64::from(cd_size32), u64::from(entries16))
+        }
         Err(err) => return Err(err),
     };
     if entries == 0 || cd_size == 0 {
@@ -1094,6 +1105,20 @@ mod tests {
         let layout = detect_zip_layout(Path::new("falsepkA.jar"), &mut cur).unwrap();
         assert_eq!(layout.prefix_len, DECOY_LAUNCHER.len() as u64);
         assert_eq!(layout.view_shift, 0);
+    }
+
+    #[test]
+    fn cd_first_local_skips_decoy_pk_plus_zip64() {
+        let zip = make_zip64(&[("BOOT-INF/lib/dep.jar", b"nested-zip64-opaque")]);
+        let mut wrapped = DECOY_LAUNCHER.to_vec();
+        wrapped.extend_from_slice(&zip);
+        let mut extra_cur = Cursor::new(wrapped.clone());
+        let extra = eocd_extra(&mut extra_cur).expect("classic EOCD still present");
+        assert!(extra > DECOY_LAUNCHER.len() as u64);
+        let mut cur = Cursor::new(wrapped);
+        let layout = detect_zip_layout(Path::new("falsepk64.jar"), &mut cur).unwrap();
+        assert_eq!(layout.prefix_len, DECOY_LAUNCHER.len() as u64);
+        assert_eq!(layout.view_shift, DECOY_LAUNCHER.len() as u64);
     }
 
     #[test]
