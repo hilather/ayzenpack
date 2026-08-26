@@ -90,7 +90,7 @@ Unknown header keys are ignored. Write versions `{1,2}`. Read: `magic[0..4]==AYZ
   "zstd_level": 3,
   "created_unix": 1710000000,
   "tool": "ayzenpack",
-  "tool_version": "0.2.0"
+  "tool_version": "0.2.1"
 }
 ```
 
@@ -189,7 +189,7 @@ The original JAR is gone after dehydrate. What remains:
 
 **Forbidden on write:** a second encoding of the same entry. No default `cdata_blob` beside the content blob. No `raw_zip` except unlistable zips (spanning / parse failure / ZipArchive count ≠ CD count). Do not store pre-deflated ZIP cdata as the CAS payload. Do not switch to per-file zstd frames.
 
-Crate 0.2.0 still writes leftover `cdata_blob` on `MixedExact` / class-4 (`ExactWithExotic`). That is a defect, not a policy. [`PLAN.md`](PLAN.md) / [`AGENTS.md`](AGENTS.md). New work must not add more dual copies.
+Crate **0.2.1** never writes leftover `cdata_blob`. Crate 0.2.0 MixedExact / class-4 dual copies still read. [`PLAN.md`](PLAN.md) / [`AGENTS.md`](AGENTS.md). New work must not add more dual copies.
 
 ---
 
@@ -324,4 +324,4 @@ Treat a `.ayz` as sensitive as the input JARs: it contains file contents and ori
 - zstd-framed / edition-2024 dependencies
 - Tokio, reqwest, openssl
 
-Future: `--explode-nested`, a class-file zstd dictionary. Implement [`PLAN.md`](PLAN.md) (crate 0.2.1 writer: never emit `cdata_blob`) before any of those.
+Future: `--explode-nested`, a class-file zstd dictionary. Crate 0.2.1 already never emits `cdata_blob`.

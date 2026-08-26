@@ -17,7 +17,8 @@ use fixtures::{
     spring_boot_launch_script, write_data_descriptor_zip, write_deflate_miss_plus_dir_cdata,
     write_deflate_miss_plus_empty_deflate_dir, write_jar, write_jar_entries,
     write_jar_with_comment, write_non_utf8_name_zip, write_padded_locals_zip,
-    write_signed_looking_jar, write_store_file_plus_empty_deflate_dir,
+    write_signed_looking_jar, write_store_file_plus_dir_cdata,
+    write_store_file_plus_empty_deflate_dir, write_store_file_plus_leftover_csize_dir,
     write_stored_block_deflate_wrapped, write_stored_block_deflate_zip, write_stored_jar_dos_zero,
     write_stored_zip, write_wrapped_jar, write_wrapped_jar_adjusted, write_wrapped_zip64_jar,
     zip64_jar_bytes, JarEntry, SPRING_LAUNCHER,
@@ -94,6 +95,38 @@ fn dehydrate_shared_hello_unique_blob_count_is_3() {
         summary.unique_blob_count
     );
     assert_eq!(m.stats.unique_blob_count, summary.unique_blob_count);
+}
+
+#[test]
+fn unique_overlap_content_blobs_not_dual_copy() {
+    // HELLO + A + B = 3 distinct content blobs. Index tails/headers are allowed.
+    // Dual cdata_blob encodings are not.
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("A.jar");
+    let b = dir.path().join("B.jar");
+    write_jar(&a, &[("A.txt", b"AAA"), ("HELLO.txt", b"HELLO")]);
+    write_jar(&b, &[("B.txt", b"BBB"), ("HELLO.txt", b"HELLO")]);
+    let out = dir.path().join("out.ayz");
+    let summary = dehydrate(&opts(&out, vec![a, b])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    let content: BTreeSet<_> = content_blob_ids(&m);
+    assert_eq!(content.len(), 3, "HELLO + A + B");
+    for jar in &m.jars {
+        for e in &jar.entries {
+            assert!(
+                e.cdata_blob.is_none(),
+                "{}!{} must not write a second encoding",
+                jar.name,
+                e.name
+            );
+        }
+    }
+    assert!(
+        summary.unique_blob_count < (content.len() as u64) * 2,
+        "unique_blob_count {} must not be ~2× content count {}",
+        summary.unique_blob_count,
+        content.len()
+    );
 }
 
 #[test]
@@ -371,6 +404,70 @@ fn assert_bit_identical(src: &Path, dest: &Path) {
     let b = fs::read(dest).unwrap();
     assert_eq!(a.len(), b.len(), "size {} vs {}", a.len(), b.len());
     assert_eq!(a, b, "restored bytes must match source ({})", src.display());
+}
+
+/// Local + CD header fields for `name`. `assert_functional_identity` skips dirs.
+type ZipSizes = (u16, u32, u32, u32);
+
+fn member_local_and_cd(path: &Path, name: &str) -> (ZipSizes, ZipSizes) {
+    let data = fs::read(path).unwrap();
+    let eocd = {
+        let mut i = data.len() - 22;
+        loop {
+            if data[i..i + 4] == *b"PK\x05\x06" {
+                break i;
+            }
+            assert!(i > 0, "EOCD");
+            i -= 1;
+        }
+    };
+    let cd_size = u32::from_le_bytes(data[eocd + 12..eocd + 16].try_into().unwrap()) as usize;
+    let cd_off = u32::from_le_bytes(data[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+    let want = name.as_bytes();
+    let mut i = 0usize;
+    while i + 30 <= data.len() {
+        if data[i..i + 4] != *b"PK\x03\x04" {
+            break;
+        }
+        let method = u16::from_le_bytes([data[i + 8], data[i + 9]]);
+        let crc = u32::from_le_bytes(data[i + 14..i + 18].try_into().unwrap());
+        let csize = u32::from_le_bytes(data[i + 18..i + 22].try_into().unwrap());
+        let uncomp = u32::from_le_bytes(data[i + 22..i + 26].try_into().unwrap());
+        let name_len = u16::from_le_bytes([data[i + 26], data[i + 27]]) as usize;
+        let extra_len = u16::from_le_bytes([data[i + 28], data[i + 29]]) as usize;
+        let n = &data[i + 30..i + 30 + name_len];
+        if n == want {
+            let mut cdi = cd_off;
+            let cd_end = cd_off + cd_size;
+            while cdi + 46 <= cd_end {
+                assert_eq!(&data[cdi..cdi + 4], b"PK\x01\x02");
+                let cd_method = u16::from_le_bytes([data[cdi + 10], data[cdi + 11]]);
+                let cd_crc = u32::from_le_bytes(data[cdi + 16..cdi + 20].try_into().unwrap());
+                let cd_csize = u32::from_le_bytes(data[cdi + 20..cdi + 24].try_into().unwrap());
+                let cd_uncomp = u32::from_le_bytes(data[cdi + 24..cdi + 28].try_into().unwrap());
+                let cd_name_len = u16::from_le_bytes([data[cdi + 28], data[cdi + 29]]) as usize;
+                let cd_extra_len = u16::from_le_bytes([data[cdi + 30], data[cdi + 31]]) as usize;
+                let cd_comment_len = u16::from_le_bytes([data[cdi + 32], data[cdi + 33]]) as usize;
+                let cd_n = &data[cdi + 46..cdi + 46 + cd_name_len];
+                if cd_n == want {
+                    return (
+                        (method, crc, csize, uncomp),
+                        (cd_method, cd_crc, cd_csize, cd_uncomp),
+                    );
+                }
+                cdi += 46 + cd_name_len + cd_extra_len + cd_comment_len;
+            }
+            panic!("CD missing {name}");
+        }
+        i += 30 + name_len + extra_len + csize as usize;
+    }
+    panic!("local header missing {name}");
+}
+
+fn assert_empty_store_dir(path: &Path, name: &str) {
+    let (local, cd) = member_local_and_cd(path, name);
+    assert_eq!(local, (0, 0, 0, 0), "local {name} must be empty STORE");
+    assert_eq!(cd, (0, 0, 0, 0), "CD {name} must be empty STORE");
 }
 
 fn assert_functional_identity(src: &Path, dest: &Path) {
@@ -1826,7 +1923,7 @@ fn maven_empty_deflate_dir_does_not_force_cdata_blob() {
 }
 
 #[test]
-fn class4_miss_plus_dir_cdata_keeps_cdata_blob() {
+fn class4_miss_plus_dir_cdata_rebuilds_empty_store_dir() {
     let dir = tempfile::tempdir().unwrap();
     let jar = dir.path().join("class4.jar");
     let payload = vec![b'a'; 256];
@@ -1845,18 +1942,84 @@ fn class4_miss_plus_dir_cdata_keeps_cdata_blob() {
         .iter()
         .find(|e| e.is_dir || e.name.ends_with('/'))
         .expect("dir");
-    assert!(file.cdata_blob.is_some(), "class 4 file keeps cdata_blob");
     assert!(
-        dir_ent.cdata_blob.is_some(),
-        "class 4 dir-with-cdata keeps cdata_blob"
+        file.cdata_blob.is_none(),
+        "class 4 file must not store cdata_blob"
+    );
+    assert!(
+        dir_ent.cdata_blob.is_none(),
+        "class 4 dir-with-cdata must not store cdata_blob"
     );
     assert!(file.cdata_codec.is_none());
     assert!(dir_ent.cdata_codec.is_none());
     assert!(m.jars[0].raw_zip_blob.is_none());
-    assert!(m.jars[0].exact_restore());
+    assert!(m.jars[0].metadata_rebuild());
+    assert!(!m.jars[0].bit_identical_restore());
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
-    assert_bit_identical(&jar, &dest.join("class4.jar"));
+    let restored = dest.join("class4.jar");
+    assert_functional_identity(&jar, &restored);
+    assert_ne!(
+        fs::read(&jar).unwrap(),
+        fs::read(&restored).unwrap(),
+        "class-4 rebuild must not be bit-identical"
+    );
+    assert_empty_store_dir(&restored, "marked/");
+}
+
+#[test]
+fn exact_with_exotic_store_plus_dir_cdata_rebuilds() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("exact-exotic.jar");
+    write_store_file_plus_dir_cdata(&jar, "a.txt", b"hello-store");
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    for e in &m.jars[0].entries {
+        assert!(
+            e.cdata_blob.is_none(),
+            "{} must not write cdata_blob",
+            e.name
+        );
+    }
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    assert!(!m.jars[0].bit_identical_restore());
+    assert!(m.jars[0].metadata_rebuild());
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("exact-exotic.jar");
+    assert_functional_identity(&jar, &restored);
+    assert_ne!(
+        fs::read(&jar).unwrap(),
+        fs::read(&restored).unwrap(),
+        "ExactWithExotic rebuild must not be bit-identical"
+    );
+    assert_empty_store_dir(&restored, "marked/");
+}
+
+#[test]
+fn leftover_csize_dir_rebuilds_empty_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("leftover-csize.jar");
+    write_store_file_plus_leftover_csize_dir(&jar, "a.txt", b"hello-store");
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    for e in &m.jars[0].entries {
+        assert!(
+            e.cdata_blob.is_none(),
+            "{} must not write cdata_blob",
+            e.name
+        );
+    }
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    assert!(m.jars[0].metadata_rebuild());
+    assert!(!m.jars[0].bit_identical_restore());
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("leftover-csize.jar");
+    assert_functional_identity(&jar, &restored);
+    assert_empty_store_dir(&restored, "marked/");
 }
 
 #[test]

@@ -901,14 +901,10 @@ enum LocalClass {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StorePolicy {
-    /// STORE + codec hits only.
+    /// STORE + empty-dir + codec hits only. `cdata_codec` on hits. No `cdata_blob`.
     CleanExact,
-    /// Hits keep codec; unreproducible entries keep `cdata_blob`.
-    ExactWithExotic,
-    /// Whole-jar metadata rebuild; no cdata copy/codec.
+    /// Any DEFLATE miss or unreproducible sibling: rebuild the jar. No `cdata_blob` / no codec.
     CleanMiss,
-    /// Miss + unreproducible sibling: `cdata_blob` on DEFLATE and unreproducible.
-    MixedExact,
 }
 
 fn classify_local(entry: &Entry, local: &ExactLocal) -> LocalClass {
@@ -953,15 +949,13 @@ fn classify_local(entry: &Entry, local: &ExactLocal) -> LocalClass {
 }
 
 fn jar_store_policy(classes: &[LocalClass]) -> StorePolicy {
-    let unreproducible = classes
+    if classes
         .iter()
-        .any(|c| matches!(c, LocalClass::Unreproducible));
-    let deflate_miss = classes.iter().any(|c| matches!(c, LocalClass::DeflateMiss));
-    match (deflate_miss, unreproducible) {
-        (false, false) => StorePolicy::CleanExact,
-        (false, true) => StorePolicy::ExactWithExotic,
-        (true, false) => StorePolicy::CleanMiss,
-        (true, true) => StorePolicy::MixedExact,
+        .any(|c| matches!(c, LocalClass::DeflateMiss | LocalClass::Unreproducible))
+    {
+        StorePolicy::CleanMiss
+    } else {
+        StorePolicy::CleanExact
     }
 }
 
@@ -980,22 +974,7 @@ fn fill_exact_entry(
         remember_blob(sink, &local.header, b3, s256)?;
         entry.local_header_blob = Some(hex_lower(&b3));
     }
-    let store_cdata = matches!(
-        (policy, class),
-        (StorePolicy::ExactWithExotic, LocalClass::Unreproducible)
-            | (StorePolicy::MixedExact, LocalClass::Unreproducible)
-            | (StorePolicy::MixedExact, LocalClass::DeflateHit(_))
-            | (StorePolicy::MixedExact, LocalClass::DeflateMiss)
-    );
-    if store_cdata {
-        let (b3, s256) = hash_both(&local.cdata);
-        remember_blob(sink, &local.cdata, b3, s256)?;
-        entry.cdata_blob = Some(hex_lower(&b3));
-    } else if let (
-        StorePolicy::CleanExact | StorePolicy::ExactWithExotic,
-        LocalClass::DeflateHit(level),
-    ) = (policy, class)
-    {
+    if let (StorePolicy::CleanExact, LocalClass::DeflateHit(level)) = (policy, class) {
         entry.cdata_codec = Some(crate::deflate::codec_string(level));
     }
     if let Some(desc) = &local.descriptor {
@@ -1222,14 +1201,14 @@ mod tests {
     use std::io::{Seek, SeekFrom};
 
     #[test]
-    fn jar_store_policy_covers_all_four_classes() {
+    fn jar_store_policy_miss_or_exotic_is_clean_miss() {
         assert_eq!(
             jar_store_policy(&[LocalClass::Store, LocalClass::DeflateHit(6)]),
             StorePolicy::CleanExact
         );
         assert_eq!(
             jar_store_policy(&[LocalClass::DeflateHit(6), LocalClass::Unreproducible]),
-            StorePolicy::ExactWithExotic
+            StorePolicy::CleanMiss
         );
         assert_eq!(
             jar_store_policy(&[LocalClass::DeflateHit(6), LocalClass::DeflateMiss]),
@@ -1237,7 +1216,7 @@ mod tests {
         );
         assert_eq!(
             jar_store_policy(&[LocalClass::DeflateMiss, LocalClass::Unreproducible]),
-            StorePolicy::MixedExact
+            StorePolicy::CleanMiss
         );
     }
 

@@ -17,7 +17,7 @@ use crate::deflate;
 use crate::error::{AyzenpackError, Result};
 use crate::exact::{
     detect_offset_mode, encode_offset, patch_central_directory, patch_data_descriptor,
-    patch_eocd_cd_start, patch_local_compressed_size,
+    patch_eocd_cd_start, patch_local_rebuild_fields, RebuildPatch,
 };
 use crate::format::{decode_payload, open_ayz_layout, read_record, Record};
 use crate::hashutil::{blake3_bytes, hash_reader, hex_lower, parse_blake3_hex, parse_hex};
@@ -574,27 +574,30 @@ fn resolve_cdata(jar: &Jar, e: &Entry, cas_dir: &Path, allow_rebuild: bool) -> R
         return read_named_blob(cas_dir, hex, &format!("{}!{} cdata", jar.name, e.name));
     }
     if let Some(codec) = &e.cdata_codec {
-        let level = deflate::parse_codec(codec)?;
-        // Empty DEFLATE directories have no content blob; encode `[]` at the recorded level.
-        let bytes = if e.is_dir && e.blob.is_none() {
-            Vec::new()
-        } else {
-            read_entry_content(jar, e, cas_dir)?
-        };
-        let out = deflate::deflate_raw(&bytes, level)?;
-        if out.len() as u64 != e.compressed_size {
-            return Err(AyzenpackError::HashMismatch(format!(
-                "{}!{} cdata_codec size: recorded {} computed {}",
-                jar.name,
-                e.name,
-                e.compressed_size,
-                out.len()
-            )));
+        if !(allow_rebuild && e.is_dir) {
+            let level = deflate::parse_codec(codec)?;
+            // Empty DEFLATE directories have no content blob; encode `[]` at the recorded level.
+            let bytes = if e.is_dir && e.blob.is_none() {
+                Vec::new()
+            } else {
+                read_entry_content(jar, e, cas_dir)?
+            };
+            let out = deflate::deflate_raw(&bytes, level)?;
+            if out.len() as u64 != e.compressed_size {
+                return Err(AyzenpackError::HashMismatch(format!(
+                    "{}!{} cdata_codec size: recorded {} computed {}",
+                    jar.name,
+                    e.name,
+                    e.compressed_size,
+                    out.len()
+                )));
+            }
+            return Ok(out);
         }
-        return Ok(out);
+        // Legacy dir codecs are ignored on rebuild (CleanMiss omits them on new packs).
     }
     if e.is_dir {
-        if allow_rebuild && e.method_code == 8 {
+        if allow_rebuild && e.method_code == 8 && e.uncompressed_size == 0 {
             return deflate::deflate_raw(&[], deflate::rebuild_level());
         }
         return Ok(Vec::new());
@@ -602,7 +605,7 @@ fn resolve_cdata(jar: &Jar, e: &Entry, cas_dir: &Path, allow_rebuild: bool) -> R
     if e.method_code == 0 {
         return read_entry_content(jar, e, cas_dir);
     }
-    if allow_rebuild && e.method_code == 8 {
+    if allow_rebuild {
         let bytes = read_entry_content(jar, e, cas_dir)?;
         return deflate::deflate_raw(&bytes, deflate::rebuild_level());
     }
@@ -610,6 +613,24 @@ fn resolve_cdata(jar: &Jar, e: &Entry, cas_dir: &Path, allow_rebuild: bool) -> R
         "missing cdata for {}!{} (no cdata_blob/cdata_codec)",
         jar.name, e.name
     )))
+}
+
+/// Header fields after rebuild. Class-4 / leftover-csize / exotic dirs become empty STORE.
+/// Maven empty DEFLATE dirs (`method 8`, uncomp 0) stay DEFLATE. Exotic files become DEFLATE.
+/// Files keep crc / uncompressed size.
+fn rebuild_index_fields(e: &Entry) -> (u16, u32, u64) {
+    if e.is_dir {
+        let maven_empty_deflate = e.method_code == 8 && e.uncompressed_size == 0;
+        if !maven_empty_deflate
+            && (e.uncompressed_size != 0 || e.compressed_size != 0 || e.method_code != 0)
+        {
+            return (0, 0, 0);
+        }
+    }
+    if !e.is_dir && e.method_code != 0 && e.method_code != 8 {
+        return (8, e.crc32, e.uncompressed_size);
+    }
+    (e.method_code, e.crc32, e.uncompressed_size)
 }
 
 fn read_entry_content(jar: &Jar, e: &Entry, cas_dir: &Path) -> Result<Vec<u8>> {
@@ -662,21 +683,6 @@ fn write_rebuilt_jar(
         return Ok(());
     }
 
-    for e in &jar.entries {
-        if e.method_code != 0 && e.method_code != 8 {
-            return Err(AyzenpackError::FormatOwned(format!(
-                "cannot rebuild {}!{} method {}",
-                jar.name, e.name, e.method_code
-            )));
-        }
-        if e.is_dir && (e.cdata_blob.is_some() || e.cdata_codec.is_some()) {
-            return Err(AyzenpackError::FormatOwned(format!(
-                "cannot rebuild {}!{}: directory has cdata_blob/cdata_codec",
-                jar.name, e.name
-            )));
-        }
-    }
-
     let first_lh = jar.entries[0].local_header_offset.ok_or_else(|| {
         AyzenpackError::FormatOwned(format!(
             "missing local_header_offset for {}!{}",
@@ -690,17 +696,32 @@ fn write_rebuilt_jar(
     for e in &jar.entries {
         let mut header = load_local_header(jar, e, cas_dir)?;
         let cdata = resolve_cdata(jar, e, cas_dir, true)?;
-        patch_local_compressed_size(&mut header, cdata.len() as u64, &jar.name)?;
+        let (method, crc, uncomp) = rebuild_index_fields(e);
+        patch_local_rebuild_fields(
+            &mut header,
+            method,
+            crc,
+            cdata.len() as u64,
+            uncomp,
+            &jar.name,
+        )?;
         let desc = match &e.data_descriptor_hex {
             Some(h) => Some(patch_data_descriptor(
                 &parse_hex(h)?,
+                crc,
                 cdata.len() as u64,
+                uncomp,
                 &jar.name,
             )?),
             None => None,
         };
-        let zip_rel = locals.len() as u64;
-        updates.push((zip_rel, cdata.len() as u64));
+        updates.push(RebuildPatch {
+            zip_rel: locals.len() as u64,
+            method,
+            crc,
+            compressed_size: cdata.len() as u64,
+            uncompressed_size: uncomp,
+        });
         locals.extend_from_slice(&header);
         locals.extend_from_slice(&cdata);
         if let Some(d) = &desc {

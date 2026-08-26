@@ -124,8 +124,8 @@ fn agents_md_locks_single_cas_and_zstd_blocks() {
         "AGENTS.md must say never write legacy dual-copy again"
     );
     assert!(
-        AGENTS.contains("still **writes** `cdata_blob` (class-4 / mixed-exotic)"),
-        "AGENTS.md must admit 0.2.0 still writes leftover cdata_blob"
+        AGENTS.contains("**never writes** `cdata_blob` on STORE/DEFLATE (file or dir, any method)"),
+        "AGENTS.md must say 0.2.1 never writes leftover cdata_blob"
     );
     assert!(
         AGENTS.contains("Do not add new `cdata_blob` puts"),
@@ -161,7 +161,7 @@ fn agents_md_locks_single_cas_and_zstd_blocks() {
         "README must not tell agents that bit-identical restore is the guarantee"
     );
     assert!(
-        README.contains("Crate 0.2.0 still writes leftover `cdata_blob`"),
-        "README must not claim 0.2.0 already never writes cdata_blob"
+        README.contains("Crate **0.2.1** never writes `cdata_blob` (file or dir, any method)"),
+        "README must say 0.2.1 never writes leftover cdata_blob"
     );
 }
