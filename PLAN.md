@@ -194,7 +194,7 @@ New / updated in `tests/roundtrip.rs` (and manifest unit tests):
 
 ## Docs
 
-- `DESIGN.md`: reconstruction is metadata-only by default; `cdata_blob` is legacy / exotic; `cdata_codec`; miss = rebuild, **do not** claim `source_blake3` match; `tool_version` example `0.1.9`; memory line no longer says peak includes a `cdata` copy for new packs. Also fix the Non-goals bullet that says new packs are already bit-identical / `--verbatim` is unnecessary (`DESIGN.md` ~279) and the Reconstruction opener (`DESIGN.md` ~159, `src/rehydrate.rs` module docs).
+- `DESIGN.md`: reconstruction is metadata-only by default; `cdata_blob` is legacy / exotic; `cdata_codec`; miss = rebuild, **do not** claim `source_blake3` match; `tool_version` example `0.1.9`; memory line no longer says peak includes a `cdata` copy for new packs. Also fix the Non-goals bullet that says new packs are already bit-identical / `--verbatim` is unnecessary (`DESIGN.md` ~279), the Reconstruction opener (`DESIGN.md` ~159, `src/rehydrate.rs` module docs), and the signed-JAR paragraph that says the rebuild-breaks-signature warning is only for the ZipWriter fallback (`DESIGN.md` ~221) — it also applies to metadata-rebuild jars.
 - `README.md` Reconstruction guarantee: same facts. No new CLI flag table row.
 - `docs/library.md` only if it describes exact/cdata storage (it currently does not).
 - `tests/bench.rs` comment that assumes `cdata == blob` if it would fail compile or assert.

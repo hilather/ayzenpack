@@ -419,3 +419,133 @@ pub fn write_signed_looking_jar(path: &Path) {
         ],
     );
 }
+
+/// Raw stored-block DEFLATE (RFC 1951). miniz_oxide levels 1/3/6/9 will not match
+/// this for a compressible payload (repeated bytes).
+pub fn raw_stored_deflate(plain: &[u8]) -> Vec<u8> {
+    let len = u16::try_from(plain.len()).expect("stored-block fixture payload fits u16");
+    let mut out = vec![0x01];
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&(!len).to_le_bytes());
+    out.extend_from_slice(plain);
+    out
+}
+
+/// Dummy extra ZipWriter does not emit — proves metadata rebuild kept extras.
+pub const REBUILD_MARK_EXTRA: &[u8] = &[0x01, 0x99, 0x04, 0x00, b'T', b'E', b'S', b'T'];
+
+struct BuiltLocal {
+    name: Vec<u8>,
+    method: u16,
+    crc: u32,
+    uncomp: u32,
+    cdata: Vec<u8>,
+    extra: Vec<u8>,
+}
+
+fn write_locals_and_cd(path: &Path, entries: &[BuiltLocal]) {
+    let mut local = Vec::new();
+    let mut central = Vec::new();
+    for e in entries {
+        let off = local.len() as u32;
+        local.extend_from_slice(b"PK\x03\x04");
+        local.extend_from_slice(&20u16.to_le_bytes());
+        local.extend_from_slice(&0u16.to_le_bytes());
+        local.extend_from_slice(&e.method.to_le_bytes());
+        local.extend_from_slice(&0u16.to_le_bytes());
+        local.extend_from_slice(&0u16.to_le_bytes());
+        local.extend_from_slice(&e.crc.to_le_bytes());
+        local.extend_from_slice(&(e.cdata.len() as u32).to_le_bytes());
+        local.extend_from_slice(&e.uncomp.to_le_bytes());
+        local.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
+        local.extend_from_slice(&(e.extra.len() as u16).to_le_bytes());
+        local.extend_from_slice(&e.name);
+        local.extend_from_slice(&e.extra);
+        local.extend_from_slice(&e.cdata);
+
+        central.extend_from_slice(b"PK\x01\x02");
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&e.method.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&e.crc.to_le_bytes());
+        central.extend_from_slice(&(e.cdata.len() as u32).to_le_bytes());
+        central.extend_from_slice(&e.uncomp.to_le_bytes());
+        central.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
+        central.extend_from_slice(&(e.extra.len() as u16).to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&off.to_le_bytes());
+        central.extend_from_slice(&e.name);
+        central.extend_from_slice(&e.extra);
+    }
+    let cd_off = local.len() as u32;
+    let cd_len = central.len() as u32;
+    let n = entries.len() as u16;
+    local.extend_from_slice(&central);
+    local.extend_from_slice(b"PK\x05\x06");
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(&n.to_le_bytes());
+    local.extend_from_slice(&n.to_le_bytes());
+    local.extend_from_slice(&cd_len.to_le_bytes());
+    local.extend_from_slice(&cd_off.to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    std::fs::write(path, local).unwrap();
+}
+
+/// Compressible payload + stored-block DEFLATE + rebuild-mark extra.
+pub fn write_stored_block_deflate_zip(path: &Path, name: &str, data: &[u8]) {
+    let cdata = raw_stored_deflate(data);
+    write_locals_and_cd(
+        path,
+        &[BuiltLocal {
+            name: name.as_bytes().to_vec(),
+            method: 8,
+            crc: crc32fast::hash(data),
+            uncomp: data.len() as u32,
+            cdata,
+            extra: REBUILD_MARK_EXTRA.to_vec(),
+        }],
+    );
+}
+
+pub fn write_stored_block_deflate_wrapped(path: &Path, launcher: &[u8], name: &str, data: &[u8]) {
+    let tmp = path.with_extension("inner.jar");
+    write_stored_block_deflate_zip(&tmp, name, data);
+    let zip = std::fs::read(&tmp).unwrap();
+    std::fs::remove_file(&tmp).unwrap();
+    let mut out = launcher.to_vec();
+    out.extend_from_slice(&zip);
+    std::fs::write(path, out).unwrap();
+}
+
+/// Stored-block DEFLATE file plus a directory whose local record has non-empty cdata.
+pub fn write_deflate_miss_plus_dir_cdata(path: &Path, name: &str, data: &[u8]) {
+    let cdata = raw_stored_deflate(data);
+    write_locals_and_cd(
+        path,
+        &[
+            BuiltLocal {
+                name: name.as_bytes().to_vec(),
+                method: 8,
+                crc: crc32fast::hash(data),
+                uncomp: data.len() as u32,
+                cdata,
+                extra: Vec::new(),
+            },
+            BuiltLocal {
+                name: b"marked/".to_vec(),
+                method: 0,
+                crc: 0,
+                uncomp: 4,
+                cdata: b"DIRC".to_vec(),
+                extra: Vec::new(),
+            },
+        ],
+    );
+}

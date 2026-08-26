@@ -199,7 +199,7 @@ fn bench_script_emits_required_keys() {
     }
     assert!(v["bytes_in_jars"].as_u64().unwrap() > 0);
     assert!(v["archive_size"].as_u64().unwrap() > 0);
-    // Stored synthetic copies share one content blob + one tail (cdata == blob).
+    // Stored synthetic copies share one content blob + one tail (no extra cdata object).
     assert_eq!(v["unique_blob_count"].as_u64(), Some(2));
 }
 

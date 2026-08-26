@@ -50,9 +50,37 @@ pub struct Jar {
 }
 
 impl Jar {
-    /// New packs set `tail_*` or `raw_zip_*`. Old 0.1.x archives have neither.
+    /// Bit-identical splice: `raw_zip`, or `tail` plus every entry can resolve cdata
+    /// without rebuilding (`cdata_blob`, `cdata_codec`, STORE, or empty dir).
     pub fn exact_restore(&self) -> bool {
-        self.raw_zip_blob.is_some() || self.tail_blob.is_some()
+        self.bit_identical_restore()
+    }
+
+    pub fn bit_identical_restore(&self) -> bool {
+        if self.raw_zip_blob.is_some() {
+            return true;
+        }
+        if self.tail_blob.is_none() {
+            return false;
+        }
+        self.entries.iter().all(Entry::can_exact_cdata)
+    }
+
+    /// Sliced metadata is present but at least one DEFLATE entry has no cdata copy/codec.
+    pub fn metadata_rebuild(&self) -> bool {
+        self.raw_zip_blob.is_none() && self.tail_blob.is_some() && !self.bit_identical_restore()
+    }
+}
+
+impl Entry {
+    fn can_exact_cdata(&self) -> bool {
+        if self.cdata_blob.is_some() || self.cdata_codec.is_some() {
+            return true;
+        }
+        if self.is_dir {
+            return true;
+        }
+        self.method_code == 0
     }
 }
 
@@ -93,9 +121,12 @@ pub struct Entry {
     pub utf8_flag: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name_raw_hex: Option<String>,
-    /// BLAKE3 of the original compressed payload. Same CAS object as `blob` when stored.
+    /// BLAKE3 of the original compressed payload. Legacy 0.1.6–0.1.8 / exotic methods.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cdata_blob: Option<String>,
+    /// Re-encode content `blob` with this raw-deflate codec (`deflate-raw:flate2:<level>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdata_codec: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_header_offset: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -143,6 +174,7 @@ mod tests {
             utf8_flag: true,
             name_raw_hex: None,
             cdata_blob: None,
+            cdata_codec: None,
             local_header_offset: None,
             local_header_hex: None,
             local_header_blob: None,
@@ -249,6 +281,7 @@ mod tests {
         assert!(SCHEMA_JSON.contains("tail_blob"));
         assert!(SCHEMA_JSON.contains("raw_zip_blob"));
         assert!(SCHEMA_JSON.contains("cdata_blob"));
+        assert!(SCHEMA_JSON.contains("cdata_codec"));
         assert!(SCHEMA_JSON.contains("local_header_hex"));
         assert!(SCHEMA_JSON.contains("local_header_offset"));
         assert!(!SCHEMA_JSON.contains("jded"));
@@ -380,6 +413,7 @@ mod tests {
         );
         let mut exact_ent = m.jars[0].entries[0].clone();
         exact_ent.cdata_blob = Some(EMPTY_BLAKE3.into());
+        exact_ent.cdata_codec = Some("deflate-raw:flate2:6".into());
         exact_ent.local_header_offset = Some(0);
         exact_ent.local_header_hex = Some("504b0304".into());
         exact_ent.data_descriptor_hex = Some("504b0708".into());
@@ -389,6 +423,7 @@ mod tests {
             &[
                 "utf8_flag",
                 "cdata_blob",
+                "cdata_codec",
                 "local_header_offset",
                 "local_header_hex",
                 "data_descriptor_hex",
@@ -415,6 +450,7 @@ mod tests {
             utf8_flag: true,
             name_raw_hex: None,
             cdata_blob: None,
+            cdata_codec: None,
             local_header_offset: None,
             local_header_hex: None,
             local_header_blob: None,
@@ -534,6 +570,7 @@ mod tests {
             "raw_zip_blob",
             "raw_zip_size",
             "cdata_blob",
+            "cdata_codec",
             "local_header_offset",
             "local_header_hex",
             "local_header_blob",
@@ -546,6 +583,7 @@ mod tests {
         let e = serde_json::to_string(&jar.entries[0]).unwrap();
         for key in [
             "cdata_blob",
+            "cdata_codec",
             "local_header_offset",
             "local_header_hex",
             "local_header_blob",

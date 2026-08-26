@@ -158,11 +158,11 @@ See [docs/library.md](docs/library.md#load-a-yaml-job-file) for the loader.
 
 ## Reconstruction guarantee
 
-New packs restore **bit-identical** files: blake3, sha256, and size match `jars[].source_*`, and `cmp` is equal. Spring Boot fully-executable JARs stay `[official launch.script][zip]`. File-level signatures survive because the bytes do.
+New packs keep ZIP metadata (local headers, descriptors, padding, CD tail) and restore **bit-identical** files when every DEFLATE member matches a pinned flate2 raw-deflate codec (`cdata_codec`) or is STORE. Then blake3, sha256, and size match `jars[].source_*`. Spring Boot fully-executable JARs stay `[official launch.script][zip]`.
 
-Uncompressed entry blobs are still stored (listing, CRC, cross-jar dedup). Exact restore copies original local headers, compressed payloads (`cdata_blob`), data descriptors, alignment padding, and the ZIP tail (central directory through EOCD). If a zip cannot be sliced, the zip portion after the prefix is stored as `raw_zip_blob` and copied.
+Uncompressed entry blobs are still stored (listing, CRC, cross-jar dedup). The original already-deflated ZIP payload is **not** stored a second time. If flate2 cannot reproduce a member, rehydrate rebuilds a valid ZIP with the same names, order, timestamps, and extras (new compressed sizes; `source_*` will not match). 0.1.6–0.1.8 packs that still have `cdata_blob` keep working. If a zip cannot be sliced, the zip portion after the prefix is stored as `raw_zip_blob` and copied.
 
-**Old archives** (0.1.4 / 0.1.5, no `cdata` / `tail` / `raw_zip` fields) still rehydrate via `ZipWriter`: uncompressed bytes, names, CD order, and CRC match; the deflate bitstream and extras do not. `--verbatim` is **not** a CLI flag.
+**Old archives** (0.1.4 / 0.1.5, no `tail` / `raw_zip` fields) still rehydrate via `ZipWriter`: uncompressed bytes, names, CD order, and CRC match; the deflate bitstream and extras do not. `--verbatim` is **not** a CLI flag.
 
 Spring Boot launchers (including after `zip -A` and Zip64) keep the existing prefix detection. Nested `BOOT-INF/lib/*.jar` entries are not exploded.
 
