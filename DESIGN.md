@@ -23,7 +23,7 @@ A set of application classpaths repeats the same `.class` and resource bytes ten
 
 Storing **uncompressed** entry bytes into **record-aligned zstd groups** usually beats concatenating already-deflated ZIP members: DEFLATE is not a concatenable input for a second compressor, and a second copy of those streams is why packs ballooned (200MB → ~3GB). Identical class files across JARs collapse to one BLOB. The manifest is an index of ZIP slots pointing at those blobs — one file in, N JARs out. v2 groups BLOBs into record-aligned frames (flush at 4 MiB uncompressed BLOB **record** bytes) so the zstd window stays warm and `list` can seek the last frame via the TOC.
 
-Never store a second encoding of the same entry (`cdata_blob` next to the content blob, or `raw_zip` of a jar that parsed). Never switch to per-file/per-blob zstd frames.
+Never store a second encoding of the same entry (`cdata_blob` next to the content blob, or `raw_zip` of a listed jar). Never switch to per-file/per-blob zstd frames.
 
 The tool never unpacks JARs to a forest of `.class` files, never talks to the network, and contains no `unsafe`.
 
@@ -187,9 +187,9 @@ The original JAR is gone after dehydrate. What remains:
 | Index | Manifest ZIP slots: `name`, CD order, `method` / `method_code`, `crc32`, compressed/uncompressed sizes, GPBF (inside `local_header_*`, not a new JSON field), `local_header_offset`, local header / data-descriptor / pad, `tail_blob` (CD through EOF), `prefix_blob` if any, `blob` hash. |
 | Pack compression | Format v2 record-aligned zstd **groups** of those uncompressed BLOB records (flush at 4 MiB record bytes), then MANIFEST+END, uncompressed TOC. |
 
-**Forbidden on write:** a second encoding of the same entry. No default `cdata_blob` beside the content blob. No `raw_zip` except unlistable zips (spanning / parse failure / ZipArchive count ≠ CD count). Do not store pre-deflated ZIP cdata as the CAS payload. Do not switch to per-file zstd frames.
+**Forbidden on write:** a second encoding of the same entry. No default `cdata_blob` beside the content blob. No `raw_zip` of a listed jar (`entries[]` already populated). Count mismatch and homemade parse failure on a listed jar are skip-exact, not `raw_zip`. `raw_zip` only if listing never produced `entries[]` (`UnsupportedArchive` spanning / `NotZip`). Do not store pre-deflated ZIP cdata as the CAS payload. Do not switch to per-file zstd frames.
 
-Crate **0.2.1** never writes leftover `cdata_blob`. Crate 0.2.0 MixedExact / class-4 dual copies still read. [`PLAN.md`](PLAN.md) / [`AGENTS.md`](AGENTS.md). New work must not add more dual copies.
+Crate **0.2.1** never writes leftover `cdata_blob`. Crate **0.2.2** never writes `raw_zip` of a listed jar. Crate 0.2.0 MixedExact / class-4 dual copies still read. [`PLAN.md`](PLAN.md) / [`AGENTS.md`](AGENTS.md). New work must not add more dual copies.
 
 ---
 
@@ -204,7 +204,7 @@ Rehydrate builds a **valid ZIP** from index + blobs. Paths, in order:
 
 Per jar: `tail_blob` / `tail_size` is the CD-through-EOF index blob (structural, not a second copy of entry payloads).
 
-`raw_zip_blob` is only for a zip that cannot be sliced. It is not the codec-miss path and not the exotic-sibling path.
+`raw_zip_blob` is only for a zip that cannot be listed at all. It is not the codec-miss path, not the exotic-sibling path, and not a slice/count-mismatch fallback.
 
 **Old archives** (no tail / `raw_zip`): keep the 0.1.x `ZipWriter` path. `--verbatim` is not a CLI flag.
 
@@ -317,7 +317,7 @@ Treat a `.ayz` as sensitive as the input JARs: it contains file contents and ori
 - Recursively exploding nested JARs
 - A `--verbatim` / `--exact-cdata` CLI flag
 - Java/zlib bit-identical whole-file hashes (Matt locked this out)
-- Dual `cdata_blob` + content; `raw_zip` of jars that parse
+- Dual `cdata_blob` + content; `raw_zip` of listed jars
 - Per-blob zstd frames as the default
 - HTTP CAS, S3, split archives, GUI, Maven/Gradle plugins
 - Renaming v1 manifest fields (`blob`, `uncompressed_size`, `local_header_offset`, …)

@@ -1,16 +1,21 @@
 //! Slice a ZIP (after any executable prefix) into bit-exact reconstruction parts.
 //!
-//! Local records are read by seeking to central-directory offsets. Compressed
-//! payloads are the original bytes — the zip crate's inflating reader is not used
-//! for `cdata`. Parse failure, spanning, or a CD/entry-count mismatch yields the
-//! whole zip portion as `Raw` so rehydrate can still copy it.
+//! Dehydrate builds locals from the same `ZipArchive::by_index` listing as scan
+//! (`slice_from_archive`). Homemade CD parse is a store-tail count gate only.
+//! A count mismatch or a listed-jar slice failure is skip-exact, not `raw_zip`.
+//! `capture_zip_exact` / `ZipExact::Raw` remain for unit tests of the homemade
+//! walker; dehydrate must not consume `Raw`.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use zip::ZipArchive;
+
 use crate::error::{AyzenpackError, Result};
-use crate::scan::{detect_zip_layout, find_cd_bounds, find_eocd, io_at, ZipLayout};
+#[cfg(test)]
+use crate::scan::find_cd_bounds_v0_2_1;
+use crate::scan::{detect_zip_layout, find_cd_bounds, io_at, ZipLayout, ZipView};
 
 pub(crate) const LOCAL_FILE_MAGIC: [u8; 4] = *b"PK\x03\x04";
 pub(crate) const CD_MAGIC: [u8; 4] = *b"PK\x01\x02";
@@ -37,13 +42,16 @@ pub(crate) struct ExactSlice {
     pub tail: Vec<u8>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) enum ZipExact {
     Sliced(ExactSlice),
+    /// Homemade `slice_zip` fallback for unit tests only. Dehydrate must not consume this.
+    #[allow(dead_code)]
     Raw(Vec<u8>),
 }
 
-struct CdRecord {
+pub(crate) struct CdRecord {
     crc: u32,
     compressed_size: u64,
     uncompressed_size: u64,
@@ -51,8 +59,24 @@ struct CdRecord {
     zip_rel_offset: u64,
 }
 
+#[cfg(test)]
 pub(crate) fn capture_zip_exact(path: &Path) -> Result<ZipExact> {
-    match slice_zip(path) {
+    capture_zip_exact_using(path, slice_zip)
+}
+
+/// 0.2.1 homemade walker: `find_cd_bounds` ignored a present Zip64 locator unless
+/// classic EOCD fields were sentinels. `Err` became `ZipExact::Raw` (whole zip).
+#[cfg(test)]
+pub(crate) fn capture_zip_exact_v0_2_1(path: &Path) -> Result<ZipExact> {
+    capture_zip_exact_using(path, slice_zip_v0_2_1)
+}
+
+#[cfg(test)]
+fn capture_zip_exact_using(
+    path: &Path,
+    slice: fn(&Path) -> Result<ExactSlice>,
+) -> Result<ZipExact> {
+    match slice(path) {
         Ok(slice) => Ok(ZipExact::Sliced(slice)),
         Err(AyzenpackError::Encrypted { .. }) => Err(AyzenpackError::Encrypted {
             path: path.to_path_buf(),
@@ -64,6 +88,180 @@ pub(crate) fn capture_zip_exact(path: &Path) -> Result<ZipExact> {
     }
 }
 
+/// Locals from the same `ZipArchive` listing scan uses. Never returns a whole-zip `Raw`.
+///
+/// Store-tail is valid only when homemade `parse_central_directory` yields the same
+/// count as `ZipArchive::len()`. Overlap, first-local ≠ 0, parse `None`, or a
+/// count mismatch is `Err` so dehydrate can skip exact attach.
+pub(crate) fn slice_from_archive(path: &Path) -> Result<ExactSlice> {
+    let layout = {
+        let mut file = File::open(path).map_err(|source| io_at(source, path))?;
+        detect_zip_layout(path, &mut file)?
+    };
+    let recs = archive_local_records(path, &layout)?;
+    if !recs.is_empty() {
+        let min_off = recs.iter().map(|r| r.zip_rel_offset).min().unwrap();
+        if min_off != 0 {
+            return Err(slice_fail(
+                path,
+                "first local header is not at zip offset 0",
+            ));
+        }
+        let mut ordered: Vec<u64> = recs.iter().map(|r| r.zip_rel_offset).collect();
+        ordered.sort_unstable();
+        for pair in ordered.windows(2) {
+            if pair[0] >= pair[1] {
+                return Err(slice_fail(path, "overlapping or unsorted local offsets"));
+            }
+        }
+    }
+
+    let mut file = File::open(path).map_err(|source| io_at(source, path))?;
+    let file_len = file
+        .seek(SeekFrom::End(0))
+        .map_err(|source| io_at(source, path))?;
+    if file_len < layout.prefix_len {
+        return Err(slice_fail(path, "prefix longer than file"));
+    }
+    let (cd_struct_off, cd_size, _recorded_cd, _entry_count) =
+        find_cd_bounds(path, &mut file, file_len)?;
+    let phys_cd = cd_struct_off
+        .checked_sub(cd_size)
+        .ok_or_else(|| slice_fail(path, "central directory offset underflow"))?;
+    if phys_cd < layout.prefix_len {
+        return Err(slice_fail(path, "central directory starts inside prefix"));
+    }
+    let zip_rel_cd = phys_cd - layout.prefix_len;
+    let mut tail = vec![0u8; usize_from_u64(file_len - phys_cd, path)?];
+    file.seek(SeekFrom::Start(phys_cd))
+        .map_err(|source| io_at(source, path))?;
+    file.read_exact(&mut tail)
+        .map_err(|source| io_at(source, path))?;
+    let cd_n = usize_from_u64(cd_size, path)?;
+    if tail.len() < cd_n {
+        return Err(slice_fail(path, "central directory truncated in tail"));
+    }
+    let homemade = parse_central_directory(&tail[..cd_n], &layout)
+        .ok_or_else(|| slice_fail(path, "central directory parse failed"))?;
+    if homemade.len() != recs.len() {
+        return Err(slice_fail(path, "central directory entry count mismatch"));
+    }
+
+    let mut locals = Vec::with_capacity(recs.len());
+    for rec in &recs {
+        let next = recs
+            .iter()
+            .map(|r| r.zip_rel_offset)
+            .filter(|&off| off > rec.zip_rel_offset)
+            .min()
+            .unwrap_or(zip_rel_cd);
+        if next <= rec.zip_rel_offset {
+            return Err(slice_fail(
+                path,
+                "local header offset at or past central directory",
+            ));
+        }
+        locals.push(read_local(path, &mut file, &layout, rec, next)?);
+    }
+    Ok(ExactSlice { locals, tail })
+}
+
+fn archive_local_records(path: &Path, layout: &ZipLayout) -> Result<Vec<CdRecord>> {
+    let file = File::open(path).map_err(|source| io_at(source, path))?;
+    let reader = BufReader::new(ZipView::new(file, layout.view_shift));
+    let mut archive = ZipArchive::new(reader).map_err(|err| archive_open_err(err, path))?;
+    let mut recs = Vec::with_capacity(archive.len());
+    for i in 0..archive.len() {
+        let zf = archive
+            .by_index(i)
+            .map_err(|err| archive_entry_err(err, path))?;
+        if zf.encrypted() {
+            return Err(AyzenpackError::Encrypted {
+                path: path.to_path_buf(),
+            });
+        }
+        let zip_rel_offset = cd_offset_to_zip_rel(zf.header_start(), layout)
+            .ok_or_else(|| slice_fail(path, "local header offset underflow after prefix"))?;
+        recs.push(CdRecord {
+            crc: zf.crc32(),
+            compressed_size: zf.compressed_size(),
+            uncompressed_size: zf.size(),
+            zip_rel_offset,
+        });
+    }
+    Ok(recs)
+}
+
+/// Homemade CD record count vs `ZipArchive::len()` on the **source** file.
+/// `None` homemade means parse failed. Used as the second-bug gate (not tautological).
+#[cfg(test)]
+pub(crate) fn homemade_cd_count_and_archive_len(path: &Path) -> Result<(Option<usize>, usize)> {
+    let (layout, archive_len) = {
+        let mut file = File::open(path).map_err(|source| io_at(source, path))?;
+        let layout = detect_zip_layout(path, &mut file)?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|source| io_at(source, path))?;
+        let archive = ZipArchive::new(BufReader::new(ZipView::new(file, layout.view_shift)))
+            .map_err(|err| archive_open_err(err, path))?;
+        (layout, archive.len())
+    };
+    let mut file = File::open(path).map_err(|source| io_at(source, path))?;
+    let file_len = file
+        .seek(SeekFrom::End(0))
+        .map_err(|source| io_at(source, path))?;
+    let (cd_struct_off, cd_size, _, _) = find_cd_bounds(path, &mut file, file_len)?;
+    let Some(phys_cd) = cd_struct_off.checked_sub(cd_size) else {
+        return Ok((None, archive_len));
+    };
+    if phys_cd < layout.prefix_len || file_len < phys_cd {
+        return Ok((None, archive_len));
+    }
+    let mut tail = vec![0u8; usize_from_u64(file_len - phys_cd, path)?];
+    file.seek(SeekFrom::Start(phys_cd))
+        .map_err(|source| io_at(source, path))?;
+    file.read_exact(&mut tail)
+        .map_err(|source| io_at(source, path))?;
+    let Ok(cd_n) = usize::try_from(cd_size) else {
+        return Ok((None, archive_len));
+    };
+    if tail.len() < cd_n {
+        return Ok((None, archive_len));
+    }
+    Ok((
+        parse_central_directory(&tail[..cd_n], &layout).map(|r| r.len()),
+        archive_len,
+    ))
+}
+
+fn archive_open_err(err: zip::result::ZipError, path: &Path) -> AyzenpackError {
+    match err {
+        zip::result::ZipError::Io(source) => io_at(source, path),
+        zip::result::ZipError::UnsupportedArchive(msg)
+            if msg == zip::result::ZipError::PASSWORD_REQUIRED =>
+        {
+            AyzenpackError::Encrypted {
+                path: path.to_path_buf(),
+            }
+        }
+        _ => slice_fail(path, "zip archive open failed"),
+    }
+}
+
+fn archive_entry_err(err: zip::result::ZipError, path: &Path) -> AyzenpackError {
+    match err {
+        zip::result::ZipError::Io(source) => io_at(source, path),
+        zip::result::ZipError::UnsupportedArchive(msg)
+            if msg == zip::result::ZipError::PASSWORD_REQUIRED =>
+        {
+            AyzenpackError::Encrypted {
+                path: path.to_path_buf(),
+            }
+        }
+        _ => slice_fail(path, "zip archive entry failed"),
+    }
+}
+
+#[cfg(test)]
 fn read_zip_portion(path: &Path) -> Result<Vec<u8>> {
     let mut file = File::open(path).map_err(|source| io_at(source, path))?;
     let layout = detect_zip_layout(path, &mut file)?;
@@ -79,7 +277,21 @@ fn read_zip_portion(path: &Path) -> Result<Vec<u8>> {
     Ok(zip)
 }
 
+#[cfg(test)]
 fn slice_zip(path: &Path) -> Result<ExactSlice> {
+    slice_zip_using(path, find_cd_bounds)
+}
+
+#[cfg(test)]
+fn slice_zip_v0_2_1(path: &Path) -> Result<ExactSlice> {
+    slice_zip_using(path, find_cd_bounds_v0_2_1)
+}
+
+#[cfg(test)]
+fn slice_zip_using(
+    path: &Path,
+    find_bounds: impl Fn(&Path, &mut File, u64) -> Result<(u64, u64, u64, u64)>,
+) -> Result<ExactSlice> {
     let mut file = File::open(path).map_err(|source| io_at(source, path))?;
     let layout = detect_zip_layout(path, &mut file)?;
     let file_len = file
@@ -92,7 +304,7 @@ fn slice_zip(path: &Path) -> Result<ExactSlice> {
     check_not_spanned(path, &mut file, file_len)?;
 
     let (cd_struct_off, cd_size, _recorded_cd, entry_count) =
-        find_cd_bounds(path, &mut file, file_len)?;
+        find_bounds(path, &mut file, file_len)?;
     let phys_cd = cd_struct_off
         .checked_sub(cd_size)
         .ok_or_else(|| slice_fail(path, "central directory offset underflow"))?;
@@ -158,8 +370,9 @@ fn slice_zip(path: &Path) -> Result<ExactSlice> {
     Ok(ExactSlice { locals, tail })
 }
 
+#[cfg(test)]
 fn check_not_spanned(path: &Path, file: &mut File, file_len: u64) -> Result<()> {
-    let (eocd_off, _cd_size, _cd_off, _entries) = find_eocd(path, file, file_len)?;
+    let (eocd_off, _cd_size, _cd_off, _entries) = crate::scan::find_eocd(path, file, file_len)?;
     file.seek(SeekFrom::Start(eocd_off))
         .map_err(|source| io_at(source, path))?;
     let mut eocd = [0u8; 22];
@@ -173,7 +386,7 @@ fn check_not_spanned(path: &Path, file: &mut File, file_len: u64) -> Result<()> 
     Ok(())
 }
 
-fn parse_central_directory(cd: &[u8], layout: &ZipLayout) -> Option<Vec<CdRecord>> {
+pub(crate) fn parse_central_directory(cd: &[u8], layout: &ZipLayout) -> Option<Vec<CdRecord>> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < cd.len() {
@@ -221,7 +434,7 @@ fn parse_central_directory(cd: &[u8], layout: &ZipLayout) -> Option<Vec<CdRecord
     Some(out)
 }
 
-fn cd_offset_to_zip_rel(recorded: u64, layout: &ZipLayout) -> Option<u64> {
+pub(crate) fn cd_offset_to_zip_rel(recorded: u64, layout: &ZipLayout) -> Option<u64> {
     if layout.view_shift == 0 && layout.prefix_len > 0 {
         recorded.checked_sub(layout.prefix_len)
     } else {
@@ -312,7 +525,7 @@ fn take_u32(data: &[u8]) -> Option<(u32, &[u8])> {
     Some((v, &data[4..]))
 }
 
-fn read_local(
+pub(crate) fn read_local(
     path: &Path,
     file: &mut File,
     layout: &ZipLayout,
@@ -915,7 +1128,7 @@ mod tests {
     use super::*;
     use std::io::{Cursor, Write};
     use zip::write::SimpleFileOptions;
-    use zip::ZipWriter;
+    use zip::{ZipArchive, ZipWriter};
 
     fn write_temp_zip(
         files: &[(&str, &[u8])],
@@ -1029,5 +1242,218 @@ mod tests {
             }
             ZipExact::Raw(_) => panic!("empty zip must slice as tail"),
         }
+        let (home, arch) = homemade_cd_count_and_archive_len(&path).unwrap();
+        assert_eq!(home, Some(0));
+        assert_eq!(arch, 0);
+        let sliced = slice_from_archive(&path).unwrap();
+        assert!(sliced.locals.is_empty());
+        assert!(!sliced.tail.is_empty());
+    }
+
+    fn write_stored_named(path: &Path, files: &[(&str, &[u8])]) {
+        let mut local = Vec::new();
+        let mut central = Vec::new();
+        for (name, data) in files {
+            let name_b = name.as_bytes();
+            let crc = crc32fast::hash(data);
+            let off = local.len() as u32;
+            local.extend_from_slice(b"PK\x03\x04");
+            local.extend_from_slice(&20u16.to_le_bytes());
+            local.extend_from_slice(&0u16.to_le_bytes());
+            local.extend_from_slice(&0u16.to_le_bytes());
+            local.extend_from_slice(&0u16.to_le_bytes());
+            local.extend_from_slice(&0u16.to_le_bytes());
+            local.extend_from_slice(&crc.to_le_bytes());
+            local.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            local.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            local.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
+            local.extend_from_slice(&0u16.to_le_bytes());
+            local.extend_from_slice(name_b);
+            local.extend_from_slice(data);
+            central.extend_from_slice(b"PK\x01\x02");
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&off.to_le_bytes());
+            central.extend_from_slice(name_b);
+        }
+        let cd_off = local.len() as u32;
+        let cd_len = central.len() as u32;
+        let n = files.len() as u16;
+        local.extend_from_slice(&central);
+        local.extend_from_slice(b"PK\x05\x06");
+        local.extend_from_slice(&0u16.to_le_bytes());
+        local.extend_from_slice(&0u16.to_le_bytes());
+        local.extend_from_slice(&n.to_le_bytes());
+        local.extend_from_slice(&n.to_le_bytes());
+        local.extend_from_slice(&cd_len.to_le_bytes());
+        local.extend_from_slice(&cd_off.to_le_bytes());
+        local.extend_from_slice(&0u16.to_le_bytes());
+        std::fs::write(path, local).unwrap();
+    }
+
+    #[test]
+    fn zip64_large_file_homemade_cd_matches_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("z64.jar");
+        let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        z.set_zip64_comment(Some(""));
+        let opts = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .large_file(true);
+        z.start_file("a.txt", opts).unwrap();
+        z.write_all(b"hello").unwrap();
+        z.start_file("b.txt", opts).unwrap();
+        z.write_all(b"world").unwrap();
+        let zip = z.finish().unwrap().into_inner();
+        let mut out = b"#!/bin/bash\n# stub\n".to_vec();
+        out.extend_from_slice(&zip);
+        std::fs::write(&path, &out).unwrap();
+        let (home, arch) = homemade_cd_count_and_archive_len(&path).unwrap();
+        assert_eq!(home, Some(2));
+        assert_eq!(arch, 2);
+        let sliced = slice_from_archive(&path).expect("Zip64 fat must slice from archive");
+        assert_eq!(sliced.locals.len(), 2);
+    }
+
+    #[test]
+    fn homemade_cd_matches_archive_on_plain_zipwriter() {
+        let (_dir, path) = write_temp_zip(&[("a.txt", b"hello"), ("b.txt", b"world")], false);
+        let (home, arch) = homemade_cd_count_and_archive_len(&path).unwrap();
+        assert_eq!(home, Some(2));
+        assert_eq!(arch, 2);
+        let sliced = slice_from_archive(&path).unwrap();
+        assert_eq!(sliced.locals.len(), 2);
+    }
+
+    #[test]
+    fn dup_name_homemade_cd_is_two_archive_is_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dup.jar");
+        write_stored_named(
+            &path,
+            &[
+                ("dup.txt", b"first-payload"),
+                ("dup.txt", b"second-payload"),
+            ],
+        );
+        let (home, arch) = homemade_cd_count_and_archive_len(&path).unwrap();
+        assert_eq!(home, Some(2), "homemade CD must see both records");
+        assert_eq!(arch, 1, "ZipArchive IndexMap last-wins");
+        assert!(
+            slice_from_archive(&path).is_err(),
+            "count mismatch must skip exact, not raw_zip"
+        );
+        match capture_zip_exact(&path).unwrap() {
+            ZipExact::Sliced(s) => assert_eq!(s.locals.len(), 2),
+            ZipExact::Raw(_) => panic!("dup names must homemade-slice; 0.2.1 used Sliced mismatch"),
+        }
+    }
+
+    #[test]
+    fn overlapping_locals_are_raw_on_homemade_slice_not_archive_slice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overlap.jar");
+        write_stored_named(
+            &path,
+            &[("a.txt", b"SAME-payload"), ("b.txt", b"SAME-payload")],
+        );
+        let mut buf = std::fs::read(&path).unwrap();
+        let eocd = find_eocd_in(&buf).unwrap();
+        let cd_off = u32::from_le_bytes(buf[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        let name_len =
+            u16::from_le_bytes(buf[cd_off + 28..cd_off + 30].try_into().unwrap()) as usize;
+        let rec2 = cd_off + 46 + name_len;
+        buf[rec2 + 42..rec2 + 46].copy_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&path, &buf).unwrap();
+
+        match capture_zip_exact(&path).unwrap() {
+            ZipExact::Raw(_) => {}
+            ZipExact::Sliced(_) => panic!("overlapping locals must be Raw on homemade slice_zip"),
+        }
+        assert!(
+            slice_from_archive(&path).is_err(),
+            "overlap must skip exact, not become Raw for dehydrate"
+        );
+        let (home, arch) = homemade_cd_count_and_archive_len(&path).unwrap();
+        assert_eq!(home, Some(2));
+        assert_eq!(arch, 2);
+    }
+
+    #[test]
+    fn zip64_prefix_zipa_is_raw_on_v0_2_1_not_on_archive_slice() {
+        // rust zip large_file + prefix + zip -A: classic EOCD is not sentinels,
+        // 0.2.1 find_cd_bounds used eocd-cd_size (Zip64 footer) → Raw. Listed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fat.jar");
+        let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+        z.set_zip64_comment(Some(""));
+        let opts = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .large_file(true);
+        z.start_file("BOOT-INF/lib/a.jar", opts).unwrap();
+        z.write_all(&[0xA5; 4096]).unwrap();
+        z.start_file("BOOT-INF/lib/b.jar", opts).unwrap();
+        z.write_all(&[0x5A; 4096]).unwrap();
+        let zip = z.finish().unwrap().into_inner();
+        let launcher = b"#!/bin/bash\n# :: Spring Boot ::\n# launcher\n";
+        let mut wrapped = launcher.to_vec();
+        wrapped.extend_from_slice(&zip);
+        // zip -A: bump classic CD local offsets + EOCD CD offset.
+        let eocd = find_eocd_in(&wrapped).unwrap();
+        let cd_size = u32::from_le_bytes(wrapped[eocd + 12..eocd + 16].try_into().unwrap());
+        let cd_off = u32::from_le_bytes(wrapped[eocd + 16..eocd + 20].try_into().unwrap());
+        let delta = launcher.len() as u32;
+        let phys_cd = cd_off as usize + delta as usize;
+        let mut i = phys_cd;
+        let cd_end = phys_cd + cd_size as usize;
+        while i + 46 <= cd_end {
+            let nl = u16::from_le_bytes(wrapped[i + 28..i + 30].try_into().unwrap()) as usize;
+            let el = u16::from_le_bytes(wrapped[i + 30..i + 32].try_into().unwrap()) as usize;
+            let cl = u16::from_le_bytes(wrapped[i + 32..i + 34].try_into().unwrap()) as usize;
+            let old = u32::from_le_bytes(wrapped[i + 42..i + 46].try_into().unwrap());
+            wrapped[i + 42..i + 46].copy_from_slice(&(old + delta).to_le_bytes());
+            i += 46 + nl + el + cl;
+        }
+        wrapped[eocd + 16..eocd + 20].copy_from_slice(&(cd_off + delta).to_le_bytes());
+        std::fs::write(&path, &wrapped).unwrap();
+
+        let listed = ZipArchive::new(std::fs::File::open(&path).unwrap())
+            .unwrap()
+            .len();
+        assert!(listed >= 2, "fixture must be listable, got {listed}");
+        match capture_zip_exact_v0_2_1(&path).unwrap() {
+            ZipExact::Raw(zip) => {
+                assert!(
+                    zip.len() > 8000,
+                    "0.2.1 Raw must be the zip portion, got {}",
+                    zip.len()
+                );
+            }
+            ZipExact::Sliced(s) => panic!(
+                "0.2.1 must Raw this Zip64+prefix+zip-A jar, sliced {} locals",
+                s.locals.len()
+            ),
+        }
+        let sliced = slice_from_archive(&path).expect("0.2.2 archive slice must succeed");
+        assert_eq!(sliced.locals.len(), listed);
+        assert!(
+            capture_zip_exact(&path)
+                .ok()
+                .is_some_and(|z| matches!(z, ZipExact::Sliced(_))),
+            "current homemade walker (fixed bounds) must slice"
+        );
     }
 }

@@ -542,10 +542,19 @@ fn corpus_mix_regular_and_spring_whole_file_hashes() {
             hex_lower(&dest_sha)
         );
         let hashes_eq = src_b3 == dest_b3 && src_sha == dest_sha;
+        assert!(
+            jar.raw_zip_blob.is_none(),
+            "{} must not store raw_zip on a listed mix member",
+            jar.name
+        );
         if jar.name == "spring-zip64-nested.jar" {
             assert!(
                 jar.bit_identical_restore(),
                 "zip-crate Zip64 fat must be bit-identical, not rebuild"
+            );
+            assert!(
+                jar.raw_zip_blob.is_none(),
+                "Zip64 fat bit-identical must be splice, not raw_zip"
             );
             assert!(hashes_eq, "Zip64 nested-lib fat whole-file hash must match");
         }

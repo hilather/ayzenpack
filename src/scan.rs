@@ -657,6 +657,33 @@ pub(crate) fn find_cd_bounds(
     file_len: u64,
 ) -> Result<(u64, u64, u64, u64)> {
     let (eocd_off, cd_size32, cd_off32, entries16) = find_eocd(path, file, file_len)?;
+    // Prefer Zip64 EOCD when the locator is present, even if classic EOCD
+    // fields are not sentinels (rust zip `large_file` writes a Zip64 footer
+    // while leaving a 32-bit CD offset / entry count). Classic
+    // `eocd - cd_size` then lands in the Zip64 footer instead of the CD.
+    match find_zip64_cd_bounds(path, file, eocd_off) {
+        Ok(bounds) => Ok(bounds),
+        Err(AyzenpackError::NotZip { .. }) => Ok((
+            eocd_off,
+            u64::from(cd_size32),
+            u64::from(cd_off32),
+            u64::from(entries16),
+        )),
+        Err(err) => Err(err),
+    }
+}
+
+/// 0.2.1 `find_cd_bounds`: Zip64 only when classic EOCD fields are sentinels.
+/// rust zip `large_file` writes a Zip64 footer while leaving a 32-bit CD offset
+/// / entry count, so `eocd - cd_size` lands in that footer. That is the listed-jar
+/// `ZipExact::Raw` path this crate must not take anymore.
+#[cfg(test)]
+pub(crate) fn find_cd_bounds_v0_2_1(
+    path: &Path,
+    file: &mut (impl Read + Seek),
+    file_len: u64,
+) -> Result<(u64, u64, u64, u64)> {
+    let (eocd_off, cd_size32, cd_off32, entries16) = find_eocd(path, file, file_len)?;
     let zip64 = cd_size32 == u32::MAX || cd_off32 == u32::MAX || entries16 == u16::MAX;
     if !zip64 {
         return Ok((
@@ -1035,7 +1062,8 @@ mod tests {
 
     #[test]
     fn first_pk_official_script_plus_zip64() {
-        // Zip64 EOCD sits between CD and classic EOCD, so extra != first PK.
+        // Zip64 EOCD sits between CD and classic EOCD. find_cd_bounds must
+        // prefer the locator so extra == first PK (not the inflated 0.1.4 math).
         let launcher = spring_boot_launch_script();
         let zip = make_zip64(&[("BOOT-INF/lib/dep.jar", b"nested-zip64-opaque")]);
         let mut wrapped = launcher.to_vec();
@@ -1044,10 +1072,10 @@ mod tests {
 
         let mut extra_cur = Cursor::new(wrapped.clone());
         let extra = eocd_extra(&mut extra_cur).expect("classic EOCD still present");
-        assert!(
-            extra > launcher.len() as u64,
-            "Zip64 footer inflates 0.1.4 extra past first PK: extra={extra} first={}",
-            launcher.len()
+        assert_eq!(
+            extra,
+            launcher.len() as u64,
+            "Zip64 locator must yield CD start, not inflate extra through the footer"
         );
 
         let mut cur = Cursor::new(wrapped);
@@ -1114,7 +1142,7 @@ mod tests {
         wrapped.extend_from_slice(&zip);
         let mut extra_cur = Cursor::new(wrapped.clone());
         let extra = eocd_extra(&mut extra_cur).expect("classic EOCD still present");
-        assert!(extra > DECOY_LAUNCHER.len() as u64);
+        assert_eq!(extra, DECOY_LAUNCHER.len() as u64);
         let mut cur = Cursor::new(wrapped);
         let layout = detect_zip_layout(Path::new("falsepk64.jar"), &mut cur).unwrap();
         assert_eq!(layout.prefix_len, DECOY_LAUNCHER.len() as u64);

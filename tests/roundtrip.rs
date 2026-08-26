@@ -15,13 +15,14 @@ use ayzenpack::manifest::Manifest;
 use ayzenpack::{dehydrate, rehydrate, verify, DehydrateOptions, RehydrateOptions};
 use fixtures::{
     spring_boot_launch_script, write_data_descriptor_zip, write_deflate_miss_plus_dir_cdata,
-    write_deflate_miss_plus_empty_deflate_dir, write_jar, write_jar_entries,
-    write_jar_with_comment, write_non_utf8_name_zip, write_padded_locals_zip,
-    write_signed_looking_jar, write_store_file_plus_dir_cdata,
-    write_store_file_plus_empty_deflate_dir, write_store_file_plus_leftover_csize_dir,
-    write_stored_block_deflate_wrapped, write_stored_block_deflate_zip, write_stored_jar_dos_zero,
-    write_stored_zip, write_wrapped_jar, write_wrapped_jar_adjusted, write_wrapped_zip64_jar,
-    zip64_jar_bytes, JarEntry, SPRING_LAUNCHER,
+    write_deflate_miss_plus_empty_deflate_dir, write_fat_spring_zip64_zipa_jar, write_jar,
+    write_jar_entries, write_jar_with_comment, write_non_utf8_name_zip,
+    write_overlapping_local_zip, write_padded_locals_zip, write_signed_looking_jar,
+    write_store_file_plus_dir_cdata, write_store_file_plus_empty_deflate_dir,
+    write_store_file_plus_leftover_csize_dir, write_stored_block_deflate_wrapped,
+    write_stored_block_deflate_zip, write_stored_jar_dos_zero, write_stored_zip, write_wrapped_jar,
+    write_wrapped_jar_adjusted, write_wrapped_zip64_jar, zip64_jar_bytes, JarEntry,
+    SPRING_LAUNCHER,
 };
 use zip::{CompressionMethod, DateTime, ZipArchive};
 
@@ -854,7 +855,8 @@ fn duplicate_entry_names_in_one_jar_all_restored() {
     );
 
     let out = dir.path().join("out.ayz");
-    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let zip_len = fs::metadata(&jar).unwrap().len();
+    let summary = dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
     let restored = dest.join("dup.jar");
@@ -881,6 +883,191 @@ fn duplicate_entry_names_in_one_jar_all_restored() {
         dest_entries, src,
         "all scanner-visible duplicate-name entries must be restored in CD order"
     );
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert!(
+        m.jars[0].raw_zip_blob.is_none(),
+        "dup.txt last-wins must not store raw_zip"
+    );
+    assert!(
+        m.jars[0].tail_blob.is_none(),
+        "dup.txt homemade CD count != entries; do not store a disagreeing tail"
+    );
+    for e in &m.jars[0].entries {
+        assert!(e.cdata_blob.is_none());
+    }
+    assert!(
+        summary.bytes_unique_blobs < zip_len,
+        "unique blobs {} must not include a second copy of the {} zip",
+        summary.bytes_unique_blobs,
+        zip_len
+    );
+}
+
+/// 0.2.1 `find_cd_bounds` used classic `eocd - cd_size` unless EOCD fields were
+/// sentinels. rust zip `large_file` writes a Zip64 footer with real 32-bit
+/// counts, so that lands in the footer (not `PK\x01\x02`) → homemade slice Err
+/// → `ZipExact::Raw` of the whole zip portion.
+fn v021_classic_bounds_miss_cd(jar: &[u8]) -> bool {
+    if jar.len() < 22 {
+        return false;
+    }
+    let mut i = jar.len() - 22;
+    let eocd = loop {
+        if jar[i..i + 4] == *b"PK\x05\x06" {
+            let comment_len = u16::from_le_bytes([jar[i + 20], jar[i + 21]]) as usize;
+            if i + 22 + comment_len == jar.len() {
+                break i;
+            }
+        }
+        if i == 0 {
+            return false;
+        }
+        i -= 1;
+    };
+    let cd_size32 = u32::from_le_bytes(jar[eocd + 12..eocd + 16].try_into().unwrap());
+    let cd_off32 = u32::from_le_bytes(jar[eocd + 16..eocd + 20].try_into().unwrap());
+    let entries16 = u16::from_le_bytes(jar[eocd + 10..eocd + 12].try_into().unwrap());
+    let sentinels = cd_size32 == u32::MAX || cd_off32 == u32::MAX || entries16 == u16::MAX;
+    if sentinels {
+        return false;
+    }
+    let has_zip64_locator = eocd >= 20 && jar[eocd - 20..eocd - 16] == *b"PK\x06\x07";
+    if !has_zip64_locator {
+        return false;
+    }
+    let Some(phys) = eocd.checked_sub(cd_size32 as usize) else {
+        return true;
+    };
+    phys + 4 > jar.len() || jar[phys..phys + 4] != *b"PK\x01\x02"
+}
+
+#[test]
+fn fat_spring_zip64_zipa_is_listed_raw_on_v021_no_dual_copy_now() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("app.jar");
+    write_fat_spring_zip64_zipa_jar(&jar);
+    let src = fs::read(&jar).unwrap();
+    let zip_len = src.len() as u64;
+    let prefix = spring_boot_launch_script().len() as u64;
+    assert!(src.starts_with(spring_boot_launch_script()));
+    assert!(
+        src.windows(4).any(|w| w == b"PK\x06\x06"),
+        "fat fixture must be Zip64"
+    );
+
+    let listed = {
+        let mut za = ZipArchive::new(File::open(&jar).unwrap()).expect("fixture must be listable");
+        let n = za.len();
+        let names: Vec<String> = (0..n)
+            .map(|i| za.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "App.class"),
+            "outer listing must include App.class, got {names:?}"
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.starts_with("BOOT-INF/lib/"))
+                .count(),
+            4,
+            "outer listing must include 4 nested libs, got {names:?}"
+        );
+        n
+    };
+    assert!(
+        listed >= 6,
+        "App + properties + 4 BOOT-INF/lib jars, got {listed}"
+    );
+    assert!(
+        v021_classic_bounds_miss_cd(&src),
+        "0.2.1 find_cd_bounds must miss the CD on this listable Zip64+prefix+zip-A jar"
+    );
+
+    let out = dir.path().join("out.ayz");
+    let summary = dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert_eq!(m.jars[0].entries.len(), listed);
+    assert!(
+        m.jars[0].raw_zip_blob.is_none(),
+        "listed fat Spring jar must not store raw_zip"
+    );
+    assert!(
+        m.jars[0].tail_blob.is_some(),
+        "Zip64+zip-A fat must slice (tail), not skip-exact"
+    );
+    for e in &m.jars[0].entries {
+        assert!(
+            e.cdata_blob.is_none(),
+            "{} must not grow a cdata_blob dual copy",
+            e.name
+        );
+    }
+    let zip_portion = zip_len - prefix;
+    let biggest = m.blobs.iter().map(|b| b.size).max().unwrap_or(0);
+    assert!(
+        biggest < zip_portion,
+        "no blob ({biggest}) may be the whole zip portion ({zip_portion})"
+    );
+    // 0.2.1 Raw unique ≈ prefix + zip_portion + CAS (no fill_exact headers).
+    let cas: u64 = m.jars[0].entries.iter().map(|e| e.uncompressed_size).sum();
+    let v021_unique = zip_len + cas;
+    assert!(
+        summary.bytes_unique_blobs < v021_unique,
+        "unique {} must be below 0.2.1 CAS+whole-zip ~{}",
+        summary.bytes_unique_blobs,
+        v021_unique
+    );
+    assert!(
+        v021_unique - summary.bytes_unique_blobs >= zip_portion * 8 / 10,
+        "must drop most of the {} raw_zip; unique {} vs 0.2.1 ~{}",
+        zip_portion,
+        summary.bytes_unique_blobs,
+        v021_unique
+    );
+    assert!(
+        summary.bytes_unique_blobs < zip_len + cas / 2,
+        "unique {} must stay below CAS+whole-zip (zip {} cas {})",
+        summary.bytes_unique_blobs,
+        zip_len,
+        cas
+    );
+
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("app.jar");
+    assert_functional_identity(&jar, &restored);
+    if m.jars[0].bit_identical_restore() {
+        assert_bit_identical(&jar, &restored);
+    }
+}
+
+#[test]
+fn overlapping_locals_listed_jar_has_no_raw_zip() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("overlap.jar");
+    write_overlapping_local_zip(&jar);
+    let zip_len = fs::metadata(&jar).unwrap().len();
+    let out = dir.path().join("out.ayz");
+    let summary = dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert!(
+        m.jars[0].raw_zip_blob.is_none(),
+        "listed overlap jar must not store raw_zip"
+    );
+    assert!(
+        m.jars[0].tail_blob.is_none(),
+        "overlap must skip exact (no broken tail)"
+    );
+    assert!(
+        summary.bytes_unique_blobs < zip_len,
+        "unique blobs {} must not include the {} zip portion",
+        summary.bytes_unique_blobs,
+        zip_len
+    );
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert!(dest.join("overlap.jar").is_file());
 }
 
 #[test]
@@ -1077,6 +1264,8 @@ fn roundtrip_bash_prefixed_executable_jar() {
 
     let m = manifest_from_records(&read_archive(&out).2);
     assert!(m.jars[0].prefix_blob.is_some());
+    assert!(m.jars[0].tail_blob.is_some());
+    assert!(m.jars[0].raw_zip_blob.is_none());
     assert_eq!(m.jars[0].prefix_size, Some(SPRING_LAUNCHER.len() as u64));
     let prefix_hex = m.jars[0].prefix_blob.as_deref().unwrap();
     let prefix_blob = m
@@ -1127,6 +1316,9 @@ fn roundtrip_zip_a_adjusted_executable_jar() {
     let summary = dehydrate(&opts(&out, vec![jar.clone()]))
         .expect("zip -A adjusted executable JAR must not be NotZip");
     assert!(summary.unique_blob_count >= 3, "prefix + two file entries");
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert!(m.jars[0].tail_blob.is_some());
+    assert!(m.jars[0].raw_zip_blob.is_none());
 
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
@@ -1184,6 +1376,9 @@ fn roundtrip_official_script_plus_zip64_nested_lib() {
     let out = dir.path().join("out.ayz");
     dehydrate(&opts(&out, vec![jar.clone()]))
         .expect("official launch.script + Zip64 fat JAR must not be NotZip");
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert!(m.jars[0].tail_blob.is_some());
+    assert!(m.jars[0].raw_zip_blob.is_none());
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
     let restored = dest.join("app.jar");
@@ -1406,7 +1601,8 @@ fn normal_jar_has_no_prefix_fields_and_roundtrips() {
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
     assert_bit_identical(&jar, &dest.join("plain.jar"));
     assert_functional_identity(&jar, &dest.join("plain.jar"));
-    assert!(m.jars[0].tail_blob.is_some() || m.jars[0].raw_zip_blob.is_some());
+    assert!(m.jars[0].tail_blob.is_some());
+    assert!(m.jars[0].raw_zip_blob.is_none());
 }
 
 fn strip_exact_fields(records: Vec<Record>) -> Vec<Record> {
@@ -1501,8 +1697,13 @@ fn roundtrip_data_descriptor_is_bit_identical() {
     dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
     let m = manifest_from_records(&read_archive(&out).2);
     assert!(
-        m.jars[0].entries[0].data_descriptor_hex.is_some() || m.jars[0].raw_zip_blob.is_some(),
+        m.jars[0].entries[0].data_descriptor_hex.is_some(),
         "GPBF bit 3 must be captured"
+    );
+    assert!(m.jars[0].tail_blob.is_some());
+    assert!(
+        m.jars[0].raw_zip_blob.is_none(),
+        "descriptor jar must not fall back to raw_zip"
     );
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
@@ -1566,9 +1767,11 @@ fn roundtrip_zipalign_padding_is_bit_identical() {
     dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
     let m = manifest_from_records(&read_archive(&out).2);
     let pad = m.jars[0].entries[0].pad_zeros;
+    assert!(pad == Some(5), "expected pad_zeros=5, got {pad:?}");
+    assert!(m.jars[0].tail_blob.is_some());
     assert!(
-        pad == Some(5) || m.jars[0].raw_zip_blob.is_some(),
-        "expected pad_zeros=5 or raw_zip fallback, got {pad:?}"
+        m.jars[0].raw_zip_blob.is_none(),
+        "zipalign jar must not fall back to raw_zip"
     );
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();

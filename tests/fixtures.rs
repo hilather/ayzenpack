@@ -95,6 +95,59 @@ fn wrapped_zip64_bytes(launcher: &[u8], files: &[(&str, &[u8])]) -> Vec<u8> {
     out
 }
 
+/// Official launch.script + Zip64 outer + `zip -A` + several fat `BOOT-INF/lib`
+/// members (STORE). Listable on 0.2.1; homemade `find_cd_bounds` there missed
+/// the Zip64 locator (classic EOCD fields are not sentinels) → `ZipExact::Raw`.
+pub fn write_fat_spring_zip64_zipa_jar(path: &Path) {
+    use std::io::Cursor;
+    let launcher = spring_boot_launch_script();
+    let nested: Vec<Vec<u8>> = (0..4)
+        .map(|i| inner_incompressible_jar(i, 128 * 1024))
+        .collect();
+    let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+    z.set_zip64_comment(Some(""));
+    // DEFLATE nested libs so zip -A + ZipView(prefix) cannot latch onto an
+    // inner jar's CD (STORE nested PK\x01\x02 at a wrong seek). Payloads stay
+    // large because the inner jars are incompressible.
+    let opts = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .large_file(true);
+    z.start_file("App.class", opts).unwrap();
+    z.write_all(b"class-bytes-outer").unwrap();
+    z.start_file("BOOT-INF/classes/application.properties", opts)
+        .unwrap();
+    z.write_all(b"x=1\n").unwrap();
+    for (i, lib) in nested.iter().enumerate() {
+        let name = format!("BOOT-INF/lib/lib{i}.jar");
+        z.start_file(&name, opts).unwrap();
+        z.write_all(lib).unwrap();
+    }
+    let zip = z.finish().unwrap().into_inner();
+    assert!(
+        zip.windows(4).any(|w| w == b"PK\x06\x06"),
+        "outer must be Zip64"
+    );
+    std::fs::write(path, prepend_launcher(&zip, launcher, true)).unwrap();
+}
+
+fn inner_incompressible_jar(i: usize, nbytes: usize) -> Vec<u8> {
+    use std::io::Cursor;
+    let mut payload = vec![0u8; nbytes];
+    let mut x: u32 = 0xA5A5_0000 ^ (i as u32).wrapping_mul(0x9E37);
+    for b in &mut payload {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *b = (x >> 16) as u8;
+    }
+    let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    z.start_file("META-INF/MANIFEST.MF", opts).unwrap();
+    z.write_all(b"Manifest-Version: 1.0\n").unwrap();
+    let class = format!("com/Lib{i}.class");
+    z.start_file(&class, opts).unwrap();
+    z.write_all(&payload).unwrap();
+    z.finish().unwrap().into_inner()
+}
+
 /// Prepend `launcher` to an existing ZIP/JAR. `zip_a` applies Info-ZIP `zip -A`
 /// (classic u32 CD/EOCD only — do not use on Zip64).
 pub fn prepend_launcher(zip: &[u8], launcher: &[u8], zip_a: bool) -> Vec<u8> {
@@ -245,6 +298,53 @@ pub fn write_stored_zip(path: &Path, files: &[(&str, &[u8], u32)]) {
     local.extend_from_slice(&cd_off.to_le_bytes());
     local.extend_from_slice(&0u16.to_le_bytes());
     std::fs::write(path, local).unwrap();
+}
+
+/// Two distinct-name CD records that share local offset 0.
+/// ZipArchive still lists both; homemade `slice_zip` fails (overlap) → 0.2.1 `Raw`.
+pub fn write_overlapping_local_zip(path: &Path) {
+    // Same CRC so ZipArchive::by_index lists both; distinct names so last-wins
+    // does not collapse. Homemade slice still fails (overlapping offsets).
+    let payload = b"SAME-payload";
+    write_stored_zip(
+        path,
+        &[
+            ("a.txt", payload, crc32fast::hash(payload)),
+            ("b.txt", payload, crc32fast::hash(payload)),
+        ],
+    );
+    let mut buf = std::fs::read(path).unwrap();
+    let eocd = {
+        let mut i = buf.len() - 22;
+        loop {
+            if buf[i..i + 4] == *b"PK\x05\x06" {
+                let comment_len = u16::from_le_bytes([buf[i + 20], buf[i + 21]]) as usize;
+                if i + 22 + comment_len == buf.len() {
+                    break i;
+                }
+            }
+            assert!(i > 0);
+            i -= 1;
+        }
+    };
+    let cd_size = u32::from_le_bytes(buf[eocd + 12..eocd + 16].try_into().unwrap()) as usize;
+    let cd_off = u32::from_le_bytes(buf[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+    let mut i = cd_off;
+    let cd_end = cd_off + cd_size;
+    let mut seen = 0u32;
+    while i + 46 <= cd_end {
+        assert_eq!(&buf[i..i + 4], b"PK\x01\x02");
+        let name_len = u16::from_le_bytes(buf[i + 28..i + 30].try_into().unwrap()) as usize;
+        let extra_len = u16::from_le_bytes(buf[i + 30..i + 32].try_into().unwrap()) as usize;
+        let comment_len = u16::from_le_bytes(buf[i + 32..i + 34].try_into().unwrap()) as usize;
+        if seen == 1 {
+            buf[i + 42..i + 46].copy_from_slice(&0u32.to_le_bytes());
+        }
+        seen += 1;
+        i += 46 + name_len + extra_len + comment_len;
+    }
+    assert_eq!(seen, 2);
+    std::fs::write(path, buf).unwrap();
 }
 
 /// Stored ZIP with GPBF bit 3 and a signed data descriptor after the payload.

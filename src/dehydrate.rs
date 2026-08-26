@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 use crate::error::{AyzenpackError, Result};
-use crate::exact::{capture_zip_exact, ExactLocal, ZipExact};
+use crate::exact::{slice_from_archive, ExactLocal};
 use crate::format::{verify_finished_ayz, AyzWriter, FileHeader};
 use crate::hashutil::{hash_both, hex_lower};
 use crate::manifest::{Blob, Entry, Jar, Manifest, Stats, MANIFEST_FORMAT};
@@ -818,8 +818,13 @@ fn entry_from_scan(meta: &ScannedEntry, blob: Option<String>, sha256: Option<Str
 }
 
 fn attach_exact(sink: &mut BlobSink<'_>, path: &Path, jar: &mut Jar) -> Result<()> {
-    match capture_zip_exact(path)? {
-        ZipExact::Sliced(slice) if slice.locals.len() == jar.entries.len() => {
+    // Listed jars never store raw_zip. Encrypted still errors. Any other slice
+    // failure (count mismatch, overlap, homemade parse None) is skip-exact.
+    match slice_from_archive(path) {
+        Ok(slice) => {
+            if slice.locals.len() != jar.entries.len() {
+                return Ok(());
+            }
             let classes: Vec<LocalClass> = jar
                 .entries
                 .iter()
@@ -839,55 +844,13 @@ fn attach_exact(sink: &mut BlobSink<'_>, path: &Path, jar: &mut Jar) -> Result<(
             remember_blob(sink, &slice.tail, b3, s256)?;
             jar.tail_blob = Some(hex_lower(&b3));
             jar.tail_size = Some(slice.tail.len() as u64);
+            Ok(())
         }
-        ZipExact::Raw(zip) => {
-            let (b3, s256) = hash_both(&zip);
-            remember_blob(sink, &zip, b3, s256)?;
-            jar.raw_zip_blob = Some(hex_lower(&b3));
-            jar.raw_zip_size = Some(zip.len() as u64);
-        }
-        ZipExact::Sliced(_) => {
-            let zip = read_zip_after_prefix(path, jar.prefix_size.unwrap_or(0))?;
-            let (b3, s256) = hash_both(&zip);
-            remember_blob(sink, &zip, b3, s256)?;
-            jar.raw_zip_blob = Some(hex_lower(&b3));
-            jar.raw_zip_size = Some(zip.len() as u64);
-        }
+        Err(AyzenpackError::Encrypted { .. }) => Err(AyzenpackError::Encrypted {
+            path: path.to_path_buf(),
+        }),
+        Err(_) => Ok(()),
     }
-    Ok(())
-}
-
-fn read_zip_after_prefix(path: &Path, prefix_len: u64) -> Result<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = File::open(path).map_err(|source| AyzenpackError::Io {
-        source,
-        path: Some(path.to_path_buf()),
-    })?;
-    let file_len = file
-        .metadata()
-        .map_err(|source| AyzenpackError::Io {
-            source,
-            path: Some(path.to_path_buf()),
-        })?
-        .len();
-    if file_len < prefix_len {
-        return Err(AyzenpackError::FormatOwned(format!(
-            "prefix longer than file {}",
-            path.display()
-        )));
-    }
-    file.seek(SeekFrom::Start(prefix_len))
-        .map_err(|source| AyzenpackError::Io {
-            source,
-            path: Some(path.to_path_buf()),
-        })?;
-    let mut zip = Vec::new();
-    file.read_to_end(&mut zip)
-        .map_err(|source| AyzenpackError::Io {
-            source,
-            path: Some(path.to_path_buf()),
-        })?;
-    Ok(zip)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
