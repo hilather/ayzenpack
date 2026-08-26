@@ -86,6 +86,7 @@ ayzenpack = { git = "https://github.com/hilather/ayzenpack" }
 | `quiet` / `verbose` / `json_logs` | `false` | stderr behaviour |
 | `jobs` | `1` | `0` = `available_parallelism` |
 | `max_inflight_bytes` | 64 MiB | uncompressed buffers in the hash pipeline |
+| `restore_paths` | `false` | record `restore_path` / mode / uid / gid on each jar |
 
 `DehydrateSummary` mirrors manifest `stats`, plus `output_len` and `signed_jars`.
 
@@ -96,14 +97,15 @@ ayzenpack = { git = "https://github.com/hilather/ayzenpack" }
 | Field | Default | Notes |
 |-------|---------|--------|
 | `input` | empty (required) | `.ayz` |
-| `dir` | empty (required) | created if missing |
+| `dir` | empty (required unless `restore_paths`) | created if missing; unused when `restore_paths` |
 | `cas_dir` | `None` | tempfile, deleted on success |
 | `keep_cas` | `false` | keep that tempfile |
 | `store_all` | `false` | ZIP STORE instead of DEFLATE |
 | `deflate_level` | `6` | 0..=9 |
 | `clean` | `false` | unlink dest names we will write (not the whole dir) |
-| `overwrite` | `false` | refuse to clobber existing JARs |
+| `overwrite` | `false` | refuse to clobber existing JARs (ignored when `restore_paths`) |
 | `only` | `[]` | jar `name`s from the manifest |
+| `restore_paths` | `false` | write to recorded `restore_path`; `--dir` unused |
 
 ---
 

@@ -47,6 +47,30 @@ fn help_lists_pretty_manifest() {
 }
 
 #[test]
+fn help_lists_restore_paths_on_dehydrate_and_rehydrate() {
+    ayzenpack()
+        .args(["dehydrate", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--restore-paths"));
+    ayzenpack()
+        .args(["rehydrate", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--restore-paths"))
+        .stdout(predicate::str::contains("--dir"));
+}
+
+#[test]
+fn rehydrate_requires_dir_without_restore_paths() {
+    ayzenpack()
+        .args(["rehydrate", "-i", "x.ayz"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
 fn help_lists_jobs_and_max_inflight_bytes() {
     // Guards clap sketch dropping PR-18 pipeline flags.
     ayzenpack()

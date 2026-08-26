@@ -67,14 +67,18 @@ enum Cmd {
         /// Cap on uncompressed entry buffers in the hash pipeline (default 64 MiB)
         #[arg(long, default_value_t = 64 * 1024 * 1024)]
         max_inflight_bytes: u64,
+        /// Record absolute path + mode (+ uid/gid on Unix) for later --restore-paths
+        #[arg(long)]
+        restore_paths: bool,
     },
     /// Restore JARs from a .ayz archive
     #[command(visible_alias = "unpack")]
     Rehydrate {
         #[arg(short, long)]
         input: PathBuf,
-        #[arg(short, long)]
-        dir: PathBuf,
+        /// Destination directory (not required with --restore-paths)
+        #[arg(short, long, required_unless_present = "restore_paths")]
+        dir: Option<PathBuf>,
         #[arg(long)]
         cas_dir: Option<PathBuf>,
         #[arg(long)]
@@ -89,6 +93,9 @@ enum Cmd {
         overwrite: bool,
         #[arg(long)]
         only: Vec<String>,
+        /// Write each JAR to its recorded restore_path (overwrites; --dir unused)
+        #[arg(long)]
+        restore_paths: bool,
     },
     /// Show archive contents
     List {
@@ -202,6 +209,7 @@ pub fn run() -> std::result::Result<(), CliError> {
             exclude,
             jobs,
             max_inflight_bytes,
+            restore_paths,
         } => {
             let opts = DehydrateOptions {
                 output,
@@ -222,6 +230,7 @@ pub fn run() -> std::result::Result<(), CliError> {
                 json_logs,
                 jobs,
                 max_inflight_bytes,
+                restore_paths,
             };
             let summary = dehydrate(&opts)?;
             print_dehydrate_stats(&opts, &summary);
@@ -237,10 +246,11 @@ pub fn run() -> std::result::Result<(), CliError> {
             clean,
             overwrite,
             only,
+            restore_paths,
         } => {
             let opts = RehydrateOptions {
                 input,
-                dir,
+                dir: dir.unwrap_or_default(),
                 cas_dir,
                 keep_cas,
                 store_all,
@@ -251,6 +261,7 @@ pub fn run() -> std::result::Result<(), CliError> {
                 quiet,
                 verbose,
                 json_logs,
+                restore_paths,
             };
             rehydrate(&opts)?;
             Ok(())

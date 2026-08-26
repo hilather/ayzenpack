@@ -34,6 +34,8 @@ pub struct RehydrateOptions {
     pub quiet: bool,
     pub verbose: bool,
     pub json_logs: bool,
+    /// Write each jar to its recorded `restore_path` (mode/owner when present).
+    pub restore_paths: bool,
 }
 
 impl Default for RehydrateOptions {
@@ -51,6 +53,7 @@ impl Default for RehydrateOptions {
             quiet: false,
             verbose: false,
             json_logs: false,
+            restore_paths: false,
         }
     }
 }
@@ -63,10 +66,12 @@ pub fn rehydrate(opts: &RehydrateOptions) -> Result<()> {
         )));
     }
 
-    fs::create_dir_all(&opts.dir).map_err(|source| AyzenpackError::Io {
-        source,
-        path: Some(opts.dir.clone()),
-    })?;
+    if !opts.restore_paths {
+        fs::create_dir_all(&opts.dir).map_err(|source| AyzenpackError::Io {
+            source,
+            path: Some(opts.dir.clone()),
+        })?;
+    }
 
     let mut tmp_guard = None;
     let cas_path = match &opts.cas_dir {
@@ -191,13 +196,33 @@ fn restore_jars(opts: &RehydrateOptions, manifest: &Manifest, cas_dir: &Path) ->
         }
     }
 
-    for jar in &manifest.jars {
-        if !opts.only.is_empty() && !opts.only.iter().any(|n| n == &jar.name) {
-            continue;
+    let selected: Vec<&Jar> = manifest
+        .jars
+        .iter()
+        .filter(|jar| opts.only.is_empty() || opts.only.iter().any(|n| n == &jar.name))
+        .collect();
+
+    if opts.restore_paths {
+        for jar in &selected {
+            if !matches!(jar.restore_path.as_deref(), Some(p) if !p.is_empty()) {
+                return Err(AyzenpackError::Usage(format!(
+                    "pack was not created with --restore-paths ({})",
+                    jar.name
+                )));
+            }
         }
-        check_jar_name(&jar.name)?;
-        let dest = opts.dir.join(&jar.name);
-        if dest.exists() {
+    }
+
+    for jar in selected {
+        let dest = if opts.restore_paths {
+            restore_dest(jar)?
+        } else {
+            check_jar_name(&jar.name)?;
+            opts.dir.join(&jar.name)
+        };
+        if opts.restore_paths {
+            prepare_restore_dest(&dest)?;
+        } else if dest.exists() {
             if opts.clean {
                 fs::remove_file(&dest).map_err(|source| AyzenpackError::Io {
                     source,
@@ -213,16 +238,193 @@ fn restore_jars(opts: &RehydrateOptions, manifest: &Manifest, cas_dir: &Path) ->
         if opts.verbose {
             eprintln!("ayzenpack: restoring {}", jar.name);
         }
+        let apply_prefix_chmod = !(opts.restore_paths && jar.restore_mode.is_some());
         if jar.exact_restore() {
-            write_exact_jar(jar, cas_dir, &dest)?;
+            write_exact_jar(jar, cas_dir, &dest, apply_prefix_chmod)?;
         } else {
-            write_jar(opts, jar, cas_dir, &dest)?;
+            write_jar(opts, jar, cas_dir, &dest, apply_prefix_chmod)?;
+        }
+        if opts.restore_paths {
+            apply_restore_attrs(opts, jar, &dest)?;
         }
     }
     Ok(())
 }
 
-fn write_exact_jar(jar: &Jar, cas_dir: &Path, dest: &Path) -> Result<()> {
+fn restore_dest(jar: &Jar) -> Result<PathBuf> {
+    let raw = jar.restore_path.as_deref().unwrap_or("");
+    if raw.is_empty() || raw.contains('\0') {
+        return Err(AyzenpackError::UnsafePath(raw.to_string()));
+    }
+    let dest = PathBuf::from(raw);
+    if !dest.is_absolute() {
+        return Err(AyzenpackError::Usage(format!(
+            "restore_path for {} is not absolute (canonicalize failed at dehydrate): {raw}",
+            jar.name
+        )));
+    }
+    Ok(dest)
+}
+
+/// Unlink dest if it is a file or symlink; create missing parents as 0755.
+fn prepare_restore_dest(dest: &Path) -> Result<()> {
+    match fs::symlink_metadata(dest) {
+        Ok(meta) => {
+            if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+                return Err(AyzenpackError::Usage(format!(
+                    "refusing to overwrite directory {}",
+                    dest.display()
+                )));
+            }
+            fs::remove_file(dest).map_err(|source| AyzenpackError::Io {
+                source,
+                path: Some(dest.to_path_buf()),
+            })?;
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(AyzenpackError::Io {
+                source,
+                path: Some(dest.to_path_buf()),
+            });
+        }
+    }
+    create_parent_dirs_0755(dest)
+}
+
+fn create_parent_dirs_0755(dest: &Path) -> Result<()> {
+    let Some(parent) = dest.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let mut acc = PathBuf::new();
+    for comp in parent.components() {
+        acc.push(comp);
+        match fs::symlink_metadata(&acc) {
+            Ok(_) => continue,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(AyzenpackError::Io {
+                    source,
+                    path: Some(acc),
+                });
+            }
+        }
+        mkdir_0755(&acc)?;
+    }
+    Ok(())
+}
+
+fn mkdir_0755(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(path)
+            .map_err(|source| AyzenpackError::Io {
+                source,
+                path: Some(path.to_path_buf()),
+            })?;
+        let mut perms = fs::metadata(path)
+            .map_err(|source| AyzenpackError::Io {
+                source,
+                path: Some(path.to_path_buf()),
+            })?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).map_err(|source| AyzenpackError::Io {
+            source,
+            path: Some(path.to_path_buf()),
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir(path).map_err(|source| AyzenpackError::Io {
+            source,
+            path: Some(path.to_path_buf()),
+        })?;
+    }
+    Ok(())
+}
+
+fn apply_restore_attrs(opts: &RehydrateOptions, jar: &Jar, dest: &Path) -> Result<()> {
+    if let Some(mode) = jar.restore_mode {
+        set_restore_mode(dest, mode)?;
+    }
+    #[cfg(unix)]
+    {
+        if let (Some(uid), Some(gid)) = (jar.restore_uid, jar.restore_gid) {
+            if let Err(source) = std::os::unix::fs::chown(dest, Some(uid), Some(gid)) {
+                if chown_denied(&source) {
+                    warn(
+                        opts,
+                        &format!(
+                            "could not chown {} to {uid}:{gid}: {source}",
+                            dest.display()
+                        ),
+                    );
+                } else {
+                    return Err(AyzenpackError::Io {
+                        source,
+                        path: Some(dest.to_path_buf()),
+                    });
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = opts;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn chown_denied(err: &io::Error) -> bool {
+    if err.kind() == io::ErrorKind::PermissionDenied {
+        return true;
+    }
+    // EPERM (1) and EACCES (13) on Linux/macOS; rustc 1.80 may not map both to PermissionDenied.
+    matches!(err.raw_os_error(), Some(1) | Some(13))
+}
+
+fn set_restore_mode(dest: &Path, mode: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(dest)
+            .map_err(|source| AyzenpackError::Io {
+                source,
+                path: Some(dest.to_path_buf()),
+            })?
+            .permissions();
+        perms.set_mode(mode);
+        fs::set_permissions(dest, perms).map_err(|source| AyzenpackError::Io {
+            source,
+            path: Some(dest.to_path_buf()),
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut perms = fs::metadata(dest)
+            .map_err(|source| AyzenpackError::Io {
+                source,
+                path: Some(dest.to_path_buf()),
+            })?
+            .permissions();
+        perms.set_readonly(mode & 0o222 == 0);
+        fs::set_permissions(dest, perms).map_err(|source| AyzenpackError::Io {
+            source,
+            path: Some(dest.to_path_buf()),
+        })?;
+    }
+    Ok(())
+}
+
+fn write_exact_jar(jar: &Jar, cas_dir: &Path, dest: &Path, apply_prefix_chmod: bool) -> Result<()> {
     let mut file = File::create(dest).map_err(|source| AyzenpackError::Io {
         source,
         path: Some(dest.to_path_buf()),
@@ -243,7 +445,7 @@ fn write_exact_jar(jar: &Jar, cas_dir: &Path, dest: &Path) -> Result<()> {
                 source,
                 path: Some(dest.to_path_buf()),
             })?;
-        return finish_exact(dest, jar, prefix_len);
+        return finish_exact(dest, jar, prefix_len, apply_prefix_chmod);
     }
 
     let tail = match (&jar.tail_blob, jar.tail_size) {
@@ -292,7 +494,7 @@ fn write_exact_jar(jar: &Jar, cas_dir: &Path, dest: &Path) -> Result<()> {
             source,
             path: Some(dest.to_path_buf()),
         })?;
-    finish_exact(dest, jar, prefix_len)
+    finish_exact(dest, jar, prefix_len, apply_prefix_chmod)
 }
 
 fn write_exact_entry(
@@ -397,8 +599,8 @@ fn write_zeros(file: &mut File, n: u64, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-fn finish_exact(dest: &Path, jar: &Jar, prefix_len: u64) -> Result<()> {
-    if prefix_len > 0 {
+fn finish_exact(dest: &Path, jar: &Jar, prefix_len: u64, apply_prefix_chmod: bool) -> Result<()> {
+    if prefix_len > 0 && apply_prefix_chmod {
         chmod_executable(dest)?;
     }
     verify_source_identity(dest, jar)
@@ -456,6 +658,7 @@ fn write_jar(
     jar: &crate::manifest::Jar,
     cas_dir: &Path,
     dest: &Path,
+    apply_prefix_chmod: bool,
 ) -> Result<()> {
     let mut file = File::create(dest).map_err(|source| AyzenpackError::Io {
         source,
@@ -537,7 +740,7 @@ fn write_jar(
     }
 
     writer.finish().map_err(|err| zip_err(err, dest))?;
-    if prefix_len > 0 {
+    if prefix_len > 0 && apply_prefix_chmod {
         chmod_executable(dest)?;
     }
     Ok(())
