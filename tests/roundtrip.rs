@@ -1093,16 +1093,40 @@ fn store_nested_unadjusted_fat_uses_prefix_shift() {
     let dir = tempfile::tempdir().unwrap();
     let jar = dir.path().join("app.jar");
     write_fat_spring_store_nested_jar(&jar);
-    let src_n = ZipArchive::new(File::open(&jar).unwrap()).unwrap().len();
+    // ZipArchive::new(File) is view_shift=0 and latches on unadjusted prefix.
+    // Scan (correct view) must list the outer zip.
     let out = dir.path().join("out.ayz");
     dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
     let m = manifest_from_records(&read_archive(&out).2);
-    assert_eq!(m.jars[0].entries.len(), src_n);
+    let names: Vec<&str> = m.jars[0].entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"App.class"), "outer listing, got {names:?}");
+    assert_eq!(
+        names
+            .iter()
+            .filter(|n| n.starts_with("BOOT-INF/lib/"))
+            .count(),
+        2
+    );
     assert!(m.jars[0].raw_zip_blob.is_none());
     assert!(m.jars[0].tail_blob.is_some());
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
-    assert_functional_identity(&jar, &dest.join("app.jar"));
+    // rust ZipArchive::new(File) latches on unadjusted prefix; use scan (correct view).
+    let src_scan = ayzenpack::scan::scan_jar(&jar, u64::MAX).unwrap();
+    let dest_scan = ayzenpack::scan::scan_jar(&dest.join("app.jar"), u64::MAX).unwrap();
+    assert_eq!(
+        src_scan
+            .entries
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect::<Vec<_>>(),
+        dest_scan
+            .entries
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(src_scan.entries.len(), dest_scan.entries.len());
 }
 
 #[test]

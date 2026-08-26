@@ -398,7 +398,7 @@ fn zip_archive_opens(
     if archive.len() as u64 != outer_entries {
         return Ok(false);
     }
-    if archive.len() == 0 {
+    if archive.is_empty() {
         return Ok(true);
     }
     let header_start = match archive.by_index(0) {
