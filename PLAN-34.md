@@ -84,13 +84,13 @@ Keep `PLAN.md` (0.2.1) and `AGENTS.md` as-is.
 
 - Reconstruction “Otherwise rebuild” bullet: drop “Signed JARs on this path use the existing “rebuild will break the signature” warning.” Keep `source_*` may change.
 - Signed JARs section: replace the compressed/stored-bytes claim. State that `.SF` / MANIFEST digest **uncompressed** entry bytes, not the deflate stream. Rebuild keeps those bytes, so jarsigner should still verify. Whole-file `source_*` may change. Still warn `signed JAR <name>` for exact and rebuild. `--fail-on-signed` aborts. `--strict` does not promote. No re-sign. Do not store `cdata_blob` / `raw_zip` of a healthy jar to keep a file hash.
-- Security table “Signed JAR silently broken”: detect + warn; do **not** say rebuild breaks the signature. Keep `--fail-on-signed`.
+- Security table “Signed JAR silently broken”: replace the cell so it does **not** say “splice may keep bytes; rebuild will not” (that is the old compressed-bytes model). Detect + warn `signed JAR <name>`; jarsigner should still verify after rebuild; keep `--fail-on-signed`. Title may stay.
 
 **`README.md` Signed JARs**
 
 - Drop “Rebuild changes compressed sizes and will break them.”
 - Drop “Content-mode rebuild of an old archive can still break a signature.”
-- Same facts as DESIGN: still warn; `--fail-on-signed`; `--strict` does not promote; no second payload copy; no re-sign.
+- Do **not** leave splice as the only “signatures survive” story. State the DESIGN fact: `.SF` / MANIFEST digest **uncompressed** entry bytes; rebuild keeps those bytes; whole-file `source_*` may change. Still warn; `--fail-on-signed`; `--strict` does not promote; no second payload copy; no re-sign.
 
 `docs/library.md` only documents `--fail-on-signed` / `fail_on_signed`. Leave it unless a sentence repeats the lie (it does not today).
 
@@ -104,9 +104,13 @@ Keep `PLAN.md` (0.2.1) and `AGENTS.md` as-is.
    - stderr does **not** contain `rebuild will break the signature`
 2. **`--fail-on-signed`:** still failure / exit 1 / stderr contains `signed JAR <name>` and not the extra clause.
 3. **`--strict`:** still success; stderr still contains `signed JAR <name>`; not an error.
-4. Keep existing `fail_on_signed_exits_error` (strict packs; flag aborts). Tighten it to reject the extra clause if that is free.
-5. `signed_rebuild_is_not_exact_restore` may keep `!exact_restore()`. Update the comment that names “rebuild-breaks-signature warning path”.
-6. `tests/docs.rs`: assert DESIGN + README do **not** contain `rebuild will break the signature` and do **not** claim `.SF` digests “compressed or stored bytes”. Assert DESIGN states uncompressed entry bytes (via MANIFEST) for `.SF`.
+4. Keep existing `fail_on_signed_exits_error` (strict packs; flag aborts). On the existing no-flag CLI success of `write_signed_jar` (exact/codec-hit), **require** stderr contains `signed JAR` and does **not** contain `rebuild will break the signature`.
+5. `signed_rebuild_is_not_exact_restore` **keeps** `!exact_restore()`. Only the comment that names “rebuild-breaks-signature warning path” changes.
+6. `tests/docs.rs`:
+   - DESIGN + README must **not** contain `rebuild will break the signature`
+   - DESIGN must **not** claim `.SF` digests “compressed or stored bytes”
+   - README must **not** contain “will break them” or “can still break a signature”
+   - DESIGN must state uncompressed entry bytes (via MANIFEST) for `.SF`
 
 Do not add jarsigner / JDK verification. Do not require whole-file hash match on rebuild.
 
@@ -121,6 +125,13 @@ Do not add jarsigner / JDK verification. Do not require whole-file hash match on
 - `raw_zip` / `slice_zip` / crate 0.2.2
 - Format bump, field renames, version bump
 - Replacing `PLAN.md`
+
+---
+
+## Skeptic review (plan)
+
+- Sweep 1: ACCEPT, no blockers. Folded five SHOULD items (README fact + wording lock, security-table cell, exact-path extra-clause reject, keep `!exact_restore()`).
+- Sweep 2 / 3: pending.
 
 ---
 
