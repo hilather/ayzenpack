@@ -1,0 +1,79 @@
+name: Bench
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  bench:
+    name: dehydrate-rehydrate-budgets
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        id: corpus-cache
+        with:
+          path: ${{ github.workspace }}/.corpus
+          key: corpus-${{ hashFiles('ci/corpus.lock.json') }}
+      - name: Download pinned corpus
+        run: ci/download-corpus.sh
+        env:
+          CORPUS_DIR: ${{ github.workspace }}/.corpus
+          LOCKFILE: ${{ github.workspace }}/ci/corpus.lock.json
+      - uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        if: steps.corpus-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ github.workspace }}/.corpus
+          key: corpus-${{ hashFiles('ci/corpus.lock.json') }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: cargo fetch
+        run: cargo fetch --locked
+      - name: cargo build --release
+        # Release CLI only. panic = abort makes a test harness landmine.
+        run: cargo build --release --locked
+        env:
+          CARGO_NET_OFFLINE: "true"
+      - name: Ensure GNU time
+        run: command -v /usr/bin/time || (sudo apt-get update -qq && sudo apt-get install -y time)
+      - name: Release CLI bench (overlap + 50×1 MiB)
+        env:
+          CORPUS_DIR: ${{ github.workspace }}/.corpus
+          AYZENPACK_BIN: ${{ github.workspace }}/target/release/ayzenpack
+          BENCH_OUT: ${{ github.workspace }}/bench-results.json
+        run: ci/bench.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bench-results
+          path: bench-results.json
+          if-no-files-found: error
+      - name: Optional vs-main bench artifact
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/main-bench
+          run_id="$(gh run list --workflow bench.yml --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+          if [[ -z "${run_id}" ]]; then
+            echo "no successful main bench run yet"
+            exit 0
+          fi
+          gh run download "${run_id}" --name bench-results --dir /tmp/main-bench
+      - name: Performance budgets
+        run: |
+          set -euo pipefail
+          extra=()
+          if [[ -f /tmp/main-bench/bench-results.json ]]; then
+            extra+=(--baseline /tmp/main-bench/bench-results.json)
+          fi
+          python3 ci/compare-bench.py bench-results.json ci/perf-budgets.json "${extra[@]}"

@@ -1,0 +1,8 @@
+{
+  "dehydrate_wall_ms_max": 60000,
+  "rehydrate_wall_ms_max": 90000,
+  "dehydrate_peak_rss_kb_max": 1048576,
+  "rehydrate_peak_rss_kb_max": 1048576,
+  "ratio_archive_to_jars_max": 0.70,
+  "ratio_unique_to_uncompressed_max": 0.85
+}
