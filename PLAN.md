@@ -53,7 +53,7 @@ Replace the boolean `exact_restore()` with two helpers used by dehydrate warning
    - `cdata_blob.is_some()` (old 0.1.6–0.1.8 packs; exotic; mixed-unreproducible), **or**
    - `cdata_codec.is_some()`, **or**
    - `method_code == 0` (STORE; use content `blob`), **or**
-   - `is_dir` and no payload (`cdata_blob` absent ⇒ empty cdata)
+   - `is_dir` **and** `cdata_blob` absent (empty cdata only; dir-with-cdata must have `cdata_blob`)
 2. **`metadata_rebuild()`** — `tail_blob` is set, `raw_zip_blob` is absent, and some file entry cannot resolve via (1) (DEFLATE without `cdata_blob`/`cdata_codec`, i.e. a clean miss jar). A jar that also had unreproducible entries is **not** in this class (dehydrate stored `cdata_blob` on every non-STORE file so (1) holds).
 3. **Else** — old 0.1.4/0.1.5 content archive → existing `write_jar` / `ZipWriter`.
 
@@ -78,7 +78,7 @@ For each sliced local, still record `local_header_*`, `data_descriptor_hex`, `pa
 
 **Jar-wide policy after pass 1** (picks one mechanism so inference and restore cannot disagree):
 
-Let `unreproducible` = any file entry that is `method_code` not in `{0, 8}`, or whose `cdata` fails raw-inflate, or is a directory with **non-empty** cdata (today’s `!is_dir || !cdata.is_empty()` put; do not treat that as empty).
+Let `unreproducible` = any entry that is `method_code` not in `{0, 8}`, or whose `cdata` fails raw-inflate, or is a directory with **non-empty** cdata (today’s `!is_dir || !cdata.is_empty()` put; do not treat that as empty), or is a STORE **file** whose BLAKE3(`local.cdata`) ≠ `entry.blob` (payload Vec is gone after `commit_blob`; compare hashes). A STORE file whose cdata hashes as the content blob is reproducible via `blob`.
 
 Let `deflate_miss` = any `method_code == 8` file whose trial-encode does not match.
 
@@ -87,7 +87,7 @@ Let `deflate_miss` = any `method_code == 8` file whose trial-encode does not mat
 | no `deflate_miss`, no `unreproducible` | STORE: nothing extra. DEFLATE hit: `cdata_codec` only. empty dir: nothing. | `bit_identical_restore` |
 | no `deflate_miss`, some `unreproducible` | `cdata_blob` **only** on unreproducible file/dir-with-cdata entries. Hits still `cdata_codec`. STORE uses `blob`. | `bit_identical_restore` (every file resolves) |
 | `deflate_miss`, no `unreproducible` | **no** `cdata_blob`, **no** `cdata_codec` (strip hits too). Tail + local headers kept. **Not** `raw_zip`. | `metadata_rebuild` |
-| `deflate_miss` **and** `unreproducible` | **`cdata_blob` for every non-STORE file entry** (hits, misses, and exotic). No `cdata_codec`. | `bit_identical_restore`. **Never** metadata-rebuild a jar that has an unreproducible entry — rebuild’s encoder is only STORE or `deflate_raw(..., 6)` and must not invent method-8 bytes for LZMA/XZ/`Unsupported`. |
+| `deflate_miss` **and** `unreproducible` | **`cdata_blob` for every unreproducible entry and every DEFLATE file** (hits, misses, exotic files, **and dir-with-cdata**). STORE *files* whose `cdata ==` content blob still omit `cdata_blob`. No `cdata_codec`. | `bit_identical_restore`. **Never** metadata-rebuild a jar that has an unreproducible entry — rebuild’s encoder is only STORE-file or `deflate_raw(..., 6)` and must not invent method-8 bytes or drop dir cdata. |
 
 `write_rebuilt_jar` is therefore only entered when every file is STORE or DEFLATE. It never sees `cdata_blob` and never re-encodes `other`.
 
@@ -135,7 +135,7 @@ Old `cdata_blob`: unchanged.
 
 Do **not** seek to original `local_header_offset`s. Write a new zip portion, then the patched tail.
 
-Canonical miss encoder: `deflate-raw:flate2:6` for every `method_code == 8` file. STORE / dirs stay stored/empty.
+Canonical miss encoder: `deflate-raw:flate2:6` for every `method_code == 8` file. STORE files use the content blob. Empty dirs stay empty. If `write_rebuilt_jar` sees `method_code` not in `{0, 8}` or a dir with `cdata_blob` / non-empty reconstructed cdata, return `Format` (do not emit method-8 bytes for LZMA or drop dir payload). Dehydrate will not emit that pack; a crafted one must not become a corrupt ZIP.
 
 **Offset mode** (prefix / `zip -A`): from the first CD record in `tail` vs `entries[0].local_header_offset` and `prefix_size`:
 
@@ -157,7 +157,7 @@ Canonical miss encoder: `deflate-raw:flate2:6` for every `method_code == 8` file
 **Patch tail in place** (length unchanged):
 
 - Walk CD records in lockstep with `jar.entries`. Patch compressed size at CD+20 (and Zip64 extra). Patch local-header offset at CD+42 (and Zip64 extra) using the offset mode above.
-- If a Zip64 EOCD is present (locator magic immediately before classic EOCD, as `find_zip64_cd_bounds` already requires): patch `cd_offset` (and locator’s Zip64-EOCD offset = `new_cd_start + original_cd_size`).
+- If a Zip64 EOCD is present (locator magic immediately before classic EOCD, as `find_zip64_cd_bounds` already requires): patch `cd_offset` using the **same offset mode** as CD+42 (zip-rel or `prefix_size + zip-rel`). Locator’s Zip64-EOCD offset = that same-mode CD start + original `cd_size` (file-absolute after `zip -A`, not a bare zip-relative sum).
 - Classic EOCD: if recorded `cd_off` is `u32::MAX`, leave it; else write the new CD start (zip-rel or file-abs). `cd_size` unchanged.
 - Archive comment bytes after EOCD stay.
 
@@ -181,6 +181,7 @@ New / updated in `tests/roundtrip.rs` (and manifest unit tests):
 2. **Codec hit is bit-identical.** `write_jar` / mixed stored+deflated / Spring / zip-A / Zip64 / data-descriptor (STORE) / zipalign (STORE) fixtures already in this file must still `assert_bit_identical`. Manifest shows `cdata_codec` on deflated file entries and **no** `cdata_blob`. `source_*` verify stays.
 3. **Codec miss rebuilds a valid ZIP.** Hand-built ZIP whose DEFLATE cdata is a raw stored-block (`01` + len + `~len` + payload) over a **compressible** payload (e.g. 256+ bytes of `0x61`). miniz_oxide level 1 can emit a stored-block for short/incompressible input — do not use `"hi"`. After pack: no `cdata_blob`, no `cdata_codec`, no `raw_zip_*`, `tail_blob` present. Rehydrate: `ZipArchive` opens; names/order/uncompressed bytes match; file bytes ≠ source; pack `output_len` and `bytes_unique_blobs` are not ~1:1 with the jar size (unique blobs ≈ uncompressed entries + small headers/tail). Add one miss+prefix (short shebang + stored-block DEFLATE) so rebuild offset-mode / EOCD patch is exercised in default `cargo test`, not only on the Maven corpus.
 4. **Old-style `cdata_blob` fixture.** Craft a pack with `format::write_ayz_file`: content blob + **separate** cdata blob + tail + local header hex + `cdata_blob` set, `cdata_codec` absent. Rehydrate is bit-identical. (Also keep a swapped-`cdata_blob` hash-fail test by crafting, not by dehydrating a new pack.)
+4b. **Class 4 (miss + unreproducible sibling).** Stored-block DEFLATE file plus a directory local with non-empty cdata. After pack: DEFLATE and the dir both have `cdata_blob`; no `cdata_codec`; restore is bit-identical (`source_*` match). Guards class 4 forgetting dir-with-cdata.
 5. **Prefix / Spring / zip-A / Zip64** existing tests stay bit-identical (zip-crate deflate → codec hit).
 6. **Signed + rebuild:** miss-style signed-looking jar warns `rebuild will break the signature` (stderr or `signed && !exact_restore()`). Codec-hit signed fixture stays bit-identical and does **not** use that warning.
 7. **`strip_exact_fields`** also clears `cdata_codec`.
@@ -234,9 +235,8 @@ Existing `tests/corpus.rs` overlap tests (env-gated) should still pass; update a
 
 1. `flate2 = "=1.1.9"` (default features) in `Cargo.toml`; `cdata_codec` + schema + manifest tests; crate `0.1.9`.
 2. `deflate_raw` / `inflate_raw` / GPBF hint helper (unit-tested) in a small module (`src/deflate.rs` or `exact.rs`).
-3. Two-pass `attach_exact` + `resolve_cdata` + exact path **together** (no default cdata put).
-4. `write_rebuilt_jar` + dispatch + signed warning. `pub(crate)` the zip64/descriptor helpers.
-5. Tests + docs.
+3. Two-pass `attach_exact` + `resolve_cdata` + `write_rebuilt_jar` + inference/`exact_restore` rewrite **in the same commit**. Stopping cdata puts while `exact_restore()` is still `tail \|\| raw_zip` would send clean-miss jars into `write_exact_jar` with empty cdata.
+4. Tests + docs. `pub(crate)` the zip64/descriptor helpers in that same change.
 6. `cargo test`, `cargo clippy -D warnings`.
 7. Download corpus; measure; put numbers in the PR.
 
