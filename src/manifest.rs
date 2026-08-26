@@ -24,6 +24,10 @@ pub struct Jar {
     pub source_sha256: String,
     pub comment: String,
     pub signed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_blob: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_size: Option<u64>,
     pub entries: Vec<Entry>,
 }
 
@@ -117,6 +121,8 @@ mod tests {
                     .into(),
                 comment: String::new(),
                 signed: false,
+                prefix_blob: None,
+                prefix_size: None,
                 entries: vec![sample_file_entry()],
             }],
             blobs: vec![Blob {
@@ -179,6 +185,8 @@ mod tests {
         assert!(SCHEMA_JSON.contains("\"const\": \"ayzenpack-manifest\""));
         assert!(SCHEMA_JSON.contains("\"additionalProperties\": false"));
         assert!(SCHEMA_JSON.contains("name_raw_hex"));
+        assert!(SCHEMA_JSON.contains("prefix_blob"));
+        assert!(SCHEMA_JSON.contains("prefix_size"));
         assert!(!SCHEMA_JSON.contains("jded"));
         assert_eq!(m.version, 1);
         assert_eq!(m.hash_algo, "blake3");
@@ -231,6 +239,13 @@ mod tests {
                 "signed",
                 "entries",
             ],
+        );
+        let mut with_prefix = m.jars[0].clone();
+        with_prefix.prefix_blob = Some(EMPTY_BLAKE3.into());
+        with_prefix.prefix_size = Some(42);
+        assert_key_order(
+            &serde_json::to_string(&with_prefix).unwrap(),
+            &["signed", "prefix_blob", "prefix_size", "entries"],
         );
         assert_key_order(
             &serde_json::to_string(&m.blobs[0]).unwrap(),
@@ -347,5 +362,25 @@ mod tests {
         assert_key_order(&s2, &["utf8_flag", "name_raw_hex"]);
         let round: Entry = serde_json::from_str(&s2).unwrap();
         assert_eq!(round, with);
+    }
+
+    #[test]
+    fn prefix_fields_omitted_when_none() {
+        let jar = sample_manifest().jars[0].clone();
+        assert_eq!(jar.prefix_blob, None);
+        assert_eq!(jar.prefix_size, None);
+        let s = serde_json::to_string(&jar).unwrap();
+        assert_compact(&s);
+        assert!(
+            !s.contains("prefix_blob"),
+            "None prefix_blob must be omitted: {s}"
+        );
+        assert!(
+            !s.contains("prefix_size"),
+            "None prefix_size must be omitted: {s}"
+        );
+        let jar2: Jar = serde_json::from_str(&s).unwrap();
+        assert_eq!(jar2.prefix_blob, None);
+        assert_eq!(jar2.prefix_size, None);
     }
 }

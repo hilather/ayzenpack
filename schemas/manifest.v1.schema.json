@@ -81,6 +81,8 @@
         "source_sha256": { "$ref": "#/$defs/hex64" },
         "comment": { "type": "string" },
         "signed": { "type": "boolean" },
+        "prefix_blob": { "$ref": "#/$defs/hex64" },
+        "prefix_size": { "type": "integer", "minimum": 0 },
         "entries": {
           "type": "array",
           "items": { "$ref": "#/$defs/entry" }
