@@ -161,6 +161,7 @@ fn format_is_integrity(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     if m.contains("truncated")
         || m.contains("trailer")
+        || m.contains("toc")
         || m.contains("missing end")
         || m.contains("missing manifest")
         || m.contains("unknown record")

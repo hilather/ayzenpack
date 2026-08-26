@@ -342,16 +342,17 @@ fn toc_len_corrupt_truncated_too_big_v2_zero() {
     );
 
     let zero = dir.path().join("zero-toc.ayz");
-    fs::write(&zero, &orig).unwrap();
+    // Drop TOC bytes so expected_toc is 0, then set trailer.toc_len=0 to hit the v2 arm.
+    let header_total = 12 + trailer.header_len as usize;
+    let payload = trailer.payload_bytes as usize;
+    let mut stripped = orig[..header_total + payload].to_vec();
+    stripped.extend_from_slice(&orig[orig.len() - 64..]);
+    fs::write(&zero, &stripped).unwrap();
     patch_trailer_toc_len(&zero, 0);
     let err = list(&zero).unwrap_err();
     assert!(
-        matches!(
-            err,
-            AyzenpackError::Format("toc_len mismatch")
-                | AyzenpackError::Format("v2 toc_len must not be 0")
-        ) || err.to_string().contains("toc"),
-        "v2 toc_len=0 must fail, got {err:?}"
+        matches!(err, AyzenpackError::Format("v2 toc_len must not be 0")),
+        "v2 toc_len=0 with matching geometry must fail that arm, got {err:?}"
     );
 }
 
