@@ -161,7 +161,7 @@ fn agents_md_locks_single_cas_and_zstd_blocks() {
         "README must not tell agents that bit-identical restore is the guarantee"
     );
     assert!(
-        README.contains("Crate **0.2.1** never writes `cdata_blob`"),
+        README.contains("Crate **0.2.1** never writes `cdata_blob` (file or dir, any method)"),
         "README must say 0.2.1 never writes leftover cdata_blob"
     );
 }

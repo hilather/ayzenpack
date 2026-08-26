@@ -158,7 +158,7 @@ See [docs/library.md](docs/library.md#load-a-yaml-job-file) for the loader.
 
 ## Reconstruction
 
-**Storage efficiency is of the utmost importance.** New packs store **one** CAS blob per unique uncompressed entry (BLAKE3 of those bytes) and a ZIP-slot **index** (name, CD order, method, CRC, sizes, local header / descriptor / pad, tail, prefix, blob hash). Format v2 zstd-compresses those uncompressed blobs in 4 MiB record-aligned groups. The original already-deflated ZIP payload must **not** be stored a second time. Crate **0.2.1** never writes `cdata_blob` for a normal STORE/DEFLATE file (0.2.0 MixedExact leftover still reads).
+**Storage efficiency is of the utmost importance.** New packs store **one** CAS blob per unique uncompressed entry (BLAKE3 of those bytes) and a ZIP-slot **index** (name, CD order, method, CRC, sizes, local header / descriptor / pad, tail, prefix, blob hash). Format v2 zstd-compresses those uncompressed blobs in 4 MiB record-aligned groups. The original already-deflated ZIP payload must **not** be stored a second time. Crate **0.2.1** never writes `cdata_blob` (file or dir, any method). 0.2.0 MixedExact leftover still reads.
 
 Rehydrate rebuilds a **valid ZIP** from index + blobs: STORE splice, or a flate2 `cdata_codec` hit if one happened at pack time, otherwise a rebuild (new compressed sizes). Whole-file `source_*` hashes may change. That is acceptable. Do not store `cdata_blob` or `raw_zip` a healthy jar to keep hashes. Spring Boot fully-executable JARs keep `[official launch.script][zip]`.
 

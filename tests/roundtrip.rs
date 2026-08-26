@@ -113,14 +113,12 @@ fn unique_overlap_content_blobs_not_dual_copy() {
     assert_eq!(content.len(), 3, "HELLO + A + B");
     for jar in &m.jars {
         for e in &jar.entries {
-            if e.blob.is_some() {
-                assert!(
-                    e.cdata_blob.is_none(),
-                    "{}!{} must not write a second encoding",
-                    jar.name,
-                    e.name
-                );
-            }
+            assert!(
+                e.cdata_blob.is_none(),
+                "{}!{} must not write a second encoding",
+                jar.name,
+                e.name
+            );
         }
     }
     assert!(

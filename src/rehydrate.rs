@@ -615,11 +615,17 @@ fn resolve_cdata(jar: &Jar, e: &Entry, cas_dir: &Path, allow_rebuild: bool) -> R
     )))
 }
 
-/// Header fields after rebuild. Class-4 payload dirs become empty STORE.
-/// Exotic file methods become DEFLATE. Files keep crc / uncompressed size.
+/// Header fields after rebuild. Class-4 / leftover-csize / exotic dirs become empty STORE.
+/// Maven empty DEFLATE dirs (`method 8`, uncomp 0) stay DEFLATE. Exotic files become DEFLATE.
+/// Files keep crc / uncompressed size.
 fn rebuild_index_fields(e: &Entry) -> (u16, u32, u64) {
-    if e.is_dir && (e.uncompressed_size != 0 || (e.method_code != 0 && e.method_code != 8)) {
-        return (0, 0, 0);
+    if e.is_dir {
+        let maven_empty_deflate = e.method_code == 8 && e.uncompressed_size == 0;
+        if !maven_empty_deflate
+            && (e.uncompressed_size != 0 || e.compressed_size != 0 || e.method_code != 0)
+        {
+            return (0, 0, 0);
+        }
     }
     if !e.is_dir && e.method_code != 0 && e.method_code != 8 {
         return (8, e.crc32, e.uncompressed_size);
