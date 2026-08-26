@@ -10,8 +10,9 @@ use ayzenpack::error::AyzenpackError;
 use ayzenpack::hashutil::hash_both;
 use ayzenpack::scan::{for_each_jar_entry, scan_jar, zip_prefix_len, ScannedEntry};
 use fixtures::{
-    write_jar, write_jar_entries_with_mtime, write_wrapped_jar, write_wrapped_jar_adjusted,
-    JarEntry, SPRING_LAUNCHER, SYSTEMD_LAUNCHER,
+    spring_boot_launch_script, write_jar, write_jar_entries_with_mtime, write_wrapped_jar,
+    write_wrapped_jar_adjusted, write_wrapped_zip64_jar, zip64_jar_bytes, JarEntry,
+    SPRING_LAUNCHER,
 };
 use zip::CompressionMethod;
 use zip::DateTime;
@@ -199,17 +200,36 @@ fn scan_adjusted_script_plus_zip() {
 }
 
 #[test]
-fn scan_systemd_launcher_unadjusted() {
-    assert!(SYSTEMD_LAUNCHER.len() > 200);
-    let (_dir, path) = temp_jar("app-systemd.jar");
-    write_wrapped_jar(&path, SYSTEMD_LAUNCHER, &[("App.class", b"class-bytes")]);
-    assert_eq!(
-        zip_prefix_len(&path).unwrap(),
-        SYSTEMD_LAUNCHER.len() as u64
-    );
+fn scan_official_launch_script_unadjusted() {
+    let launcher = spring_boot_launch_script();
+    assert!(launcher.len() > 200);
+    let (_dir, path) = temp_jar("app-official.jar");
+    write_wrapped_jar(&path, launcher, &[("App.class", b"class-bytes")]);
+    assert_eq!(zip_prefix_len(&path).unwrap(), launcher.len() as u64);
     let scanned = scan_jar(&path, MAX_ENTRY).unwrap();
-    assert_eq!(scanned.prefix.as_deref(), Some(SYSTEMD_LAUNCHER));
+    assert_eq!(scanned.prefix.as_deref(), Some(launcher));
     assert_eq!(scanned.entries[0].name, "App.class");
+}
+
+#[test]
+fn scan_official_script_plus_zip64_nested_lib() {
+    let launcher = spring_boot_launch_script();
+    let inner = zip64_jar_bytes(&[("com/Dep.class", b"dep-bytes")]);
+    let (_dir, path) = temp_jar("app-zip64.jar");
+    write_wrapped_zip64_jar(
+        &path,
+        launcher,
+        &[
+            ("BOOT-INF/lib/dep.jar", inner.as_slice()),
+            ("App.class", b"app"),
+        ],
+    );
+    assert_eq!(zip_prefix_len(&path).unwrap(), launcher.len() as u64);
+    let scanned = scan_jar(&path, MAX_ENTRY).unwrap();
+    assert_eq!(scanned.prefix.as_deref(), Some(launcher));
+    let names: Vec<&str> = scanned.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["BOOT-INF/lib/dep.jar", "App.class"]);
+    assert!(!scanned.entries.iter().any(|e| e.name.contains("Dep.class")));
 }
 
 #[test]

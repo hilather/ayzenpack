@@ -8,6 +8,11 @@ use std::path::Path;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime, ZipWriter};
 
+#[path = "spring_launch.rs"]
+mod spring_launch;
+#[allow(unused_imports)]
+pub use spring_launch::spring_boot_launch_script;
+
 pub fn write_jar(path: &Path, files: &[(&str, &[u8])]) {
     let mut z = ZipWriter::new(File::create(path).unwrap());
     let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
@@ -22,56 +27,6 @@ pub fn write_jar(path: &Path, files: &[(&str, &[u8])]) {
 pub const SPRING_LAUNCHER: &[u8] = b"#!/bin/bash\n\
 #    .   ____          _            __ _ _\n\
 #   :: Spring Boot Startup Script ::\n\
-";
-
-/// Longer chkconfig + systemd-style Spring Boot launch script (not a 2-line shebang).
-pub const SYSTEMD_LAUNCHER: &[u8] = b"#!/bin/bash\n\
-#\n\
-# chkconfig: 2345 80 20\n\
-# description: demo Spring Boot application\n\
-# processname: demo\n\
-# pidfile: /var/run/demo.pid\n\
-#\n\
-### BEGIN INIT INFO\n\
-# Provides:          demo\n\
-# Required-Start:    $remote_fs $syslog $network\n\
-# Required-Stop:     $remote_fs $syslog $network\n\
-# Default-Start:     2 3 4 5\n\
-# Default-Stop:      0 1 6\n\
-# Short-Description: demo\n\
-# Description:       demo Spring Boot application\n\
-### END INIT INFO\n\
-#\n\
-#    .   ____          _            __ _ _\n\
-#   /\\\\ / ___'_ __ _ _(_)_ __  __ _ \\ \\ \\ \\\n\
-#  ( ( )\\___ | '_ | '_| | '_ \\/ _` | \\ \\ \\ \\\n\
-#   \\\\/  ___)| |_)| | | | | || (_| |  ) ) ) )\n\
-#    '  |____| .__|_| |_|_| |_\\__, | / / / /\n\
-#   =========|_|==============|___/=/_/_/_/\n\
-#   :: Spring Boot Startup Script ::\n\
-#\n\
-# [Unit]\n\
-# Description=demo Spring Boot application\n\
-# After=network.target\n\
-# [Service]\n\
-# Type=simple\n\
-# EnvironmentFile=-/etc/sysconfig/demo\n\
-# ExecStart=/usr/bin/demo\n\
-# [Install]\n\
-# WantedBy=multi-user.target\n\
-#\n\
-[ -n \"$DEBUG_SPRING_BOOT\" ] && set -x\n\
-prg=\"$0\"\n\
-while [ -h \"$prg\" ]; do\n\
-  ls=$(ls -ld \"$prg\")\n\
-  link=$(expr \"$ls\" : '.*-> \\(.*\\)$')\n\
-  if expr \"$link\" : '/.*' > /dev/null; then\n\
-    prg=\"$link\"\n\
-  else\n\
-    prg=$(dirname \"$prg\")\"/$link\"\n\
-  fi\ndone\n\
-# The JAR payload is appended after this script.\n\
-exec java -jar \"$0\" \"$@\"\n\
 ";
 
 /// Write `launcher` then a tiny JAR built with [`write_jar`].
@@ -100,6 +55,43 @@ fn wrapped_jar_bytes(launcher: &[u8], files: &[(&str, &[u8])], adjust: bool) -> 
     if adjust {
         adjust_self_extracting_offsets(&mut out, u32::try_from(launcher.len()).unwrap());
     }
+    out
+}
+
+/// Prepend `launcher` to a Zip64 JAR (`large_file` so EOCD uses Zip64 sentinels).
+pub fn write_wrapped_zip64_jar(path: &Path, launcher: &[u8], files: &[(&str, &[u8])]) {
+    std::fs::write(path, wrapped_zip64_bytes(launcher, files)).unwrap();
+}
+
+pub fn zip64_jar_bytes(files: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Cursor;
+    let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+    // Force a Zip64 EOCD/locator (same footer Spring fat JARs write when they flip Zip64).
+    z.set_zip64_comment(Some(""));
+    let opts = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .large_file(true);
+    for (name, data) in files {
+        z.start_file(*name, opts).unwrap();
+        z.write_all(data).unwrap();
+    }
+    let zip = z.finish().unwrap().into_inner();
+    assert!(
+        zip.windows(4).any(|w| w == b"PK\x06\x06"),
+        "Zip64 EOCD (PK\\x06\\x06) must be present"
+    );
+    assert!(
+        zip.windows(4).any(|w| w == b"PK\x06\x07"),
+        "Zip64 locator (PK\\x06\\x07) must be present"
+    );
+    zip
+}
+
+fn wrapped_zip64_bytes(launcher: &[u8], files: &[(&str, &[u8])]) -> Vec<u8> {
+    let zip = zip64_jar_bytes(files);
+    let mut out = Vec::with_capacity(launcher.len() + zip.len());
+    out.extend_from_slice(launcher);
+    out.extend_from_slice(&zip);
     out
 }
 

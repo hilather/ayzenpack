@@ -172,7 +172,7 @@ Nested `.jar` entries are opaque blobs. They are not exploded.
 
 ## Executable / prefixed JARs
 
-Spring Boot “fully executable” JARs (`spring-boot-maven-plugin` `executable: true` and similar) prepend a bash launcher before a normal ZIP. The file starts with `#!/bin/bash` (or similar), not `PK\x03\x04`. Real launchers are often a chkconfig/systemd script of many lines, not a two-line shebang.
+Spring Boot “fully executable” JARs (`spring-boot-maven-plugin` `executable: true` / `bootJar { launchScript() }`) prepend the official `launch.script` before a ZIP (often Zip64). The file starts with `#!/bin/bash`, the Spring Boot banner, `### BEGIN INIT INFO` / chkconfig, and ends with `exit 0` — not `PK\x03\x04`. Placeholders like `{{mode:auto}}` are already substituted in a real build.
 
 Detection uses no CLI flag. If the file does not start with ZIP magic, scan from offset 0 for the first `PK\x03\x04` within 16 MiB. Prefix bytes are `[0, first_pk)`. Then try, in order:
 

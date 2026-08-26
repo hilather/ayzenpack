@@ -629,11 +629,17 @@ fn map_entry_err(err: zip::result::ZipError, path: &Path) -> AyzenpackError {
 }
 
 #[cfg(test)]
+#[path = "../tests/spring_launch.rs"]
+mod spring_launch;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Cursor, Read, Seek, Write};
     use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
+
+    use super::spring_launch::spring_boot_launch_script;
 
     fn make_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut z = ZipWriter::new(Cursor::new(Vec::new()));
@@ -715,55 +721,20 @@ mod tests {
         eocd_off.checked_sub(cd_size)?.checked_sub(cd_off)
     }
 
-    /// chkconfig + systemd-style Spring Boot launcher (not a 2-line shebang).
-    const SYSTEMD_LAUNCHER: &[u8] = b"#!/bin/bash\n\
-#\n\
-# chkconfig: 2345 80 20\n\
-# description: demo Spring Boot application\n\
-# processname: demo\n\
-# pidfile: /var/run/demo.pid\n\
-#\n\
-### BEGIN INIT INFO\n\
-# Provides:          demo\n\
-# Required-Start:    $remote_fs $syslog $network\n\
-# Required-Stop:     $remote_fs $syslog $network\n\
-# Default-Start:     2 3 4 5\n\
-# Default-Stop:      0 1 6\n\
-# Short-Description: demo\n\
-# Description:       demo Spring Boot application\n\
-### END INIT INFO\n\
-#\n\
-#    .   ____          _            __ _ _\n\
-#   /\\\\ / ___'_ __ _ _(_)_ __  __ _ \\ \\ \\ \\\n\
-#  ( ( )\\___ | '_ | '_| | '_ \\/ _` | \\ \\ \\ \\\n\
-#   \\\\/  ___)| |_)| | | | | || (_| |  ) ) ) )\n\
-#    '  |____| .__|_| |_|_| |_\\__, | / / / /\n\
-#   =========|_|==============|___/=/_/_/_/\n\
-#   :: Spring Boot Startup Script ::\n\
-#\n\
-# [Unit]\n\
-# Description=demo Spring Boot application\n\
-# After=network.target\n\
-# [Service]\n\
-# Type=simple\n\
-# EnvironmentFile=-/etc/sysconfig/demo\n\
-# ExecStart=/usr/bin/demo\n\
-# [Install]\n\
-# WantedBy=multi-user.target\n\
-#\n\
-[ -n \"$DEBUG_SPRING_BOOT\" ] && set -x\n\
-prg=\"$0\"\n\
-while [ -h \"$prg\" ]; do\n\
-  ls=$(ls -ld \"$prg\")\n\
-  link=$(expr \"$ls\" : '.*-> \\(.*\\)$')\n\
-  if expr \"$link\" : '/.*' > /dev/null; then\n\
-    prg=\"$link\"\n\
-  else\n\
-    prg=$(dirname \"$prg\")\"/$link\"\n\
-  fi\ndone\n\
-# The JAR payload is appended after this script.\n\
-exec java -jar \"$0\" \"$@\"\n\
-";
+    fn make_zip64(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+        z.set_zip64_comment(Some(""));
+        let opts = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .large_file(true);
+        for (name, data) in files {
+            z.start_file(*name, opts).unwrap();
+            z.write_all(data).unwrap();
+        }
+        let zip = z.finish().unwrap().into_inner();
+        assert!(zip.windows(4).any(|w| w == ZIP64_EOCD_MAGIC));
+        zip
+    }
 
     #[test]
     fn prefix_len_on_zip_a_adjusted_script_plus_zip() {
@@ -794,17 +765,18 @@ exec java -jar \"$0\" \"$@\"\n\
 
     #[test]
     fn first_pk_succeeds_when_eocd_math_is_skipped() {
-        // Guards treating first-PK as optional: 0.1.4 extra-data math is not called.
+        // Official launch.script; 0.1.4 extra-data math is not called.
+        let launcher = spring_boot_launch_script();
         assert!(
-            SYSTEMD_LAUNCHER.len() > 200,
-            "launcher must be a chkconfig/systemd script, not a 2-line shebang"
+            launcher.len() > 200,
+            "must be the official chkconfig/INIT INFO script, not a 2-line shebang"
         );
         assert!(
-            !SYSTEMD_LAUNCHER.windows(4).any(|w| w == LOCAL_FILE_MAGIC),
+            !launcher.windows(4).any(|w| w == LOCAL_FILE_MAGIC),
             "launcher must not contain PK\\x03\\x04"
         );
         let zip = make_zip(&[("App.class", b"class-bytes")]);
-        let mut wrapped = SYSTEMD_LAUNCHER.to_vec();
+        let mut wrapped = launcher.to_vec();
         wrapped.extend_from_slice(&zip);
         let file_len = wrapped.len() as u64;
 
@@ -812,7 +784,7 @@ exec java -jar \"$0\" \"$@\"\n\
         let extra = eocd_extra(&mut extra_cur).expect("well-formed zip has EOCD extra");
         assert_eq!(
             extra,
-            SYSTEMD_LAUNCHER.len() as u64,
+            launcher.len() as u64,
             "this fixture is unadjusted; extra happens to match first PK"
         );
 
@@ -820,10 +792,10 @@ exec java -jar \"$0\" \"$@\"\n\
         let layout = layout_from_first_pk(Path::new("app.jar"), &mut cur, file_len)
             .unwrap()
             .expect("first PK\\x03\\x04 + ZipArchive must open without EOCD math");
-        assert_eq!(layout.prefix_len, SYSTEMD_LAUNCHER.len() as u64);
+        assert_eq!(layout.prefix_len, launcher.len() as u64);
         assert_eq!(
             layout.view_shift,
-            SYSTEMD_LAUNCHER.len() as u64,
+            launcher.len() as u64,
             "unadjusted: ZipView shifts to first PK"
         );
     }
@@ -831,24 +803,49 @@ exec java -jar \"$0\" \"$@\"\n\
     #[test]
     fn first_pk_succeeds_when_eocd_extra_disagrees() {
         // zip -A: extra == 0, first PK is the launcher length. 0.1.4 would NotZip.
-        assert!(SYSTEMD_LAUNCHER.len() > 200);
+        let launcher = spring_boot_launch_script();
         let zip = make_zip(&[("App.class", b"class-bytes")]);
-        let mut wrapped = SYSTEMD_LAUNCHER.to_vec();
+        let mut wrapped = launcher.to_vec();
         wrapped.extend_from_slice(&zip);
-        adjust_self_extracting_offsets(&mut wrapped, SYSTEMD_LAUNCHER.len() as u32);
+        adjust_self_extracting_offsets(&mut wrapped, u32::try_from(launcher.len()).unwrap());
         let file_len = wrapped.len() as u64;
 
         let mut extra_cur = Cursor::new(wrapped.clone());
         let extra = eocd_extra(&mut extra_cur).expect("EOCD still present");
         assert_eq!(extra, 0);
-        assert_ne!(extra, SYSTEMD_LAUNCHER.len() as u64);
+        assert_ne!(extra, launcher.len() as u64);
 
         let mut cur = Cursor::new(wrapped);
         let layout = layout_from_first_pk(Path::new("app.jar"), &mut cur, file_len)
             .unwrap()
             .expect("first PK path must work when extra disagrees");
-        assert_eq!(layout.prefix_len, SYSTEMD_LAUNCHER.len() as u64);
+        assert_eq!(layout.prefix_len, launcher.len() as u64);
         assert_eq!(layout.view_shift, 0);
+    }
+
+    #[test]
+    fn first_pk_official_script_plus_zip64() {
+        // Zip64 EOCD sits between CD and classic EOCD, so extra != first PK.
+        let launcher = spring_boot_launch_script();
+        let zip = make_zip64(&[("BOOT-INF/lib/dep.jar", b"nested-zip64-opaque")]);
+        let mut wrapped = launcher.to_vec();
+        wrapped.extend_from_slice(&zip);
+        let file_len = wrapped.len() as u64;
+
+        let mut extra_cur = Cursor::new(wrapped.clone());
+        let extra = eocd_extra(&mut extra_cur).expect("classic EOCD still present");
+        assert!(
+            extra > launcher.len() as u64,
+            "Zip64 footer inflates 0.1.4 extra past first PK: extra={extra} first={}",
+            launcher.len()
+        );
+
+        let mut cur = Cursor::new(wrapped);
+        let layout = layout_from_first_pk(Path::new("app.jar"), &mut cur, file_len)
+            .unwrap()
+            .expect("first PK + ZipArchive must open Zip64 after launch.script");
+        assert_eq!(layout.prefix_len, launcher.len() as u64);
+        assert_eq!(layout.view_shift, launcher.len() as u64);
     }
 
     #[test]

@@ -14,8 +14,9 @@ use ayzenpack::hashutil::blake3_bytes;
 use ayzenpack::manifest::Manifest;
 use ayzenpack::{dehydrate, rehydrate, verify, DehydrateOptions, RehydrateOptions};
 use fixtures::{
-    write_jar, write_jar_entries, write_stored_jar_dos_zero, write_stored_zip, write_wrapped_jar,
-    write_wrapped_jar_adjusted, JarEntry, SPRING_LAUNCHER, SYSTEMD_LAUNCHER,
+    spring_boot_launch_script, write_jar, write_jar_entries, write_stored_jar_dos_zero,
+    write_stored_zip, write_wrapped_jar, write_wrapped_jar_adjusted, write_wrapped_zip64_jar,
+    zip64_jar_bytes, JarEntry, SPRING_LAUNCHER,
 };
 use zip::{CompressionMethod, DateTime, ZipArchive};
 
@@ -970,13 +971,14 @@ fn roundtrip_zip_a_adjusted_executable_jar() {
 }
 
 #[test]
-fn roundtrip_systemd_launcher_executable_jar() {
-    assert!(SYSTEMD_LAUNCHER.len() > 200);
+fn roundtrip_official_launch_script_executable_jar() {
+    let launcher = spring_boot_launch_script();
+    assert!(launcher.len() > 200);
     let dir = tempfile::tempdir().unwrap();
     let jar = dir.path().join("app.jar");
     write_wrapped_jar(
         &jar,
-        SYSTEMD_LAUNCHER,
+        launcher,
         &[
             ("App.class", b"class-bytes"),
             ("application.properties", b"x=1"),
@@ -988,10 +990,32 @@ fn roundtrip_systemd_launcher_executable_jar() {
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
     let restored = dest.join("app.jar");
-    assert_eq!(
-        &fs::read(&restored).unwrap()[..SYSTEMD_LAUNCHER.len()],
-        SYSTEMD_LAUNCHER
+    assert_eq!(&fs::read(&restored).unwrap()[..launcher.len()], launcher);
+    assert_functional_identity(&jar, &restored);
+}
+
+#[test]
+fn roundtrip_official_script_plus_zip64_nested_lib() {
+    let launcher = spring_boot_launch_script();
+    let inner = zip64_jar_bytes(&[("com/Dep.class", b"dep-bytes")]);
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("app.jar");
+    write_wrapped_zip64_jar(
+        &jar,
+        launcher,
+        &[
+            ("BOOT-INF/lib/dep.jar", inner.as_slice()),
+            ("App.class", b"class-bytes"),
+        ],
     );
+
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()]))
+        .expect("official launch.script + Zip64 fat JAR must not be NotZip");
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("app.jar");
+    assert_eq!(&fs::read(&restored).unwrap()[..launcher.len()], launcher);
     assert_functional_identity(&jar, &restored);
 }
 
