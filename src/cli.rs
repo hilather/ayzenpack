@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 
-use ayzenpack::{dehydrate, DehydrateOptions, DehydrateSummary};
+use ayzenpack::{dehydrate, rehydrate, DehydrateOptions, DehydrateSummary, RehydrateOptions};
 
 #[derive(Parser)]
 #[command(
@@ -136,7 +136,34 @@ pub fn run() -> Result<()> {
             print_dehydrate_stats(&opts, &summary);
             Ok(())
         }
-        Cmd::Rehydrate { .. } => bail!("rehydrate is not implemented yet"),
+        Cmd::Rehydrate {
+            input,
+            dir,
+            cas_dir,
+            keep_cas,
+            store_all,
+            deflate_level,
+            clean,
+            overwrite,
+            only,
+        } => {
+            let opts = RehydrateOptions {
+                input,
+                dir,
+                cas_dir,
+                keep_cas,
+                store_all,
+                deflate_level,
+                clean,
+                overwrite,
+                only,
+                quiet,
+                verbose,
+                json_logs,
+            };
+            rehydrate(&opts)?;
+            Ok(())
+        }
         Cmd::List { .. } => bail!("list is not implemented yet"),
         Cmd::Verify { .. } => bail!("verify is not implemented yet"),
     }

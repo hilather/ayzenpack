@@ -52,3 +52,60 @@ pub fn write_jar_entries_with_mtime(path: &Path, entries: &[JarEntry<'_>], mtime
     }
     z.finish().unwrap();
 }
+
+/// Stored ZIP whose local + central DOS timestamps are the invalid pair 0,0.
+/// Scan records `dos_date=0, dos_time=0`; rehydrate must not panic.
+pub fn write_stored_jar_dos_zero(path: &Path, files: &[(&str, &[u8])]) {
+    let mut local = Vec::new();
+    let mut central = Vec::new();
+    for (name, data) in files {
+        let name_b = name.as_bytes();
+        let crc = crc32fast::hash(data);
+        let off = local.len() as u32;
+        local.extend_from_slice(b"PK\x03\x04");
+        local.extend_from_slice(&20u16.to_le_bytes());
+        local.extend_from_slice(&0u16.to_le_bytes());
+        local.extend_from_slice(&0u16.to_le_bytes());
+        local.extend_from_slice(&0u16.to_le_bytes());
+        local.extend_from_slice(&0u16.to_le_bytes());
+        local.extend_from_slice(&crc.to_le_bytes());
+        local.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        local.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        local.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
+        local.extend_from_slice(&0u16.to_le_bytes());
+        local.extend_from_slice(name_b);
+        local.extend_from_slice(data);
+
+        central.extend_from_slice(b"PK\x01\x02");
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&crc.to_le_bytes());
+        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&off.to_le_bytes());
+        central.extend_from_slice(name_b);
+    }
+    let cd_off = local.len() as u32;
+    let cd_len = central.len() as u32;
+    let n = files.len() as u16;
+    local.extend_from_slice(&central);
+    local.extend_from_slice(b"PK\x05\x06");
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(&n.to_le_bytes());
+    local.extend_from_slice(&n.to_le_bytes());
+    local.extend_from_slice(&cd_len.to_le_bytes());
+    local.extend_from_slice(&cd_off.to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    std::fs::write(path, local).unwrap();
+}

@@ -4,6 +4,7 @@
 mod fixtures;
 
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 use assert_cmd::Command;
@@ -106,4 +107,35 @@ fn dehydrate_o_overwrites_existing_ayz() {
     assert!(bytes.len() >= 4, "archive too short");
     assert_eq!(&bytes[..4], b"AYZP");
     assert_ne!(&bytes, b"not-an-ayzenpack-file");
+}
+
+#[test]
+fn unpack_alias_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = sample_jar(dir.path());
+    let out = dir.path().join("out.ayz");
+    ayzenpack()
+        .arg("dehydrate")
+        .arg("-o")
+        .arg(&out)
+        .arg(&jar)
+        .assert()
+        .success();
+    let dest = dir.path().join("restored");
+    ayzenpack()
+        .arg("unpack")
+        .arg("-i")
+        .arg(&out)
+        .arg("-d")
+        .arg(&dest)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+    let restored = dest.join("a.jar");
+    assert!(restored.is_file(), "unpack must restore a.jar");
+    let mut z = zip::ZipArchive::new(fs::File::open(&restored).unwrap()).unwrap();
+    let mut f = z.by_name("x.txt").unwrap();
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"hello");
 }
