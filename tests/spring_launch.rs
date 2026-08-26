@@ -8,22 +8,16 @@ use std::sync::OnceLock;
 
 const TEMPLATE: &[u8] = include_bytes!("fixtures/spring-boot-3.5.0-launch.script");
 
-fn lf_template() -> &'static [u8] {
-    static LF: OnceLock<Vec<u8>> = OnceLock::new();
-    LF.get_or_init(|| TEMPLATE.iter().copied().filter(|&b| b != b'\r').collect())
-        .as_slice()
-}
-
-/// Exact upstream bytes (placeholders still present). CRLF checkouts are folded to LF.
+/// Exact upstream bytes (placeholders still present). Must stay LF-only.
 pub fn official_launch_script_template() -> &'static [u8] {
-    lf_template()
+    TEMPLATE
 }
 
 /// Rendered as in a real `executable: true` / `bootJar { launchScript() }` build.
 pub fn spring_boot_launch_script() -> &'static [u8] {
     static RENDERED: OnceLock<Vec<u8>> = OnceLock::new();
     RENDERED
-        .get_or_init(|| render_spring_placeholders(lf_template()))
+        .get_or_init(|| render_spring_placeholders(TEMPLATE))
         .as_slice()
 }
 
@@ -88,6 +82,7 @@ mod tests {
     #[test]
     fn official_template_is_spring_boot_3_5_0_launch_script() {
         let raw = official_launch_script_template();
+        assert!(!raw.contains(&b'\r'), "fixture must be LF-only");
         assert_eq!(raw.len(), 9570);
         assert!(raw.starts_with(b"#!/bin/bash\n"));
         assert!(raw
@@ -104,6 +99,7 @@ mod tests {
     #[test]
     fn rendered_script_fills_defaults_and_keeps_shape() {
         let rendered = spring_boot_launch_script();
+        assert!(!rendered.contains(&b'\r'), "fixture must be LF-only");
         assert!(rendered.starts_with(b"#!/bin/bash\n"));
         assert!(rendered.ends_with(b"exit 0\n"));
         let s = std::str::from_utf8(rendered).unwrap();
