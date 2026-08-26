@@ -16,8 +16,8 @@ use ayzenpack::{dehydrate, rehydrate, verify, DehydrateOptions, RehydrateOptions
 use fixtures::{
     spring_boot_launch_script, write_data_descriptor_zip, write_deflate_miss_plus_dir_cdata,
     write_deflate_miss_plus_empty_deflate_dir, write_jar, write_jar_entries,
-    write_jar_with_comment, write_non_utf8_name_zip, write_padded_locals_zip,
-    write_signed_looking_jar, write_store_file_plus_dir_cdata,
+    write_jar_with_comment, write_non_utf8_name_zip, write_overlapping_local_zip,
+    write_padded_locals_zip, write_signed_looking_jar, write_store_file_plus_dir_cdata,
     write_store_file_plus_empty_deflate_dir, write_store_file_plus_leftover_csize_dir,
     write_stored_block_deflate_wrapped, write_stored_block_deflate_zip, write_stored_jar_dos_zero,
     write_stored_zip, write_wrapped_jar, write_wrapped_jar_adjusted, write_wrapped_zip64_jar,
@@ -854,7 +854,8 @@ fn duplicate_entry_names_in_one_jar_all_restored() {
     );
 
     let out = dir.path().join("out.ayz");
-    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let zip_len = fs::metadata(&jar).unwrap().len();
+    let summary = dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
     let restored = dest.join("dup.jar");
@@ -881,6 +882,52 @@ fn duplicate_entry_names_in_one_jar_all_restored() {
         dest_entries, src,
         "all scanner-visible duplicate-name entries must be restored in CD order"
     );
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert!(
+        m.jars[0].raw_zip_blob.is_none(),
+        "dup.txt last-wins must not store raw_zip"
+    );
+    assert!(
+        m.jars[0].tail_blob.is_none(),
+        "dup.txt homemade CD count != entries; do not store a disagreeing tail"
+    );
+    for e in &m.jars[0].entries {
+        assert!(e.cdata_blob.is_none());
+    }
+    assert!(
+        summary.bytes_unique_blobs < zip_len,
+        "unique blobs {} must not include a second copy of the {} zip",
+        summary.bytes_unique_blobs,
+        zip_len
+    );
+}
+
+#[test]
+fn overlapping_locals_listed_jar_has_no_raw_zip() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("overlap.jar");
+    write_overlapping_local_zip(&jar);
+    let zip_len = fs::metadata(&jar).unwrap().len();
+    let out = dir.path().join("out.ayz");
+    let summary = dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert!(
+        m.jars[0].raw_zip_blob.is_none(),
+        "listed overlap jar must not store raw_zip"
+    );
+    assert!(
+        m.jars[0].tail_blob.is_none(),
+        "overlap must skip exact (no broken tail)"
+    );
+    assert!(
+        summary.bytes_unique_blobs < zip_len,
+        "unique blobs {} must not include the {} zip portion",
+        summary.bytes_unique_blobs,
+        zip_len
+    );
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert!(dest.join("overlap.jar").is_file());
 }
 
 #[test]
@@ -1077,6 +1124,8 @@ fn roundtrip_bash_prefixed_executable_jar() {
 
     let m = manifest_from_records(&read_archive(&out).2);
     assert!(m.jars[0].prefix_blob.is_some());
+    assert!(m.jars[0].tail_blob.is_some());
+    assert!(m.jars[0].raw_zip_blob.is_none());
     assert_eq!(m.jars[0].prefix_size, Some(SPRING_LAUNCHER.len() as u64));
     let prefix_hex = m.jars[0].prefix_blob.as_deref().unwrap();
     let prefix_blob = m
@@ -1127,6 +1176,9 @@ fn roundtrip_zip_a_adjusted_executable_jar() {
     let summary = dehydrate(&opts(&out, vec![jar.clone()]))
         .expect("zip -A adjusted executable JAR must not be NotZip");
     assert!(summary.unique_blob_count >= 3, "prefix + two file entries");
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert!(m.jars[0].tail_blob.is_some());
+    assert!(m.jars[0].raw_zip_blob.is_none());
 
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
@@ -1184,6 +1236,9 @@ fn roundtrip_official_script_plus_zip64_nested_lib() {
     let out = dir.path().join("out.ayz");
     dehydrate(&opts(&out, vec![jar.clone()]))
         .expect("official launch.script + Zip64 fat JAR must not be NotZip");
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert!(m.jars[0].tail_blob.is_some());
+    assert!(m.jars[0].raw_zip_blob.is_none());
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
     let restored = dest.join("app.jar");
@@ -1406,7 +1461,8 @@ fn normal_jar_has_no_prefix_fields_and_roundtrips() {
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
     assert_bit_identical(&jar, &dest.join("plain.jar"));
     assert_functional_identity(&jar, &dest.join("plain.jar"));
-    assert!(m.jars[0].tail_blob.is_some() || m.jars[0].raw_zip_blob.is_some());
+    assert!(m.jars[0].tail_blob.is_some());
+    assert!(m.jars[0].raw_zip_blob.is_none());
 }
 
 fn strip_exact_fields(records: Vec<Record>) -> Vec<Record> {
@@ -1501,8 +1557,13 @@ fn roundtrip_data_descriptor_is_bit_identical() {
     dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
     let m = manifest_from_records(&read_archive(&out).2);
     assert!(
-        m.jars[0].entries[0].data_descriptor_hex.is_some() || m.jars[0].raw_zip_blob.is_some(),
+        m.jars[0].entries[0].data_descriptor_hex.is_some(),
         "GPBF bit 3 must be captured"
+    );
+    assert!(m.jars[0].tail_blob.is_some());
+    assert!(
+        m.jars[0].raw_zip_blob.is_none(),
+        "descriptor jar must not fall back to raw_zip"
     );
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
@@ -1566,9 +1627,11 @@ fn roundtrip_zipalign_padding_is_bit_identical() {
     dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
     let m = manifest_from_records(&read_archive(&out).2);
     let pad = m.jars[0].entries[0].pad_zeros;
+    assert!(pad == Some(5), "expected pad_zeros=5, got {pad:?}");
+    assert!(m.jars[0].tail_blob.is_some());
     assert!(
-        pad == Some(5) || m.jars[0].raw_zip_blob.is_some(),
-        "expected pad_zeros=5 or raw_zip fallback, got {pad:?}"
+        m.jars[0].raw_zip_blob.is_none(),
+        "zipalign jar must not fall back to raw_zip"
     );
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();

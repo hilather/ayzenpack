@@ -162,7 +162,7 @@ See [docs/library.md](docs/library.md#load-a-yaml-job-file) for the loader.
 
 Rehydrate rebuilds a **valid ZIP** from index + blobs: STORE splice, or a flate2 `cdata_codec` hit if one happened at pack time, otherwise a rebuild (new compressed sizes). Whole-file `source_*` hashes may change. That is acceptable. Do not store `cdata_blob` or `raw_zip` a healthy jar to keep hashes. Spring Boot fully-executable JARs keep `[official launch.script][zip]`.
 
-0.1.6–0.1.8 packs that still have `cdata_blob` still read. New packs must not write that shape. If a zip cannot be sliced (spanning / parse failure / count mismatch), the zip portion after the prefix is stored as `raw_zip_blob` and copied — that is the only `raw_zip` case.
+0.1.6–0.1.8 packs that still have `cdata_blob` still read. New packs must not write that shape. A listed jar (`entries[]` populated) is never stored as `raw_zip_blob`: rebuild from index + CAS, or skip-exact `write_jar`. `raw_zip` only if listing never produced `entries[]`. Crate **0.2.2** never writes `raw_zip` of a listed jar.
 
 **Old archives** (0.1.4 / 0.1.5, no `tail` / `raw_zip` fields) still rehydrate via `ZipWriter`: uncompressed bytes, names, CD order, and CRC match; the deflate bitstream and extras do not. `--verbatim` is **not** a CLI flag.
 

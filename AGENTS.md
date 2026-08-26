@@ -10,7 +10,7 @@ That is the product. Valid ZIP out of index + blobs is enough. Whole-file `sourc
 
 1. Store **one** deduped copy of each payload. Dedup key is BLAKE3 of **uncompressed** entry bytes (same class across JARs is one blob). This is the data.
 2. Keep **indexes** of where that blob belongs inside the original ZIP, in the ratarmount-rs sense: name, CD order, method, CRC, compressed/uncompressed sizes, GPBF, `local_header_offset`, local header / data-descriptor / pad metadata, jar tail (CD through EOF), prefix if any, blob hash. The original JAR is gone; the index points at the CAS blob, not at a sidecar copy of the source file.
-3. **Never** store a second encoding of the same entry. No default `cdata_blob` next to the content blob. No `raw_zip` except a zip that cannot be sliced (spanning / parse failure / ZipArchive count ≠ CD count). Do not reintroduce dual copies. That is why packs went 200MB → ~3GB: uncompressed CAS + original deflate streams (zstd cannot shrink those).
+3. **Never** store a second encoding of the same entry. No default `cdata_blob` next to the content blob. `ZipArchive` count ≠ homemade CD count is a parser bug, not a `raw_zip` case. Crate 0.2.2 never writes `raw_zip` of a listed jar. `raw_zip` only if `ZipArchive` never populated `entries[]` (`UnsupportedArchive` spanning / `NotZip`). Homemade parse failure / overlap on a listed jar is skip-exact (index + CAS / `write_jar`), never whole-zip CAS. Do not reintroduce dual copies. That is why packs went 200MB → ~3GB: uncompressed CAS + original deflate streams (zstd cannot shrink those).
 4. **Zstd-compress the actual data in blocks.** Format v2 already does this: record-aligned zstd **groups** flushing at 4 MiB of uncompressed BLOB **record** bytes, final MANIFEST+END frame, uncompressed TOC. Do **not** switch to per-file/per-blob frames (resets the window, loses size). Do not store pre-deflated ZIP cdata as the CAS payload. Blobs in the frames are uncompressed entry bytes; zstd is the only pack compression.
 5. Restore rebuilds a valid ZIP from index + blobs (STORE splice / flate2 codec hit if it happens / otherwise rebuild). Whole-file `source_*` hashes may change. That is acceptable. Do **not** add a Java/zlib deflater, `cdata_blob` for misses, or `raw_zip` of healthy jars just to keep file hashes.
 6. Read old packs (v1, legacy `cdata_blob`, 0.1.6–0.1.8 dual copy) but **never write** that shape again.
@@ -28,7 +28,7 @@ The manifest is a ZIP-slot index (ratarmount-style pointers), not a second copy 
 
 ## Current tree vs this contract
 
-Crate **0.2.1** / format **v2** groups uncompressed blobs in 4 MiB record-aligned zstd frames and **never writes** `cdata_blob` on STORE/DEFLATE (file or dir, any method). CleanMiss rebuilds class-4 / mixed-exotic. Crate 0.2.0 leftover MixedExact / ExactWithExotic dual copies still read. Do not add new `cdata_blob` puts. Do not “fix” mix size by storing more cdata.
+Crate **0.2.1** / format **v2** groups uncompressed blobs in 4 MiB record-aligned zstd frames and **never writes** `cdata_blob` on STORE/DEFLATE (file or dir, any method). Crate **0.2.2** never writes `raw_zip` of a listed jar. CleanMiss rebuilds class-4 / mixed-exotic. Crate 0.2.0 leftover MixedExact / ExactWithExotic dual copies still read. Do not add new `cdata_blob` puts. Do not “fix” mix size by storing more cdata.
 
 ## Tests that must fail
 

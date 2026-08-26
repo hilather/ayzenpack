@@ -149,10 +149,10 @@ fn agents_md_locks_single_cas_and_zstd_blocks() {
         "DESIGN.md must not treat metadata-only exact as the north star"
     );
     assert!(
-        PLAN.contains("# PLAN: single-CAS + ZIP index (crate 0.2.1)")
-            && PLAN.contains("Writers never emit `cdata_blob`")
-            && PLAN.contains("Delete `store_cdata`"),
-        "PLAN.md must be the 0.2.1 single-CAS plan, not the shipped 0.2.0 format-v2 plan"
+        PLAN.contains("# PLAN: no raw_zip dual-copy on listed jars (crate 0.2.2)")
+            && PLAN.contains("Never write `raw_zip` when `jar.entries` is populated")
+            && PLAN.contains("`ZipArchive` count ≠ homemade CD count is a **second bug**"),
+        "PLAN.md must be the 0.2.2 no-raw_zip-on-listed-jars plan"
     );
     assert!(
         !README.contains("## Reconstruction guarantee")

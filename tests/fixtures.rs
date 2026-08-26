@@ -247,6 +247,52 @@ pub fn write_stored_zip(path: &Path, files: &[(&str, &[u8], u32)]) {
     std::fs::write(path, local).unwrap();
 }
 
+/// Two distinct-name CD records that share local offset 0.
+/// ZipArchive still lists both; homemade `slice_zip` fails (overlap) → 0.2.1 `Raw`.
+pub fn write_overlapping_local_zip(path: &Path) {
+    let a = b"AAAA-payload";
+    let b = b"BBBB-payload";
+    write_stored_zip(
+        path,
+        &[
+            ("a.txt", a, crc32fast::hash(a)),
+            ("b.txt", b, crc32fast::hash(b)),
+        ],
+    );
+    let mut buf = std::fs::read(path).unwrap();
+    let eocd = {
+        let mut i = buf.len() - 22;
+        loop {
+            if buf[i..i + 4] == *b"PK\x05\x06" {
+                let comment_len = u16::from_le_bytes([buf[i + 20], buf[i + 21]]) as usize;
+                if i + 22 + comment_len == buf.len() {
+                    break i;
+                }
+            }
+            assert!(i > 0);
+            i -= 1;
+        }
+    };
+    let cd_size = u32::from_le_bytes(buf[eocd + 12..eocd + 16].try_into().unwrap()) as usize;
+    let cd_off = u32::from_le_bytes(buf[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+    let mut i = cd_off;
+    let cd_end = cd_off + cd_size;
+    let mut seen = 0u32;
+    while i + 46 <= cd_end {
+        assert_eq!(&buf[i..i + 4], b"PK\x01\x02");
+        let name_len = u16::from_le_bytes(buf[i + 28..i + 30].try_into().unwrap()) as usize;
+        let extra_len = u16::from_le_bytes(buf[i + 30..i + 32].try_into().unwrap()) as usize;
+        let comment_len = u16::from_le_bytes(buf[i + 32..i + 34].try_into().unwrap()) as usize;
+        if seen == 1 {
+            buf[i + 42..i + 46].copy_from_slice(&0u32.to_le_bytes());
+        }
+        seen += 1;
+        i += 46 + name_len + extra_len + comment_len;
+    }
+    assert_eq!(seen, 2);
+    std::fs::write(path, buf).unwrap();
+}
+
 /// Stored ZIP with GPBF bit 3 and a signed data descriptor after the payload.
 pub fn write_data_descriptor_zip(path: &Path, name: &str, data: &[u8]) {
     let name_b = name.as_bytes();
