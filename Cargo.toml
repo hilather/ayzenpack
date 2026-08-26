@@ -4,11 +4,14 @@ version = "0.1.3"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
-description = "Dehydrate many JARs into one zstd content-addressed archive and rehydrate them"
+description = "Pack many JARs into one BLAKE3 + zstd content-addressed archive and restore them"
 readme = "README.md"
 authors = ["ayzenpack contributors"]
 keywords = ["jar", "zip", "zstd", "dedup", "blake3"]
 categories = ["command-line-utilities", "compression"]
+repository = "https://github.com/hilather/ayzenpack"
+homepage = "https://github.com/hilather/ayzenpack"
+documentation = "https://github.com/hilather/ayzenpack#readme"
 
 [lib]
 name = "ayzenpack"

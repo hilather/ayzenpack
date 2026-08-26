@@ -1,0 +1,261 @@
+# Library quick start
+
+ayzenpack is a Rust library. The `ayzenpack` binary is clap over four functions:
+
+```rust
+pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary>;
+pub fn rehydrate(opts: &RehydrateOptions) -> Result<()>;
+pub fn list(input: &Path) -> Result<Manifest>;
+pub fn verify(input: &Path) -> Result<()>;
+```
+
+No clap in the lib. No process-global flags. Quiet / verbose / json-logs are fields on the options structs — copy them in from your own CLI, or leave the defaults.
+
+`#![forbid(unsafe_code)]` is on `lib.rs`.
+
+---
+
+## Pack and restore
+
+```rust
+use std::path::PathBuf;
+use ayzenpack::{dehydrate, list, rehydrate, verify, DehydrateOptions, RehydrateOptions};
+
+fn main() -> ayzenpack::Result<()> {
+    let summary = dehydrate(&DehydrateOptions {
+        output: PathBuf::from("libs.ayz"),
+        inputs: vec![PathBuf::from("app.jar"), PathBuf::from("lib")],
+        recursive: true,
+        sort_inputs: true,
+        level: 3,
+        jobs: 0,
+        fail_on_signed: true,
+        exclude: vec!["*.sources.jar".into(), "*.javadoc.jar".into()],
+        write_sidecar_manifest: Some(PathBuf::from("libs.ayz.manifest.json")),
+        pretty_manifest: true,
+        ..DehydrateOptions::default()
+    })?;
+
+    eprintln!(
+        "{} jars, {} unique blobs, ratio {:.3}",
+        summary.jar_count, summary.unique_blob_count, summary.dedup_ratio
+    );
+
+    verify("libs.ayz".as_ref())?;
+
+    let manifest = list("libs.ayz".as_ref())?;
+    assert_eq!(manifest.format, "ayzenpack-manifest");
+
+    rehydrate(&RehydrateOptions {
+        input: PathBuf::from("libs.ayz"),
+        dir: PathBuf::from("restored"),
+        overwrite: true,
+        ..RehydrateOptions::default()
+    })
+}
+```
+
+`Cargo.toml`:
+
+```toml
+[dependencies]
+ayzenpack = { git = "https://github.com/hilather/ayzenpack" }
+```
+
+---
+
+## `DehydrateOptions`
+
+`Default` is the same as the CLI defaults. Set only what you care about.
+
+| Field | Default | Notes |
+|-------|---------|--------|
+| `output` | empty (required) | overwritten if the file exists |
+| `inputs` | `[]` (required) | files, or directories when `recursive` |
+| `recursive` | `false` | `*.jar,*.zip,*.war,*.ear`, case-insensitive |
+| `sort_inputs` | `false` | also forces header `created_unix` to `0` |
+| `level` | `3` | zstd 1..=19 |
+| `max_entry_bytes` | `2_147_483_647` | zip-bomb cap |
+| `strict` | `false` | warnings become errors; does **not** promote signed-JAR |
+| `fail_on_signed` | `false` | abort if `META-INF/*.SF` + `*.RSA`/`*.DSA`/`*.EC` |
+| `dry_run` | `false` | hash and count; write nothing |
+| `write_sidecar_manifest` | `None` | extra JSON next to the archive |
+| `pretty_manifest` | `false` | pretty-print **sidecar only**; archive MANIFEST is always compact |
+| `follow_symlinks` | `false` | walkdir `follow_links` |
+| `exclude` | `[]` | glob 0.3; match CLI path **or** basename; `*` does not cross `/` |
+| `quiet` / `verbose` / `json_logs` | `false` | stderr behaviour |
+| `jobs` | `1` | `0` = `available_parallelism` |
+| `max_inflight_bytes` | 64 MiB | uncompressed buffers in the hash pipeline |
+
+`DehydrateSummary` mirrors manifest `stats`, plus `output_len` and `signed_jars`.
+
+---
+
+## `RehydrateOptions`
+
+| Field | Default | Notes |
+|-------|---------|--------|
+| `input` | empty (required) | `.ayz` |
+| `dir` | empty (required) | created if missing |
+| `cas_dir` | `None` | tempfile, deleted on success |
+| `keep_cas` | `false` | keep that tempfile |
+| `store_all` | `false` | ZIP STORE instead of DEFLATE |
+| `deflate_level` | `6` | 0..=9 |
+| `clean` | `false` | unlink dest names we will write (not the whole dir) |
+| `overwrite` | `false` | refuse to clobber existing JARs |
+| `only` | `[]` | jar `name`s from the manifest |
+
+---
+
+## Load a YAML job file
+
+There is no YAML parser inside ayzenpack. Job state is yours: a file, a CI secret, a struct. Deserialize it, then fill the options.
+
+Starter: [`examples/ayzenpack.yaml`](../examples/ayzenpack.yaml).
+
+```toml
+# your binary / build tool
+[dependencies]
+ayzenpack = { git = "https://github.com/hilather/ayzenpack" }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+```
+
+```rust
+use std::path::{Path, PathBuf};
+use ayzenpack::{dehydrate, rehydrate, DehydrateOptions, RehydrateOptions};
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct JobFile {
+    dehydrate: DehydrateJob,
+    rehydrate: Option<RehydrateJob>,
+}
+
+#[derive(Deserialize)]
+struct DehydrateJob {
+    output: PathBuf,
+    inputs: Vec<PathBuf>,
+    #[serde(default)]
+    recursive: bool,
+    #[serde(default)]
+    sort_inputs: bool,
+    #[serde(default = "default_level")]
+    level: i32,
+    #[serde(default)]
+    jobs: usize,
+    #[serde(default)]
+    fail_on_signed: bool,
+    #[serde(default)]
+    exclude: Vec<String>,
+    #[serde(default)]
+    write_sidecar_manifest: Option<PathBuf>,
+    #[serde(default)]
+    pretty_manifest: bool,
+}
+
+#[derive(Deserialize)]
+struct RehydrateJob {
+    input: PathBuf,
+    dir: PathBuf,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+fn default_level() -> i32 { 3 }
+
+fn load_dehydrate(path: &Path) -> anyhow::Result<DehydrateOptions> {
+    let job: JobFile = serde_yaml::from_str(&std::fs::read_to_string(path)?)?;
+    let d = job.dehydrate;
+    Ok(DehydrateOptions {
+        output: d.output,
+        inputs: d.inputs,
+        recursive: d.recursive,
+        sort_inputs: d.sort_inputs,
+        level: d.level,
+        jobs: d.jobs,
+        fail_on_signed: d.fail_on_signed,
+        exclude: d.exclude,
+        write_sidecar_manifest: d.write_sidecar_manifest,
+        pretty_manifest: d.pretty_manifest,
+        ..DehydrateOptions::default()
+    })
+}
+
+fn run_job(path: &Path) -> anyhow::Result<()> {
+    let job: JobFile = serde_yaml::from_str(&std::fs::read_to_string(path)?)?;
+    dehydrate(&load_dehydrate(path)?)?;
+    if let Some(r) = job.rehydrate {
+        rehydrate(&RehydrateOptions {
+            input: r.input,
+            dir: r.dir,
+            overwrite: r.overwrite,
+            ..RehydrateOptions::default()
+        })?;
+    }
+    Ok(())
+}
+```
+
+`list()` is the other “state load”: it reads the MANIFEST out of the archive. Use that when the catalog *is* the state, not a YAML file you authored.
+
+```rust
+let manifest = ayzenpack::list(std::path::Path::new("libs.ayz"))?;
+for jar in &manifest.jars {
+    println!("{}  {} entries  signed={}", jar.name, jar.entries.len(), jar.signed);
+}
+```
+
+---
+
+## GitHub Actions
+
+Same options, as workflow YAML rather than a job file:
+
+```yaml
+name: pack-classpath
+on:
+  push:
+    paths: ["vendor/**", "app.jar"]
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install --path .
+      - name: Dehydrate
+        run: |
+          ayzenpack dehydrate -o dist/libs.ayz \
+            --sort-inputs --recursive --jobs 0 \
+            --fail-on-signed \
+            --exclude '*.sources.jar' \
+            --write-sidecar-manifest dist/libs.ayz.manifest.json \
+            --pretty-manifest \
+            vendor/ app.jar
+      - run: ayzenpack verify -i dist/libs.ayz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libs.ayz
+          path: dist/libs.ayz
+```
+
+Rocky RPM install in CI is the other path — see `.github/workflows/packages.yml`.
+
+---
+
+## Errors and exit codes
+
+Library: `AyzenpackError` + `Result<T>`. Operational errors that involve a file include the path.
+
+The **binary** maps those to:
+
+| Code | When |
+|------|------|
+| 0 | ok |
+| 1 | runtime error; also integrity failures on non-`verify` commands |
+| 2 | clap usage |
+| 3 | `verify` only: blob / SHA-256 / CRC / END mismatch |
+
+I/O, `NotAyzenpack`, truncated trailer, and JSON parse on `verify` stay **1**.
