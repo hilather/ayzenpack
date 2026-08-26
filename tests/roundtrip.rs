@@ -409,7 +409,9 @@ fn assert_bit_identical(src: &Path, dest: &Path) {
 }
 
 /// Local + CD header fields for `name`. `assert_functional_identity` skips dirs.
-fn member_local_and_cd(path: &Path, name: &str) -> ((u16, u32, u32, u32), (u16, u32, u32, u32)) {
+type ZipSizes = (u16, u32, u32, u32);
+
+fn member_local_and_cd(path: &Path, name: &str) -> (ZipSizes, ZipSizes) {
     let data = fs::read(path).unwrap();
     let eocd = {
         let mut i = data.len() - 22;
