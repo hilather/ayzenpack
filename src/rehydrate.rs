@@ -203,7 +203,8 @@ fn restore_jars(opts: &RehydrateOptions, manifest: &Manifest, cas_dir: &Path) ->
         .collect();
 
     if opts.restore_paths {
-        for jar in &selected {
+        // Whole pack, not just --only: mixed/old archives must not restore a subset.
+        for jar in &manifest.jars {
             if !matches!(jar.restore_path.as_deref(), Some(p) if !p.is_empty()) {
                 return Err(AyzenpackError::Usage(format!(
                     "pack was not created with --restore-paths ({})",
@@ -276,10 +277,7 @@ fn prepare_restore_dest(dest: &Path) -> Result<()> {
                     dest.display()
                 )));
             }
-            fs::remove_file(dest).map_err(|source| AyzenpackError::Io {
-                source,
-                path: Some(dest.to_path_buf()),
-            })?;
+            remove_restore_dest(dest, &meta)?;
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(source) => {
@@ -290,6 +288,28 @@ fn prepare_restore_dest(dest: &Path) -> Result<()> {
         }
     }
     create_parent_dirs_0755(dest)
+}
+
+fn remove_restore_dest(dest: &Path, meta: &fs::Metadata) -> Result<()> {
+    #[cfg(windows)]
+    {
+        if !meta.file_type().is_symlink() && meta.permissions().readonly() {
+            let mut perms = meta.permissions();
+            perms.set_readonly(false);
+            fs::set_permissions(dest, perms).map_err(|source| AyzenpackError::Io {
+                source,
+                path: Some(dest.to_path_buf()),
+            })?;
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = meta;
+    }
+    fs::remove_file(dest).map_err(|source| AyzenpackError::Io {
+        source,
+        path: Some(dest.to_path_buf()),
+    })
 }
 
 fn create_parent_dirs_0755(dest: &Path) -> Result<()> {
@@ -891,5 +911,42 @@ mod tests {
         assert_eq!(dt.year(), 1980);
         assert_eq!(dt.month(), 1);
         assert_eq!(dt.day(), 1);
+    }
+
+    fn jar_restore(path: &str) -> Jar {
+        Jar {
+            name: "a.jar".into(),
+            source_path: "a.jar".into(),
+            source_size: 0,
+            source_blake3: "00".repeat(32),
+            source_sha256: "00".repeat(32),
+            comment: String::new(),
+            signed: false,
+            restore_path: Some(path.into()),
+            restore_mode: None,
+            restore_uid: None,
+            restore_gid: None,
+            prefix_blob: None,
+            prefix_size: None,
+            tail_blob: None,
+            tail_size: None,
+            raw_zip_blob: None,
+            raw_zip_size: None,
+            entries: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn restore_dest_rejects_relative_and_nul() {
+        let err = restore_dest(&jar_restore("relative/a.jar")).unwrap_err();
+        assert!(
+            matches!(err, AyzenpackError::Usage(ref s) if s.contains("not absolute")),
+            "{err}"
+        );
+        let err = restore_dest(&jar_restore("a.jar")).unwrap_err();
+        assert!(matches!(err, AyzenpackError::Usage(_)), "{err}");
+        let err = restore_dest(&jar_restore("\0/abs.jar")).unwrap_err();
+        assert!(matches!(err, AyzenpackError::UnsafePath(_)), "{err}");
+        restore_dest(&jar_restore("/abs/a.jar")).unwrap();
     }
 }

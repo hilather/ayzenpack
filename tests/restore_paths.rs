@@ -279,6 +279,27 @@ fn restore_paths_wins_over_dir() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn restore_paths_recorded_mode_wins_over_prefix_0755() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("app.jar");
+    fixtures::write_wrapped_jar(&jar, fixtures::SPRING_LAUNCHER, &[("BOOT-INF/x", b"y")]);
+    let mut perms = fs::metadata(&jar).unwrap().permissions();
+    perms.set_mode(0o644);
+    fs::set_permissions(&jar, perms).unwrap();
+    let pack = pack_restore(dir.path(), &jar, "spring.ayz");
+    fs::remove_file(&jar).unwrap();
+    ayzenpack()
+        .args(["rehydrate", "--restore-paths", "-i"])
+        .arg(&pack)
+        .assert()
+        .success();
+    let mode = fs::metadata(&jar).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o644, "recorded mode must win over prefix 0755");
+}
+
 #[test]
 fn dehydrate_without_flag_omits_restore_keys() {
     let dir = tempfile::tempdir().unwrap();

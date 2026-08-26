@@ -147,3 +147,16 @@ Relative `restore_path` is rejected at rehydrate (covers failed canonicalize). N
 - **PR 28**: branch from `main` only.
 
 **Verdict: accept.** No reject-level holes left in the plan. Implement.
+
+---
+
+## Skeptic code review (post-implementation)
+
+Reviewed `src/cli.rs`, `src/dehydrate.rs` (`collect_restore_meta`), `src/rehydrate.rs` (dest/symlink/parents/mode/owner), schema, and `tests/restore_paths.rs`.
+
+Must-fix found and applied:
+
+1. **Pack-level missing metadata.** First draft checked only `--only` selected jars. A mixed/old pack could restore a subset. Now every `jars[]` entry must have a non-empty `restore_path` before any write.
+2. **Windows readonly overwrite.** `remove_file` fails on dest `FILE_ATTRIBUTE_READONLY`. Clear readonly on regular files before unlink.
+
+No remaining reject-level issues. Residual TOCTOU on symlink replace is unchanged from the plan. `cargo +stable test --locked --all-targets` and `cargo +stable clippy --all-targets --locked -- -D warnings` passed.
