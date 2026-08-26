@@ -41,7 +41,7 @@ Crate version **0.1.9**. Manifest `version` stays 1. `examples/tiny.manifest.jso
 
 Codec string (pinned, no negotiation): `deflate-raw:flate2:<level>` where `<level>` is `1`, `6`, or `9` (and `3` only if the GPBF hint selected it and it matched).
 
-`skip_serializing_if = "Option::is_none"`. Schema `entry.properties` lists `cdata_codec` (`type: string`, pattern `^deflate-raw:flate2:[0-9]+$`). `additionalProperties: false` stays. `src/manifest.rs` tests: omit-when-none, field-order after `cdata_blob`, schema contains the key.
+`skip_serializing_if = "Option::is_none"`. Schema `entry.properties` lists `cdata_codec` (`type: string`, pattern `^deflate-raw:flate2:[1369]$`). `additionalProperties: false` stays. Unknown/future codec strings on **read** still deserialize (serde does not enforce the schema); `resolve_cdata` errors `Format` on an unrecognized codec rather than guessing. Update every `Entry { ... }` literal (`sample_file_entry`, `dir_entry_blob_null_roundtrip`, `entry_from_scan`) with `cdata_codec: None`. Extend `exact_fields_omitted_when_none` and `field_order_stable_for_known_struct`.
 
 No jar-level `rebuild` key. Infer restore mode from existing fields (below).
 
@@ -50,23 +50,23 @@ No jar-level `rebuild` key. Infer restore mode from existing fields (below).
 Replace the boolean `exact_restore()` with two helpers used by dehydrate warning + rehydrate dispatch:
 
 1. **`bit_identical_restore()`** — `raw_zip_blob` is set, **or** `tail_blob` is set and every file entry can resolve cdata without rebuilding:
-   - `cdata_blob.is_some()` (old 0.1.6–0.1.8 packs), **or**
+   - `cdata_blob.is_some()` (old 0.1.6–0.1.8 packs; exotic; mixed-unreproducible), **or**
    - `cdata_codec.is_some()`, **or**
    - `method_code == 0` (STORE; use content `blob`), **or**
-   - `is_dir` (empty cdata)
-2. **`metadata_rebuild()`** — `tail_blob` is set, `raw_zip_blob` is absent, and some file entry is DEFLATE/`other` without `cdata_blob` and without `cdata_codec`.
+   - `is_dir` and no payload (`cdata_blob` absent ⇒ empty cdata)
+2. **`metadata_rebuild()`** — `tail_blob` is set, `raw_zip_blob` is absent, and some file entry cannot resolve via (1) (DEFLATE without `cdata_blob`/`cdata_codec`, i.e. a clean miss jar). A jar that also had unreproducible entries is **not** in this class (dehydrate stored `cdata_blob` on every non-STORE file so (1) holds).
 3. **Else** — old 0.1.4/0.1.5 content archive → existing `write_jar` / `ZipWriter`.
 
 `exact_restore()` becomes `bit_identical_restore()` (keep the name as a thin wrapper) so the signed warning `signed && !exact_restore()` already says **rebuild will break the signature** for metadata-rebuild jars. `raw_zip` and codec-hit / STORE / old-cdata packs stay “signed JAR” only.
 
 **Resolution order for one entry’s payload bytes** (must match the request):
 
-1. `cdata_blob` if present (old packs; also exotic methods)
+1. `cdata_blob` if present (old packs; also exotic / mixed-unreproducible jars)
 2. else `cdata_codec` → load content `blob`, raw-deflate at the recorded level, compare length to `compressed_size`; mismatch is `HashMismatch`
 3. else STORE (`method_code == 0`) or empty dir → content `blob` or `[]`
-4. else rebuild fields (jar-level metadata rebuild)
+4. else rebuild fields (jar-level metadata rebuild only)
 
-If **any** file entry on a sliced jar is a codec miss, the **whole jar** is metadata-rebuild (one changed compressed size invalidates later `local_header_offset`s and the tail). On miss, do **not** store `cdata_codec` on the hits either — one canonical rebuild encoder for the jar.
+A **clean** deflate miss (no unreproducible siblings) still rebuilds the **whole** jar: one changed compressed size invalidates later `local_header_offset`s and the tail. On that class, do **not** store `cdata_codec` on the hits either — one canonical rebuild encoder for the jar. A miss **plus** an unreproducible sibling is not this class (see dehydrate table).
 
 ## Dehydrate (`fill_exact_entry` / `attach_exact`)
 
@@ -74,14 +74,26 @@ If **any** file entry on a sliced jar is a codec miss, the **whole jar** is meta
 
 For each sliced local, still record `local_header_*`, `data_descriptor_hex`, `pad_*`, `local_header_offset` (needed for exact splice **and** rebuild patching).
 
-**Do not** `remember_blob(local.cdata)` except:
+`attach_exact` is **two-pass** over the sliced locals (today’s `fill_exact_entry` is one-pass and `remember_blob` writes the zstd stream, which cannot be undone). Pass 1 classifies every local; pass 2 writes fields / CAS puts.
 
-| Entry | Action |
-|---|---|
-| dir with empty cdata | no `cdata_blob`, no codec (today’s skip) |
-| STORE (`method_code == 0`) | omit `cdata_blob`; rehydrate uses `blob` |
-| DEFLATE (`method_code == 8`) | inflate `local.cdata`; trial-encode; on hit set `cdata_codec` only; on miss set neither |
-| `other` / inflate failure | **keep `cdata_blob`** for that entry so we do not invent a bitstream we cannot reproduce. If any entry on the jar is `other`/uninflateable, that jar stays bit-identical (has `cdata_blob`) and is **not** mixed into metadata-rebuild. |
+**Jar-wide policy after pass 1** (picks one mechanism so inference and restore cannot disagree):
+
+Let `unreproducible` = any file entry that is `method_code` not in `{0, 8}`, or whose `cdata` fails raw-inflate, or is a directory with **non-empty** cdata (today’s `!is_dir || !cdata.is_empty()` put; do not treat that as empty).
+
+Let `deflate_miss` = any `method_code == 8` file whose trial-encode does not match.
+
+| Jar class | Store | Restore path |
+|---|---|---|
+| no `deflate_miss`, no `unreproducible` | STORE: nothing extra. DEFLATE hit: `cdata_codec` only. empty dir: nothing. | `bit_identical_restore` |
+| no `deflate_miss`, some `unreproducible` | `cdata_blob` **only** on unreproducible file/dir-with-cdata entries. Hits still `cdata_codec`. STORE uses `blob`. | `bit_identical_restore` (every file resolves) |
+| `deflate_miss`, no `unreproducible` | **no** `cdata_blob`, **no** `cdata_codec` (strip hits too). Tail + local headers kept. **Not** `raw_zip`. | `metadata_rebuild` |
+| `deflate_miss` **and** `unreproducible` | **`cdata_blob` for every non-STORE file entry** (hits, misses, and exotic). No `cdata_codec`. | `bit_identical_restore`. **Never** metadata-rebuild a jar that has an unreproducible entry — rebuild’s encoder is only STORE or `deflate_raw(..., 6)` and must not invent method-8 bytes for LZMA/XZ/`Unsupported`. |
+
+`write_rebuilt_jar` is therefore only entered when every file is STORE or DEFLATE. It never sees `cdata_blob` and never re-encodes `other`.
+
+Pass 2 `remember_blob(local.cdata)` **only** when the jar class says that entry gets `cdata_blob`.
+
+Trial-encode: `inflate_raw(local.cdata)` then re-encode. After inflate, check `len == entry.uncompressed_size` and `crc32fast(plain) == entry.crc32` before claiming a hit; on mismatch treat as `unreproducible` (keep `cdata_blob` for that entry / jar class above). Rehydrate encodes the CAS content `blob`, not a second inflate.
 
 Trial order (deterministic, first match wins):
 
@@ -90,9 +102,9 @@ Trial order (deterministic, first match wins):
 
 Encoder: `flate2::write::DeflateEncoder` + `Compression::new(level)` into a `Vec` (raw deflate, not zlib/gzip). Hit = byte-for-byte equality with `local.cdata`.
 
-On a jar-wide miss (any DEFLATE entry failed the trial and was not `other`):
+On the clean-miss class (`deflate_miss`, no `unreproducible`):
 
-- leave those entries without `cdata_blob` / `cdata_codec`
+- leave every entry without `cdata_blob` / `cdata_codec`
 - still store tail + local headers
 - do **not** write `raw_zip`
 - `source_blake3` / `source_sha256` / `source_size` stay the **original file** hashes/size (do not overwrite with a rebuilt file)
@@ -135,9 +147,9 @@ Canonical miss encoder: `deflate-raw:flate2:6` for every `method_code == 8` file
 
 1. Load original local header (`hex` or blob).
 2. New cdata = STORE/`dir` ? content-or-empty : `deflate_raw(content, 6)`.
-3. Patch sizes in the local header **in place**:
+3. Patch sizes in the local header **in place**. Zip64 extra layout follows **32-bit sentinels**, not “tag 0x0001 exists” (`src/exact.rs` `resolve_cd_zip64`: consume uncomp/comp/offset from the extra **only** when the corresponding 32-bit field is `u32::MAX`). An uncomp-only extra is 8 bytes; treating it as if it also has a comp slot would overwrite uncompressed size.
    - GPBF bit 3 set: leave the three local size fields as they were (usually 0 / Zip64 sentinels); patch the data descriptor’s compressed-size field (u32 or u64 depending on original descriptor length 12/16/20/24, same layout `split_descriptor` already understands).
-   - else: write `compressed_size` at local +18 (u32, or `0xFFFFFFFF` if a Zip64 extra already carries the 64-bit size) and patch the Zip64 extra payload’s compressed-size slot (APPNOTE order: uncomp, comp, … only the fields that were present).
+   - else: write `compressed_size` at local +18 (u32, or `0xFFFFFFFF` when the 32-bit field was already `u32::MAX` and a Zip64 extra carries the 64-bit comp). Patch only the extra slots that those sentinels imply.
 4. If the new compressed size **does not fit the original Zip64 layout** (32-bit fields, no extra, size ≥ 4 GiB — should not happen for class files): error `Format` with the jar/entry name rather than silently emitting a corrupt ZIP. Do not insert new extra fields (that would change header length and every later offset, and CD extra size).
 5. Drop original `pad_*` on rebuild (pads were alignment to the *old* next local).
 6. Track running zip-relative write offset.
@@ -167,7 +179,7 @@ New / updated in `tests/roundtrip.rs` (and manifest unit tests):
 
 1. **STORE uses content blob, no second object.** Stored fixture: every file entry has `cdata_blob.is_none()`, `cdata_codec.is_none()`, and `blob` equals the only payload CAS id. `blobs[].ref_count` is not doubled for cdata. Bit-identical restore.
 2. **Codec hit is bit-identical.** `write_jar` / mixed stored+deflated / Spring / zip-A / Zip64 / data-descriptor (STORE) / zipalign (STORE) fixtures already in this file must still `assert_bit_identical`. Manifest shows `cdata_codec` on deflated file entries and **no** `cdata_blob`. `source_*` verify stays.
-3. **Codec miss rebuilds a valid ZIP.** Hand-built ZIP whose DEFLATE cdata is a raw stored-block (`01` + len + `~len` + payload) so miniz_oxide levels 1/3/6/9 cannot match. After pack: no `cdata_blob`, no `cdata_codec`, no `raw_zip_*`, `tail_blob` present. Rehydrate: `ZipArchive` opens; names/order/uncompressed bytes match; file bytes ≠ source; pack `output_len` and `bytes_unique_blobs` are not ~1:1 with the jar size (unique blobs ≈ uncompressed entries + small headers/tail).
+3. **Codec miss rebuilds a valid ZIP.** Hand-built ZIP whose DEFLATE cdata is a raw stored-block (`01` + len + `~len` + payload) over a **compressible** payload (e.g. 256+ bytes of `0x61`). miniz_oxide level 1 can emit a stored-block for short/incompressible input — do not use `"hi"`. After pack: no `cdata_blob`, no `cdata_codec`, no `raw_zip_*`, `tail_blob` present. Rehydrate: `ZipArchive` opens; names/order/uncompressed bytes match; file bytes ≠ source; pack `output_len` and `bytes_unique_blobs` are not ~1:1 with the jar size (unique blobs ≈ uncompressed entries + small headers/tail). Add one miss+prefix (short shebang + stored-block DEFLATE) so rebuild offset-mode / EOCD patch is exercised in default `cargo test`, not only on the Maven corpus.
 4. **Old-style `cdata_blob` fixture.** Craft a pack with `format::write_ayz_file`: content blob + **separate** cdata blob + tail + local header hex + `cdata_blob` set, `cdata_codec` absent. Rehydrate is bit-identical. (Also keep a swapped-`cdata_blob` hash-fail test by crafting, not by dehydrating a new pack.)
 5. **Prefix / Spring / zip-A / Zip64** existing tests stay bit-identical (zip-crate deflate → codec hit).
 6. **Signed + rebuild:** miss-style signed-looking jar warns `rebuild will break the signature` (stderr or `signed && !exact_restore()`). Codec-hit signed fixture stays bit-identical and does **not** use that warning.
@@ -181,10 +193,17 @@ New / updated in `tests/roundtrip.rs` (and manifest unit tests):
 
 ## Docs
 
-- `DESIGN.md`: reconstruction is metadata-only by default; `cdata_blob` is legacy / exotic; `cdata_codec`; miss = rebuild, **do not** claim `source_blake3` match; `tool_version` example `0.1.9`; memory line no longer says peak includes a `cdata` copy for new packs.
+- `DESIGN.md`: reconstruction is metadata-only by default; `cdata_blob` is legacy / exotic; `cdata_codec`; miss = rebuild, **do not** claim `source_blake3` match; `tool_version` example `0.1.9`; memory line no longer says peak includes a `cdata` copy for new packs. Also fix the Non-goals bullet that says new packs are already bit-identical / `--verbatim` is unnecessary (`DESIGN.md` ~279) and the Reconstruction opener (`DESIGN.md` ~159, `src/rehydrate.rs` module docs).
 - `README.md` Reconstruction guarantee: same facts. No new CLI flag table row.
 - `docs/library.md` only if it describes exact/cdata storage (it currently does not).
+- `tests/bench.rs` comment that assumes `cdata == blob` if it would fail compile or assert.
 - Schema as above.
+
+Reuse `split_descriptor` / `resolve_cd_zip64` / Zip64 locator-before-EOCD logic via `pub(crate)` (or move them next to the rebuild writer). Do not duplicate the locator rule in `rehydrate.rs`.
+
+`flate2 = "=1.1.9"` with **default features only** (`rust_backend` / miniz_oxide). Do not enable `zlib` / `zlib-ng`.
+
+Land `fill_exact_entry` (stop putting cdata) and `resolve_cdata` **in the same commit** so STORE/deflate exact restore is never “empty cdata” mid-change.
 
 ## Corpus (after implementation, not in default `cargo test`)
 
@@ -213,10 +232,10 @@ Existing `tests/corpus.rs` overlap tests (env-gated) should still pass; update a
 
 ## Implementation order
 
-1. `flate2 = "=1.1.9"` in `Cargo.toml`; `cdata_codec` + schema + manifest tests; crate `0.1.9`.
+1. `flate2 = "=1.1.9"` (default features) in `Cargo.toml`; `cdata_codec` + schema + manifest tests; crate `0.1.9`.
 2. `deflate_raw` / `inflate_raw` / GPBF hint helper (unit-tested) in a small module (`src/deflate.rs` or `exact.rs`).
-3. Change `fill_exact_entry` (no default cdata put; trial; other-method escape).
-4. `resolve_cdata` + exact path; then `write_rebuilt_jar` + dispatch + signed warning.
+3. Two-pass `attach_exact` + `resolve_cdata` + exact path **together** (no default cdata put).
+4. `write_rebuilt_jar` + dispatch + signed warning. `pub(crate)` the zip64/descriptor helpers.
 5. Tests + docs.
 6. `cargo test`, `cargo clippy -D warnings`.
 7. Download corpus; measure; put numbers in the PR.
