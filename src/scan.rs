@@ -673,6 +673,29 @@ pub(crate) fn find_cd_bounds(
     }
 }
 
+/// 0.2.1 `find_cd_bounds`: Zip64 only when classic EOCD fields are sentinels.
+/// rust zip `large_file` writes a Zip64 footer while leaving a 32-bit CD offset
+/// / entry count, so `eocd - cd_size` lands in that footer. That is the listed-jar
+/// `ZipExact::Raw` path this crate must not take anymore.
+#[cfg(test)]
+pub(crate) fn find_cd_bounds_v0_2_1(
+    path: &Path,
+    file: &mut (impl Read + Seek),
+    file_len: u64,
+) -> Result<(u64, u64, u64, u64)> {
+    let (eocd_off, cd_size32, cd_off32, entries16) = find_eocd(path, file, file_len)?;
+    let zip64 = cd_size32 == u32::MAX || cd_off32 == u32::MAX || entries16 == u16::MAX;
+    if !zip64 {
+        return Ok((
+            eocd_off,
+            u64::from(cd_size32),
+            u64::from(cd_off32),
+            u64::from(entries16),
+        ));
+    }
+    find_zip64_cd_bounds(path, file, eocd_off)
+}
+
 pub(crate) fn find_eocd(
     path: &Path,
     file: &mut (impl Read + Seek),

@@ -95,6 +95,59 @@ fn wrapped_zip64_bytes(launcher: &[u8], files: &[(&str, &[u8])]) -> Vec<u8> {
     out
 }
 
+/// Official launch.script + Zip64 outer + `zip -A` + several fat `BOOT-INF/lib`
+/// members (STORE). Listable on 0.2.1; homemade `find_cd_bounds` there missed
+/// the Zip64 locator (classic EOCD fields are not sentinels) → `ZipExact::Raw`.
+pub fn write_fat_spring_zip64_zipa_jar(path: &Path) {
+    use std::io::Cursor;
+    let launcher = spring_boot_launch_script();
+    let nested: Vec<Vec<u8>> = (0..4)
+        .map(|i| inner_incompressible_jar(i, 128 * 1024))
+        .collect();
+    let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+    z.set_zip64_comment(Some(""));
+    // DEFLATE nested libs so zip -A + ZipView(prefix) cannot latch onto an
+    // inner jar's CD (STORE nested PK\x01\x02 at a wrong seek). Payloads stay
+    // large because the inner jars are incompressible.
+    let opts = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .large_file(true);
+    z.start_file("App.class", opts).unwrap();
+    z.write_all(b"class-bytes-outer").unwrap();
+    z.start_file("BOOT-INF/classes/application.properties", opts)
+        .unwrap();
+    z.write_all(b"x=1\n").unwrap();
+    for (i, lib) in nested.iter().enumerate() {
+        let name = format!("BOOT-INF/lib/lib{i}.jar");
+        z.start_file(&name, opts).unwrap();
+        z.write_all(lib).unwrap();
+    }
+    let zip = z.finish().unwrap().into_inner();
+    assert!(
+        zip.windows(4).any(|w| w == b"PK\x06\x06"),
+        "outer must be Zip64"
+    );
+    std::fs::write(path, prepend_launcher(&zip, launcher, true)).unwrap();
+}
+
+fn inner_incompressible_jar(i: usize, nbytes: usize) -> Vec<u8> {
+    use std::io::Cursor;
+    let mut payload = vec![0u8; nbytes];
+    let mut x: u32 = 0xA5A5_0000 ^ (i as u32).wrapping_mul(0x9E37);
+    for b in &mut payload {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *b = (x >> 16) as u8;
+    }
+    let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    z.start_file("META-INF/MANIFEST.MF", opts).unwrap();
+    z.write_all(b"Manifest-Version: 1.0\n").unwrap();
+    let class = format!("com/Lib{i}.class");
+    z.start_file(&class, opts).unwrap();
+    z.write_all(&payload).unwrap();
+    z.finish().unwrap().into_inner()
+}
+
 /// Prepend `launcher` to an existing ZIP/JAR. `zip_a` applies Info-ZIP `zip -A`
 /// (classic u32 CD/EOCD only — do not use on Zip64).
 pub fn prepend_launcher(zip: &[u8], launcher: &[u8], zip_a: bool) -> Vec<u8> {
