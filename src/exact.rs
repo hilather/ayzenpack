@@ -513,13 +513,17 @@ pub(crate) fn patch_central_directory(
                 "{jar_name}: CD record {idx} truncated"
             )));
         }
-        let comp32 = u32::from_le_bytes(tail[i + 20..i + 24].try_into().unwrap());
-        let uncomp32 = u32::from_le_bytes(tail[i + 24..i + 28].try_into().unwrap());
-        let off32 = u32::from_le_bytes(tail[i + 42..i + 46].try_into().unwrap());
+        let extra_start = 46 + name_len;
+        let rec = &mut tail[i..rec_end];
+        let comp32 = u32::from_le_bytes(rec[20..24].try_into().unwrap());
+        let uncomp32 = u32::from_le_bytes(rec[24..28].try_into().unwrap());
+        let off32 = u32::from_le_bytes(rec[42..46].try_into().unwrap());
         let new_off = encode_offset(mode, new_zip_rel, prefix_len);
+        let (head, rest) = rec.split_at_mut(extra_start);
+        let extra = &mut rest[..extra_len];
         patch_size32_or_zip64(
-            &mut tail[i + 20..i + 24],
-            &mut tail[i + 46 + name_len..i + 46 + name_len + extra_len],
+            &mut head[20..24],
+            extra,
             uncomp32,
             comp32,
             new_csize,
@@ -527,8 +531,8 @@ pub(crate) fn patch_central_directory(
             jar_name,
         )?;
         patch_offset32_or_zip64(
-            &mut tail[i + 42..i + 46],
-            &mut tail[i + 46 + name_len..i + 46 + name_len + extra_len],
+            &mut head[42..46],
+            extra,
             uncomp32,
             comp32,
             off32,

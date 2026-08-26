@@ -1317,6 +1317,110 @@ mod tests {
     use super::*;
 
     #[test]
+    fn jar_store_policy_covers_all_four_classes() {
+        assert_eq!(
+            jar_store_policy(&[LocalClass::Store, LocalClass::DeflateHit(6)]),
+            StorePolicy::CleanExact
+        );
+        assert_eq!(
+            jar_store_policy(&[LocalClass::DeflateHit(6), LocalClass::Unreproducible]),
+            StorePolicy::ExactWithExotic
+        );
+        assert_eq!(
+            jar_store_policy(&[LocalClass::DeflateHit(6), LocalClass::DeflateMiss]),
+            StorePolicy::CleanMiss
+        );
+        assert_eq!(
+            jar_store_policy(&[LocalClass::DeflateMiss, LocalClass::Unreproducible]),
+            StorePolicy::MixedExact
+        );
+    }
+
+    #[test]
+    fn classify_dir_with_cdata_is_unreproducible() {
+        let entry = Entry {
+            name: "d/".into(),
+            is_dir: true,
+            blob: None,
+            sha256: None,
+            crc32: 0,
+            method: "stored".into(),
+            method_code: 0,
+            uncompressed_size: 4,
+            compressed_size: 4,
+            dos_date: 0,
+            dos_time: 0,
+            unix_mode: None,
+            utf8_flag: true,
+            name_raw_hex: None,
+            cdata_blob: None,
+            cdata_codec: None,
+            local_header_offset: None,
+            local_header_hex: None,
+            local_header_blob: None,
+            data_descriptor_hex: None,
+            pad_zeros: None,
+            pad_blob: None,
+        };
+        let local = ExactLocal {
+            zip_rel_offset: 0,
+            header: vec![0; 30],
+            cdata: b"deco".to_vec(),
+            descriptor: None,
+            pad: Vec::new(),
+        };
+        assert_eq!(classify_local(&entry, &local), LocalClass::Unreproducible);
+    }
+
+    #[test]
+    fn classify_stored_block_deflate_is_miss() {
+        let plain = vec![b'a'; 256];
+        let cdata = {
+            let len = u16::try_from(plain.len()).unwrap();
+            let mut out = vec![0x01];
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(!len).to_le_bytes());
+            out.extend_from_slice(&plain);
+            out
+        };
+        let mut header = vec![0u8; 30];
+        header[0..4].copy_from_slice(b"PK\x03\x04");
+        header[8..10].copy_from_slice(&8u16.to_le_bytes());
+        let entry = Entry {
+            name: "a.txt".into(),
+            is_dir: false,
+            blob: Some("unused".into()),
+            sha256: None,
+            crc32: crc32fast::hash(&plain),
+            method: "deflated".into(),
+            method_code: 8,
+            uncompressed_size: plain.len() as u64,
+            compressed_size: cdata.len() as u64,
+            dos_date: 0,
+            dos_time: 0,
+            unix_mode: None,
+            utf8_flag: true,
+            name_raw_hex: None,
+            cdata_blob: None,
+            cdata_codec: None,
+            local_header_offset: None,
+            local_header_hex: None,
+            local_header_blob: None,
+            data_descriptor_hex: None,
+            pad_zeros: None,
+            pad_blob: None,
+        };
+        let local = ExactLocal {
+            zip_rel_offset: 0,
+            header,
+            cdata,
+            descriptor: None,
+            pad: Vec::new(),
+        };
+        assert_eq!(classify_local(&entry, &local), LocalClass::DeflateMiss);
+    }
+
+    #[test]
     fn unique_basename_collides_to_underscore_n() {
         let mut used = HashMap::new();
         assert_eq!(

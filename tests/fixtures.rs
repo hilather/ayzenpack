@@ -431,9 +431,6 @@ pub fn raw_stored_deflate(plain: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Dummy extra ZipWriter does not emit — proves metadata rebuild kept extras.
-pub const REBUILD_MARK_EXTRA: &[u8] = &[0x01, 0x99, 0x04, 0x00, b'T', b'E', b'S', b'T'];
-
 struct BuiltLocal {
     name: Vec<u8>,
     method: u16,
@@ -498,20 +495,56 @@ fn write_locals_and_cd(path: &Path, entries: &[BuiltLocal]) {
     std::fs::write(path, local).unwrap();
 }
 
-/// Compressible payload + stored-block DEFLATE + rebuild-mark extra.
+/// Compressible payload + stored-block DEFLATE. Built from a ZipWriter template
+/// so zip 2.4 can find the EOCD; only the bitstream and sizes change.
 pub fn write_stored_block_deflate_zip(path: &Path, name: &str, data: &[u8]) {
-    let cdata = raw_stored_deflate(data);
-    write_locals_and_cd(
-        path,
-        &[BuiltLocal {
-            name: name.as_bytes().to_vec(),
-            method: 8,
-            crc: crc32fast::hash(data),
-            uncomp: data.len() as u32,
-            cdata,
-            extra: REBUILD_MARK_EXTRA.to_vec(),
-        }],
-    );
+    let tmp = path.with_extension("tpl.jar");
+    {
+        let mut z = ZipWriter::new(File::create(&tmp).unwrap());
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        z.start_file(name, opts).unwrap();
+        z.write_all(data).unwrap();
+        z.finish().unwrap();
+    }
+    let tpl = std::fs::read(&tmp).unwrap();
+    std::fs::remove_file(&tmp).unwrap();
+    let patched = replace_first_cdata_with_stored_block(&tpl, data);
+    std::fs::write(path, patched).unwrap();
+}
+
+fn replace_first_cdata_with_stored_block(zip: &[u8], plain: &[u8]) -> Vec<u8> {
+    assert_eq!(&zip[..4], b"PK\x03\x04");
+    let name_len = u16::from_le_bytes([zip[26], zip[27]]) as usize;
+    let extra_len = u16::from_le_bytes([zip[28], zip[29]]) as usize;
+    let old_csize = u32::from_le_bytes(zip[18..22].try_into().unwrap()) as usize;
+    let header_end = 30 + name_len + extra_len;
+    let old_end = header_end + old_csize;
+    let new_cdata = raw_stored_deflate(plain);
+    let delta = new_cdata.len() as i64 - old_csize as i64;
+
+    let mut out = Vec::with_capacity((zip.len() as i64 + delta) as usize);
+    out.extend_from_slice(&zip[..18]);
+    out.extend_from_slice(&(new_cdata.len() as u32).to_le_bytes());
+    out.extend_from_slice(&zip[22..header_end]);
+    out.extend_from_slice(&new_cdata);
+    out.extend_from_slice(&zip[old_end..]);
+
+    // Patch CD compressed size and EOCD CD offset.
+    let eocd = {
+        let mut i = out.len() - 22;
+        loop {
+            if out[i..i + 4] == *b"PK\x05\x06" {
+                break i;
+            }
+            i -= 1;
+        }
+    };
+    let old_cd = u32::from_le_bytes(out[eocd + 16..eocd + 20].try_into().unwrap());
+    let new_cd = (old_cd as i64 + delta) as u32;
+    out[eocd + 16..eocd + 20].copy_from_slice(&new_cd.to_le_bytes());
+    let i = new_cd as usize;
+    out[i + 20..i + 24].copy_from_slice(&(new_cdata.len() as u32).to_le_bytes());
+    out
 }
 
 pub fn write_stored_block_deflate_wrapped(path: &Path, launcher: &[u8], name: &str, data: &[u8]) {

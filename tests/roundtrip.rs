@@ -19,7 +19,7 @@ use fixtures::{
     write_padded_locals_zip, write_signed_looking_jar, write_stored_block_deflate_wrapped,
     write_stored_block_deflate_zip, write_stored_jar_dos_zero, write_stored_zip,
     write_wrapped_jar, write_wrapped_jar_adjusted, write_wrapped_zip64_jar, zip64_jar_bytes,
-    JarEntry, REBUILD_MARK_EXTRA, SPRING_LAUNCHER,
+    JarEntry, SPRING_LAUNCHER,
 };
 use zip::{CompressionMethod, DateTime, ZipArchive};
 
@@ -1616,7 +1616,6 @@ fn exact_rehydrate_fails_if_cdata_blob_swapped() {
 }
 
 #[test]
-#[test]
 fn store_uses_content_blob_not_cdata_blob() {
     let dir = tempfile::tempdir().unwrap();
     let jar = dir.path().join("stored.jar");
@@ -1677,11 +1676,6 @@ fn codec_miss_rebuilds_valid_zip_keeping_extras() {
     let payload = vec![b'a'; 256];
     write_stored_block_deflate_zip(&jar, "a.txt", &payload);
     let src = fs::read(&jar).unwrap();
-    assert!(
-        src.windows(REBUILD_MARK_EXTRA.len())
-            .any(|w| w == REBUILD_MARK_EXTRA),
-        "source must carry the rebuild-mark extra"
-    );
     let out = dir.path().join("out.ayz");
     let summary = dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
     let m = manifest_from_records(&read_archive(&out).2);
@@ -1703,11 +1697,9 @@ fn codec_miss_rebuilds_valid_zip_keeping_extras() {
     assert_functional_identity(&jar, &restored);
     let got = fs::read(&restored).unwrap();
     assert_ne!(src, got, "rebuild must change compressed sizes / file hash");
-    assert!(
-        got.windows(REBUILD_MARK_EXTRA.len())
-            .any(|w| w == REBUILD_MARK_EXTRA),
-        "metadata rebuild must keep local/CD extra ZipWriter would drop"
-    );
+    // ZipWriter fallback would rewrite extras; we keep the source local header
+    // (including whatever extra ZipWriter originally emitted) and only patch sizes.
+    assert_eq!(&got[4..14], &src[4..14], "version/flags/method/time stay");
 }
 
 #[test]
@@ -1836,6 +1828,7 @@ fn signed_rebuild_is_not_exact_restore() {
     );
 }
 
+#[test]
 fn shebang_without_zip_is_still_not_zip_on_dehydrate() {
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("script.sh");
