@@ -8,7 +8,9 @@ use std::path::Path;
 
 use assert_cmd::Command;
 use ayzenpack::error::AyzenpackError;
-use ayzenpack::format::{read_ayz_file, write_ayz_file, Record};
+use ayzenpack::format::{
+    open_ayz_layout, read_ayz_file, read_toc_at, write_ayz_file, write_ayz_file_v1, Record,
+};
 use ayzenpack::{dehydrate, list, rehydrate, verify, DehydrateOptions, RehydrateOptions};
 use fixtures::{write_jar, write_stored_zip, write_wrapped_jar, SPRING_LAUNCHER};
 use predicates::prelude::*;
@@ -289,4 +291,160 @@ fn crc_mismatch_warns_or_strict_errors() {
             );
         }
     }
+}
+
+fn patch_trailer_toc_len(path: &Path, toc_len: u64) {
+    let mut bytes = fs::read(path).unwrap();
+    let n = bytes.len();
+    assert!(n >= 64);
+    bytes[n - 8..n].copy_from_slice(&toc_len.to_le_bytes());
+    fs::write(path, bytes).unwrap();
+}
+
+fn patch_trailer_version(path: &Path, version: u32) {
+    let mut bytes = fs::read(path).unwrap();
+    let n = bytes.len();
+    bytes[n - 12..n - 8].copy_from_slice(&version.to_le_bytes());
+    fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn toc_len_corrupt_truncated_too_big_v2_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = pack_hello(dir.path());
+    let orig = fs::read(&out).unwrap();
+    let (_, trailer, _) = {
+        let mut f = File::open(&out).unwrap();
+        read_ayz_file(&mut f).unwrap()
+    };
+    assert_eq!(trailer.version, 2);
+    assert!(trailer.toc_len >= 28);
+
+    let truncated = dir.path().join("trunc-toc.ayz");
+    let keep = orig.len() - trailer.toc_len as usize + 10;
+    fs::write(&truncated, &orig[..keep]).unwrap();
+    let err = list(&truncated).unwrap_err();
+    assert!(
+        matches!(err, AyzenpackError::Format(_))
+            || err.to_string().contains("toc")
+            || err.to_string().contains("truncated"),
+        "truncated TOC must fail, got {err:?}"
+    );
+
+    let too_big = dir.path().join("big-toc.ayz");
+    fs::write(&too_big, &orig).unwrap();
+    patch_trailer_toc_len(&too_big, trailer.toc_len + 4096);
+    let err = verify(&too_big).unwrap_err();
+    assert!(
+        matches!(err, AyzenpackError::Format("toc_len mismatch"))
+            || err.to_string().contains("toc"),
+        "toc_len too big must fail, got {err:?}"
+    );
+
+    let zero = dir.path().join("zero-toc.ayz");
+    // Drop TOC bytes so expected_toc is 0, then set trailer.toc_len=0 to hit the v2 arm.
+    let header_total = 12 + trailer.header_len as usize;
+    let payload = trailer.payload_bytes as usize;
+    let mut stripped = orig[..header_total + payload].to_vec();
+    stripped.extend_from_slice(&orig[orig.len() - 64..]);
+    fs::write(&zero, &stripped).unwrap();
+    patch_trailer_toc_len(&zero, 0);
+    let err = list(&zero).unwrap_err();
+    assert!(
+        matches!(err, AyzenpackError::Format("v2 toc_len must not be 0")),
+        "v2 toc_len=0 with matching geometry must fail that arm, got {err:?}"
+    );
+}
+
+#[test]
+fn v1_toc_len_nonzero_is_corrupt() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = pack_hello(dir.path());
+    let mut f = File::open(&out).unwrap();
+    let (mut header, trailer, records) = read_ayz_file(&mut f).unwrap();
+    drop(f);
+    header.version = 1;
+    let v1 = dir.path().join("v1.ayz");
+    let mut w = File::create(&v1).unwrap();
+    write_ayz_file_v1(&mut w, &header, &records, trailer.jar_count).unwrap();
+    drop(w);
+    patch_trailer_toc_len(&v1, 28);
+    let err = list(&v1).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AyzenpackError::Format("toc_len mismatch")
+                | AyzenpackError::Format("v1 toc_len must be 0")
+        ) || err.to_string().contains("toc"),
+        "v1 toc_len≠0 must fail, got {err:?}"
+    );
+}
+
+#[test]
+fn magic_json_trailer_version_skew() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = pack_hello(dir.path());
+    let dest = dir.path().join("skew.ayz");
+    fs::copy(&out, &dest).unwrap();
+    patch_trailer_version(&dest, 1);
+    let err = verify(&dest).unwrap_err();
+    assert!(
+        matches!(err, AyzenpackError::VersionSkew { .. }),
+        "header v2 / trailer v1 must be VersionSkew, got {err:?}"
+    );
+    assert!(!err.to_string().contains("not an ayzenpack"));
+}
+
+#[test]
+fn list_v2_uses_last_frame_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = pack_hello(dir.path());
+    let mut f = File::open(&out).unwrap();
+    let (header, trailer, _) = read_ayz_file(&mut f).unwrap();
+    drop(f);
+    let header_total = 12 + u64::from(trailer.header_len);
+    assert_eq!(header.version, 2);
+    let mut bytes = fs::read(&out).unwrap();
+    let first_zstd = header_total as usize;
+    assert!(first_zstd < bytes.len());
+    bytes[first_zstd] ^= 0xff;
+    fs::write(&out, &bytes).unwrap();
+    let m = list(&out).unwrap();
+    assert_eq!(m.jars[0].name, "a.jar");
+    assert!(verify(&out).is_err(), "corrupt blob frame must fail verify");
+}
+
+#[test]
+fn v1_pack_still_rehydrates() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("a.jar");
+    write_jar(&jar, &[("x.txt", b"hello")]);
+    let v2 = dir.path().join("v2.ayz");
+    dehydrate(&opts(&v2, vec![jar.clone()])).unwrap();
+    let mut f = File::open(&v2).unwrap();
+    let (mut header, trailer, records) = read_ayz_file(&mut f).unwrap();
+    drop(f);
+    header.version = 1;
+    let v1 = dir.path().join("v1.ayz");
+    let mut w = File::create(&v1).unwrap();
+    write_ayz_file_v1(&mut w, &header, &records, trailer.jar_count).unwrap();
+    drop(w);
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&v1, &dest)).unwrap();
+    assert_eq!(
+        fs::read(dest.join("a.jar")).unwrap(),
+        fs::read(&jar).unwrap()
+    );
+    list(&v1).unwrap();
+    verify(&v1).unwrap();
+}
+
+#[test]
+fn trailer_toc_len_not_copied_from_manifest_len() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = pack_hello(dir.path());
+    let mut f = File::open(&out).unwrap();
+    let layout = open_ayz_layout(&mut f).unwrap();
+    let toc = read_toc_at(&mut f, &layout).unwrap();
+    assert_ne!(toc.manifest_zstd_len, layout.trailer.manifest_len);
 }

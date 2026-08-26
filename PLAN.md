@@ -1,298 +1,136 @@
-# PLAN: metadata-only exact packs (v0.1.9)
+# PLAN: ayzenpack crate 0.2.0 / format v2
 
-Base: current `main` at v0.1.8 (`374ed67`). Branch `cursor/metadata-only-exact-1c0c`. Do not tag. Do not merge.
+Base: `cursor/metadata-only-exact-1c0c` (PR #30, v0.1.9 metadata-only exact). Branch `cursor/format-v2-0-2-0-1cf2`. Do not push onto #30. Do not overwrite #30 `PLAN.md` on that branch. Do not merge. Do not tag.
 
-Origin `matt-brewer/agent-skills` is not reachable (`origin` CLI unauthenticated; clones of `origin.cursor.com/matt-brewer/agent-skills` and `cursor.com/codebase/matt-brewer/agent-skills` failed). This file is the required written plan. Skeptic loops use fresh Task subagents with the verbatim prompts from the request. Implementation starts only after skeptic-plan-review reports **NO BLOCKING FINDINGS** (or 3 sweeps, then BLOCKED).
+This file is the **locked plan** that survived 3 skeptic-plan-review sweeps (7 then 4 blockers; sweep 3 = NO BLOCKING FINDINGS). Do not reopen grouping vs per-blob. Implement this. After the diff exists, run skeptic-code-review on `git diff cursor/metadata-only-exact-1c0c...HEAD` until NO BLOCKING FINDINGS or 3 sweeps.
+
+Origin `matt-brewer/agent-skills` is not reachable from this environment. Skeptic loops use fresh adversarial Task subagents.
+
+Constraints: MSRV 1.80, `forbid(unsafe_code)`, no zstd-framed, no new edition-2024 deps. Keep 0.1.9 metadata-only exact (no default `cdata_blob`). Manifest JSON field names stay (`blob`, `uncompressed_size`, `local_header_offset`, …). Seek prefix + `local_header_offset`.
+
+---
 
 ## Goal
 
-v0.1.6–0.1.8 always CAS-put every local `cdata` as `cdata_blob`. STORE is already the content blob (same BLAKE3, extra `ref_count` only). DEFLATE `cdata` is already-deflated; zstd does not shrink it. That second copy is why new packs ballooned (~200MB → ~3GB).
+New packs are **format v2** / crate **0.2.0**: record-aligned zstd **groups** (flush at 4 MiB uncompressed BLOB record bytes), a **final zstd frame of MANIFEST + END only**, an uncompressed **TOC** (`AYZPTOC2`), and trailer `toc_len` in bytes 56–63. `list()` seeks the last frame via the TOC. v1 files still read and rehydrate. `--jobs` remains hash-only. END digest is still BLAKE3 of concat(first-seen hashes).
 
-**Default for new packs:** keep metadata + pack order; do **not** store a second payload copy. Rehydrate either (a) re-encodes a bit-identical raw-deflate stream, or (b) rebuilds a valid ZIP with patched sizes/offsets. Old packs that already have `cdata_blob` keep working.
+Do **not** default to per-blob zstd frames.
 
-No user flag. No `--exact-cdata`. MSRV 1.80, edition 2021, no `unsafe`, no edition-2024 deps. Prefer no new crate; `flate2` is already in `Cargo.lock` via `zip 2.4.2` (`flate2 1.1.9` + `miniz_oxide`). Add it as a **direct** pin `=1.1.9` so we call `DeflateEncoder` / `DeflateDecoder` without a new dependency graph.
+---
 
-## Verified against this tree (hypothesis vs code)
-
-| Claim | Code |
-|---|---|
-| Exact splice writes prefix + local_header + cdata + descriptor + pad at `prefix + local_header_offset`, then tail at `source_size - tail.len` | `src/rehydrate.rs` `write_exact_jar` / `write_exact_entry` |
-| `fill_exact_entry` always `remember_blob(local.cdata)` and sets `cdata_blob` (except empty dirs) | `src/dehydrate.rs:983–1007` — **this is the bloat** |
-| STORE `cdata ==` uncompressed payload | `src/exact.rs` `stored_cdata_equals_payload` |
-| `raw_zip_*` only when slice fails or CD/entry-count mismatch | `attach_exact` + `capture_zip_exact` |
-| `Jar::exact_restore()` is `raw_zip \|\| tail_blob` | `src/manifest.rs:54–56` — **too coarse after this change** |
-| Signed rebuild warning is `signed && !exact_restore()` | `src/dehydrate.rs:593–597` |
-| Prefix / Spring / `zip -A` / Zip64 / decoy-PK are scan-time | `src/scan.rs`; must stay |
-| `--restore-paths` is orthogonal | leave `DehydrateOptions.restore_paths` and rehydrate dest/mode/owner alone |
-| Manifest v1, `skip_serializing_if = Option::is_none`, schema `additionalProperties: false` | new keys must be optional on the struct **and** listed in the schema |
-| In-tree fixtures use the `zip` crate (same flate2/miniz_oxide backend) | `tests/fixtures.rs` `write_jar` defaults to Deflated |
-
-Uncompressed entry bytes are **not** still in RAM at `attach_exact` (hash pipeline drops them after `commit_blob`). Trial-encode therefore inflates `local.cdata` with `flate2::write::DeflateDecoder` (raw deflate, same as ZIP), then re-encodes. Do not change the hash pipeline.
-
-## Manifest (v1, optional only)
-
-Crate version **0.1.9**. Manifest `version` stays 1. `examples/tiny.manifest.json` unchanged (no new required keys).
-
-`Entry` gains one optional field, declared after `cdata_blob` (stable serde order):
-
-| Key | Type | When present |
-|-----|------|----------------|
-| `cdata_codec` | string | DEFLATE byte-for-byte match; **never** together with `cdata_blob` on newly written packs |
-
-Codec string (pinned, no negotiation): `deflate-raw:flate2:<level>` where `<level>` is `1`, `6`, or `9` (and `3` only if the GPBF hint selected it and it matched).
-
-`skip_serializing_if = "Option::is_none"`. Schema `entry.properties` lists `cdata_codec` (`type: string`, pattern `^deflate-raw:flate2:[1369]$`). `additionalProperties: false` stays. Unknown/future codec strings on **read** still deserialize (serde does not enforce the schema); `resolve_cdata` errors `Format` on an unrecognized codec rather than guessing. Update every `Entry { ... }` literal (`sample_file_entry`, `dir_entry_blob_null_roundtrip`, `entry_from_scan`) with `cdata_codec: None`. Extend `exact_fields_omitted_when_none` and `field_order_stable_for_known_struct`.
-
-No jar-level `rebuild` key. Infer restore mode from existing fields (below).
-
-## Restore-mode inference (three paths)
-
-Replace the boolean `exact_restore()` with two helpers used by dehydrate warning + rehydrate dispatch:
-
-1. **`bit_identical_restore()`** — `raw_zip_blob` is set, **or** `tail_blob` is set and every file entry can resolve cdata without rebuilding:
-   - `cdata_blob.is_some()` (old 0.1.6–0.1.8 packs; exotic; mixed-unreproducible), **or**
-   - `cdata_codec.is_some()`, **or**
-   - `method_code == 0` (STORE; use content `blob`), **or**
-   - `is_dir` **and** `cdata_blob` absent (empty cdata only; dir-with-cdata must have `cdata_blob`)
-2. **`metadata_rebuild()`** — `tail_blob` is set, `raw_zip_blob` is absent, and some file entry cannot resolve via (1) (DEFLATE without `cdata_blob`/`cdata_codec`, i.e. a clean miss jar). A jar that also had unreproducible entries is **not** in this class (dehydrate stored `cdata_blob` on every non-STORE file so (1) holds).
-3. **Else** — old 0.1.4/0.1.5 content archive → existing `write_jar` / `ZipWriter`.
-
-`exact_restore()` becomes `bit_identical_restore()` (keep the name as a thin wrapper) so the signed warning `signed && !exact_restore()` already says **rebuild will break the signature** for metadata-rebuild jars. `raw_zip` and codec-hit / STORE / old-cdata packs stay “signed JAR” only.
-
-**Resolution order for one entry’s payload bytes** (must match the request):
-
-1. `cdata_blob` if present (old packs; also exotic / mixed-unreproducible jars)
-2. else `cdata_codec` → load content `blob` (or `[]` when `is_dir` and `blob` is absent — Maven empty DEFLATE dirs), raw-deflate at the recorded level, compare length to `compressed_size`; mismatch is `HashMismatch`
-3. else STORE (`method_code == 0`) or empty dir → content `blob` or `[]`
-4. else rebuild fields (jar-level metadata rebuild only)
-
-A **clean** deflate miss (no unreproducible siblings) still rebuilds the **whole** jar: one changed compressed size invalidates later `local_header_offset`s and the tail. On that class, do **not** store `cdata_codec` on the hits either — one canonical rebuild encoder for the jar. A miss **plus** an unreproducible sibling is not this class (see dehydrate table).
-
-## Dehydrate (`fill_exact_entry` / `attach_exact`)
-
-`attach_exact` still slices via `capture_zip_exact`. `raw_zip_*` remains **last resort when the zip cannot be sliced**, never the deflate-miss path.
-
-For each sliced local, still record `local_header_*`, `data_descriptor_hex`, `pad_*`, `local_header_offset` (needed for exact splice **and** rebuild patching).
-
-`attach_exact` is **two-pass** over the sliced locals (today’s `fill_exact_entry` is one-pass and `remember_blob` writes the zstd stream, which cannot be undone). Pass 1 classifies every local; pass 2 writes fields / CAS puts.
-
-**Jar-wide policy after pass 1** (picks one mechanism so inference and restore cannot disagree):
-
-Let `unreproducible` = any entry that is `method_code` not in `{0, 8}`, or whose `cdata` fails raw-inflate, or is a directory with **actual uncompressed payload** (`uncompressed_size != 0` or STORE dir with non-empty cdata), or is a STORE **file** whose BLAKE3(`local.cdata`) ≠ `entry.blob` (payload Vec is gone after `commit_blob`; compare hashes). A STORE file whose cdata hashes as the content blob is reproducible via `blob`.
-
-**Maven/Java empty DEFLATE directories** (`method_code == 8`, `uncompressed_size == 0`, typically 2-byte `03 00`) are **not** unreproducible. Trial-encode them like files (`DeflateHit` / `DeflateMiss`). Treating them as exotic forced MixedExact on most Maven JARs and stored every file `cdata_blob` again.
-
-Let `deflate_miss` = any `method_code == 8` file **or empty-content directory** whose trial-encode does not match.
-
-| Jar class | Store | Restore path |
-|---|---|---|
-| no `deflate_miss`, no `unreproducible` | STORE: nothing extra. DEFLATE hit (files **and** empty-content dirs): `cdata_codec` only. empty STORE dir: nothing. | `bit_identical_restore` |
-| no `deflate_miss`, some `unreproducible` | `cdata_blob` **only** on unreproducible file/dir-with-cdata entries. Hits still `cdata_codec`. STORE uses `blob`. | `bit_identical_restore` (every file resolves) |
-| `deflate_miss`, no `unreproducible` | **no** `cdata_blob`, **no** `cdata_codec` (strip hits too). Tail + local headers kept. **Not** `raw_zip`. | `metadata_rebuild` |
-| `deflate_miss` **and** `unreproducible` | **`cdata_blob` for every unreproducible entry and every DEFLATE file** (hits, misses, exotic files, **and dir-with-cdata**). STORE *files* whose `cdata ==` content blob still omit `cdata_blob`. No `cdata_codec`. | `bit_identical_restore`. **Never** metadata-rebuild a jar that has an unreproducible entry — rebuild’s encoder is only STORE-file or `deflate_raw(..., 6)` and must not invent method-8 bytes or drop dir cdata. |
-
-`write_rebuilt_jar` is therefore only entered when every file is STORE or DEFLATE. It never sees `cdata_blob` and never re-encodes `other`.
-
-Pass 2 `remember_blob(local.cdata)` **only** when the jar class says that entry gets `cdata_blob`.
-
-Trial-encode: `inflate_raw(local.cdata)` then re-encode. After inflate, check `len == entry.uncompressed_size` and `crc32fast(plain) == entry.crc32` before claiming a hit; on mismatch treat as `unreproducible` (keep `cdata_blob` for that entry / jar class above). Rehydrate encodes the CAS content `blob`, not a second inflate.
-
-Trial order (deterministic, first match wins):
-
-1. GPBF bits 1–2 from local header bytes 6–7 (APPNOTE 4.4.4): `00→6`, `01→9`, `10→3`, `11→1`
-2. then `6`, `9`, `1` (skip duplicates)
-
-Encoder: `flate2::write::DeflateEncoder` + `Compression::new(level)` into a `Vec` (raw deflate, not zlib/gzip). Hit = byte-for-byte equality with `local.cdata`.
-
-On the clean-miss class (`deflate_miss`, no `unreproducible`):
-
-- leave every entry without `cdata_blob` / `cdata_codec`
-- still store tail + local headers
-- do **not** write `raw_zip`
-- `source_blake3` / `source_sha256` / `source_size` stay the **original file** hashes/size (do not overwrite with a rebuilt file)
-
-`--restore-paths` collection stays as-is, after scan, before `attach_exact`.
-
-## Rehydrate
-
-`restore_jars` dispatch:
+## On-disk v2
 
 ```
-if jar.bit_identical_restore() { write_exact_jar + verify_source_identity }
-else if jar.metadata_rebuild() { write_rebuilt_jar  /* no source_* verify */ }
-else { write_jar /* ZipWriter */ }
+[FileHeader version=2, magic AYZP{2}\0\0\0 derived from header.version]
+[zstd frames: record-aligned BLOB groups, flush at 4 MiB uncompressed BLOB record bytes]
+[final zstd frame: MANIFEST + END only]
+[uncompressed TOC AYZPTOC2]
+[64-byte trailer version=2; bytes 56-63 = toc_len u64le]
 ```
 
-### Exact path (`write_exact_entry`)
+- `payload_bytes` = zstd-only (sum of frames).
+- `file_len` = `header_total` + `payload_bytes` + `toc_len` + 64.
+- Offsets in TOC are **payload-relative** (0 = first zstd byte after header).
+- Never copy `Trailer.manifest_len` (uncompressed JSON) into TOC. Test those two lengths differ.
 
-Replace “`cdata_blob` or empty” with `resolve_cdata` using the resolution order above. Tail position and `set_len(source_size)` unchanged. Prefix + chmod rules unchanged (`apply_prefix_chmod` still respects `--restore-paths` + `restore_mode`).
+### TOC
 
-Codec-hit: encode content blob; if encoded bytes ≠ `compressed_size`, `HashMismatch` (corrupt pack / wrong codec). Then splice at original offsets. `source_*` still verified.
+```
+"AYZPTOC2" n:u32le
+n × { blake3[32], zstd_off:u64le, zstd_len:u64le, rec_off:u64le }
+manifest_zstd_off:u64le  manifest_zstd_len:u64le
+```
 
-STORE without `cdata_blob`: write content blob as cdata (length must match `compressed_size` == `uncompressed_size`).
+Encoded length = `28 + n*56`.
 
-Old `cdata_blob`: unchanged.
+TOC fill: pending `{blake3, zstd_off, rec_off}` during a frame; back-fill `zstd_len` on `end_frame` **after** `Encoder::finish` + `BufWriter::flush`. Same for `manifest_*`.
 
-### Metadata rebuild (`write_rebuilt_jar`) — the miss path
+### Empty pack
 
-Do **not** seek to original `local_header_offset`s. Write a new zip portion, then the patched tail.
+Close the blob frame before the manifest even if `n_blobs=0`, **or** document 1-frame empty v2 (MANIFEST+END only; no preceding empty blob frame). Do **not** append MANIFEST onto a partial blob frame.
 
-Canonical miss encoder: `deflate-raw:flate2:6` for every `method_code == 8` file. STORE files use the content blob. Empty dirs stay empty. If `write_rebuilt_jar` sees `method_code` not in `{0, 8}` or a dir with `cdata_blob` / non-empty reconstructed cdata, return `Format` (do not emit method-8 bytes for LZMA or drop dir payload). Dehydrate will not emit that pack; a crafted one must not become a corrupt ZIP.
+This implementation: **1-frame empty v2**. `start_ayz_file` leaves the writer Idle. The first BLOB starts a blob frame. `finish` always ends any open blob frame, then starts a **new** frame for MANIFEST+END.
 
-**Offset mode** (prefix / `zip -A`): from the first CD record in `tail` vs `entries[0].local_header_offset` and `prefix_size`:
+---
 
-- if `cd_local_off == local_header_offset` → ZIP-relative (Spring unadjusted)
-- if `prefix_size > 0 && cd_local_off == prefix_size + local_header_offset` → file-absolute (`zip -A`)
-- else → `Format` (do not guess)
+## AyzWriter
 
-**Per entry (CD order = `jar.entries`):**
+```
+enum Idle(BufWriter<File>) | Frame(Encoder<'static, BufWriter<File>>)
+```
 
-1. Load original local header (`hex` or blob).
-2. New cdata = STORE/`dir` ? content-or-empty : `deflate_raw(content, 6)`.
-3. Patch sizes in the local header **in place**. Zip64 extra layout follows **32-bit sentinels**, not “tag 0x0001 exists” (`src/exact.rs` `resolve_cd_zip64`: consume uncomp/comp/offset from the extra **only** when the corresponding 32-bit field is `u32::MAX`). An uncomp-only extra is 8 bytes; treating it as if it also has a comp slot would overwrite uncompressed size.
-   - GPBF bit 3 set: leave the three local size fields as they were (usually 0 / Zip64 sentinels); patch the data descriptor’s compressed-size field (u32 or u64 depending on original descriptor length 12/16/20/24, same layout `split_descriptor` already understands).
-   - else: write `compressed_size` at local +18 (u32, or `0xFFFFFFFF` when the 32-bit field was already `u32::MAX` and a Zip64 extra carries the 64-bit comp). Patch only the extra slots that those sentinels imply.
-4. If the new compressed size **does not fit the original Zip64 layout** (32-bit fields, no extra, size ≥ 4 GiB — should not happen for class files): error `Format` with the jar/entry name rather than silently emitting a corrupt ZIP. Do not insert new extra fields (that would change header length and every later offset, and CD extra size).
-5. Drop original `pad_*` on rebuild (pads were alignment to the *old* next local).
-6. Track running zip-relative write offset.
+Store `zstd_level`, pending rows, finished TOC rows, running `payload_bytes`. Next `zstd_off` = `payload_bytes`. `include_checksum(false)` on **every** Encoder.
 
-**Patch tail in place** (length unchanged):
+Change `start_ayz_file` / `remember_blob` / `finish_ayz_file` / `write_ayz_file`. Keep `PendingAyz` + Windows replace.
 
-- Walk CD records in lockstep with `jar.entries`. Patch compressed size at CD+20 (and Zip64 extra). Patch local-header offset at CD+42 (and Zip64 extra) using the offset mode above.
-- If a Zip64 EOCD is present (locator magic immediately before classic EOCD, as `find_zip64_cd_bounds` already requires): patch `cd_offset` using the **same offset mode** as CD+42 (zip-rel or `prefix_size + zip-rel`). Locator’s Zip64-EOCD offset = that same-mode CD start + original `cd_size` (file-absolute after `zip -A`, not a bare zip-relative sum).
-- Classic EOCD: if recorded `cd_off` is `u32::MAX`, leave it; else write the new CD start (zip-rel or file-abs). `cd_size` unchanged.
-- Archive comment bytes after EOCD stay.
+Flush rule (record-aligned): if the current frame already has BLOB record bytes and adding the next BLOB record (`1+32+8+data.len()`) would exceed 4 MiB, `end_frame` then start a new frame. A single record larger than 4 MiB occupies its own frame.
 
-Write: prefix (existing `write_prefix`) + packed locals + patched tail. `set_len` to that sum. **Do not** call `verify_source_identity`. Unix prefix `chmod 0755` still applies when `apply_prefix_chmod`.
+`write_ayz_file` writes v2 when `header.version == 2` (default via `FileHeader::new`). Keep `write_ayz_file_v1` as a path that **actually writes version 1** (not v2 dehydrate labeled v1).
 
-Rebuild output must:
+---
 
-- open with `zip::ZipArchive`
-- same Unicode names and CD order
-- same uncompressed entry bytes
-- same DOS timestamps / extras / GPBF (except the size fields we patched)
-- **not** equal `source_blake3` (test asserts inequality or at least does not require match)
+## Header / trailer
+
+- Write magic `AYZP{ver}\0\0\0` from `header.version`. Accept write versions `{1,2}`.
+- Read: `magic[0..4]==AYZP`, `magic[4]∈{1,2}`, `magic[5..8]==0`, `header.version == u32::from(magic[4]) == trailer.version`.
+- Drop `magic == FILE_MAGIC` equality.
+- Reject skew with a **dedicated error** (`VersionSkew`). A v1 file is still an ayzenpack file (`NotAyzenpack` is wrong).
+- Move the “byte 2 unsupported” header test to **byte 3**.
+
+Trailer v2: bytes 56–63 = `toc_len` u64le. v1: `toc_len = 0`.
+
+---
+
+## `toc_len` read invariant (checked-sub)
+
+```
+expected_toc = file_len - 64 - header_total - payload_bytes
+trailer.toc_len == expected_toc
+```
+
+- v1: `toc_len == 0`
+- v2: `toc_len == 28+n*56` and `>= 28`
+- `header_total` = `12+header_len` **or** `stream_position` after `read_header`. Never raw `trailer.header_len` alone if that is wrong.
+- Update `verify_finished_ayz`: `file_len == header_total + payload_bytes + toc_len + 64`.
+- `format_corrupt`: truncated TOC, `toc_len` too big, v2 `toc_len=0`, v1 `toc_len≠0`.
+
+---
+
+## Readers
+
+Shared helper for version agreement + `expected_toc` + `take(payload_bytes)`.
+
+- v1: `.single_frame()` OK.
+- v2: multi-frame, **no** `single_frame`.
+- `read_ayz_file` and `spill_to_cas` (the **fourth** decoder at `src/rehydrate.rs` ~112–128, **not** a `read_ayz_file` caller) both use the helper and decode **all** blob+manifest frames.
+- `list()`: v1 full decode; v2 TOC seek `header_total+manifest_zstd_off`, decode last frame only, then `read_records` / `manifest_from_records` (frame is `REC_MANIFEST`+json+`REC_END`, not raw JSON).
+
+---
 
 ## Tests
 
-Offline `cargo test` / `cargo clippy --all-targets -- -D warnings`.
+Keep the #30 suite. Add:
 
-New / updated in `tests/roundtrip.rs` (and manifest unit tests):
+- v2 last frame is MANIFEST+END only
+- `list` last-frame (corrupt first blob frame; `list` still works)
+- v1 still rehydrates (`write_ayz_file_v1`)
+- mix `output_len <= 569539 * 115 / 100`
+- synthetic two blob frames
+- `manifest_zstd_len != trailer.manifest_len`
+- `toc_len` corrupt (truncated / too big / v2=0 / v1≠0)
+- magic / JSON / trailer skew
+- payload-relative origin (`zstd_off == 0` for the first blob)
+- `record.rs` one-frame test: two small blobs share a frame (still forbid per-blob default)
+- Keep corpus mix + whole-file hash. Log `unique_blob_count`.
 
-1. **STORE uses content blob, no second object.** Stored fixture: every file entry has `cdata_blob.is_none()`, `cdata_codec.is_none()`, and `blob` equals the only payload CAS id. `blobs[].ref_count` is not doubled for cdata. Bit-identical restore.
-2. **Codec hit is bit-identical.** `write_jar` / mixed stored+deflated / Spring / zip-A / Zip64 / data-descriptor (STORE) / zipalign (STORE) fixtures already in this file must still `assert_bit_identical`. Manifest shows `cdata_codec` on deflated file entries and **no** `cdata_blob`. `source_*` verify stays.
-3. **Codec miss rebuilds a valid ZIP.** Hand-built ZIP whose DEFLATE cdata is a raw stored-block (`01` + len + `~len` + payload) over a **compressible** payload (e.g. 256+ bytes of `0x61`). miniz_oxide level 1 can emit a stored-block for short/incompressible input — do not use `"hi"`. After pack: no `cdata_blob`, no `cdata_codec`, no `raw_zip_*`, `tail_blob` present. Rehydrate: `ZipArchive` opens; names/order/uncompressed bytes match; file bytes ≠ source; pack `output_len` and `bytes_unique_blobs` are not ~1:1 with the jar size (unique blobs ≈ uncompressed entries + small headers/tail). Add one miss+prefix (short shebang + stored-block DEFLATE) so rebuild offset-mode / EOCD patch is exercised in default `cargo test`, not only on the Maven corpus.
-4. **Old-style `cdata_blob` fixture.** Craft a pack with `format::write_ayz_file`: content blob + **separate** cdata blob + tail + local header hex + `cdata_blob` set, `cdata_codec` absent. Rehydrate is bit-identical. (Also keep a swapped-`cdata_blob` hash-fail test by crafting, not by dehydrating a new pack.)
-4b. **Class 4 (miss + unreproducible sibling).** Stored-block DEFLATE file plus a directory local with non-empty cdata. After pack: DEFLATE and the dir both have `cdata_blob`; no `cdata_codec`; restore is bit-identical (`source_*` match). Guards class 4 forgetting dir-with-cdata.
-5. **Prefix / Spring / zip-A / Zip64** existing tests stay bit-identical (zip-crate deflate → codec hit).
-6. **Signed + rebuild:** miss-style signed-looking jar warns `rebuild will break the signature` (stderr or `signed && !exact_restore()`). Codec-hit signed fixture stays bit-identical and does **not** use that warning.
-7. **`strip_exact_fields`** also clears `cdata_codec`.
-8. **`verify()`** does not require a blob for `cdata_codec`; still requires `cdata_blob` when present.
-9. **`two_jars_share_nested_lib_cdata_blob`:** assert shared **content** `blob` + same `cdata_codec`, not `cdata_blob`. Rename.
-
-`tests/prop_roundtrip.rs` still requires full-file equality (generator uses `zip` crate → codec hit).
-
-`tests/docs.rs` `--verbatim` line stays; README/DESIGN text about “always store cdata_blob” must change.
+---
 
 ## Docs
 
-- `DESIGN.md`: reconstruction is metadata-only by default; `cdata_blob` is legacy / exotic; `cdata_codec`; miss = rebuild, **do not** claim `source_blake3` match; `tool_version` example `0.1.9`; memory line no longer says peak includes a `cdata` copy for new packs. Also fix the Non-goals bullet that says new packs are already bit-identical / `--verbatim` is unnecessary (`DESIGN.md` ~279), the Reconstruction opener (`DESIGN.md` ~159, `src/rehydrate.rs` module docs), and the signed-JAR paragraph that says the rebuild-breaks-signature warning is only for the ZipWriter fallback (`DESIGN.md` ~221) — it also applies to metadata-rebuild jars.
-- `README.md` Reconstruction guarantee: same facts. No new CLI flag table row.
-- `docs/library.md` only if it describes exact/cdata storage (it currently does not).
-- `tests/bench.rs` comment that assumes `cdata == blob` if it would fail compile or assert.
-- Schema as above.
+`DESIGN.md`, `README.md`, `docs/library.md`, `tests/docs.rs`. Crate version 0.2.0. Manifest schema stays v1.
 
-Reuse `split_descriptor` / `resolve_cd_zip64` / Zip64 locator-before-EOCD logic via `pub(crate)` (or move them next to the rebuild writer). Do not duplicate the locator rule in `rehydrate.rs`.
+---
 
-`flate2 = "=1.1.9"` with **default features only** (`rust_backend` / miniz_oxide). Do not enable `zlib` / `zlib-ng`.
+## Done
 
-Land `fill_exact_entry` (stop putting cdata) and `resolve_cdata` **in the same commit** so STORE/deflate exact restore is never “empty cdata” mid-change.
-
-## Corpus (after implementation, not in default `cargo test`)
-
-`ci/download-corpus.sh` → `.corpus`, `AYZENPACK_CORPUS_DIR=.corpus`. Dehydrate the lockfile artifacts + copies. Report in the PR:
-
-- total jar bytes (`bytes_in_jars`)
-- unique blob bytes (`bytes_unique_blobs`)
-- `.ayz` size (`output_len`)
-- hypothetical cdata-full size if cheap (sum of compressed_size over file entries + unique uncompressed + tails/headers — or dehydrate a one-off that still puts cdata, test-only, **not** a CLI flag)
-- codec hit/miss rate (deflate entries with `cdata_codec` vs without)
-
-`.ayz` must sit in the pre-0.1.6 ballpark (near `zstd(unique uncompressed)`), not near `sum(jar sizes)`.
-
-Rehydrate corpus; verify entry contents. Bit-identical only where `cdata_codec` or STORE/`cdata_blob`.
-
-Existing `tests/corpus.rs` overlap tests (env-gated) should still pass; update any assertion that requires `cdata_blob` or whole-file equality for Maven JARs (Java zlib ≠ miniz_oxide is likely a **miss**. That is expected; rebuild must still be a valid ZIP).
-
-## Out of scope
-
-- Manifest version bump
-- `--exact-cdata` / `--verbatim`
-- Recursively exploding nested JARs
-- New deflate backend (zlib-ng / libz) to raise Maven hit rate
-- Inserting Zip64 extras on rebuild
-- Tagging, merging
-
-## Implementation order
-
-1. `flate2 = "=1.1.9"` (default features) in `Cargo.toml`; `cdata_codec` + schema + manifest tests; crate `0.1.9`.
-2. `deflate_raw` / `inflate_raw` / GPBF hint helper (unit-tested) in a small module (`src/deflate.rs` or `exact.rs`).
-3. Two-pass `attach_exact` + `resolve_cdata` + `write_rebuilt_jar` + inference/`exact_restore` rewrite **in the same commit**. Stopping cdata puts while `exact_restore()` is still `tail \|\| raw_zip` would send clean-miss jars into `write_exact_jar` with empty cdata.
-4. Tests + docs. `pub(crate)` the zip64/descriptor helpers in that same change.
-6. `cargo test`, `cargo clippy -D warnings`.
-7. Download corpus; measure; put numbers in the PR.
-
-## Residual risks (accepted)
-
-- Maven/Java deflate will usually **miss** with miniz_oxide. Product is still correct (rebuild). Hit-rate is a metric, not a gate.
-- Rebuild does not preserve zipalign padding (pads dropped). Miss fixtures are not aligned.
-- Rebuild refuses rather than invent Zip64 extras if a size crosses 4 GiB without an existing extra.
-- Residual: a crafted pack with `cdata_codec` but wrong content still fails encode-size/`source_*` checks on the exact path.
-
-## Follow-up: corpus mix + whole-file hash CI
-
-Matt: CI must pack a **complex mix** of regular JARs plus Spring Boot bash-prefix JARs and compare **before/after whole-file hashes**. Existing coverage is not enough:
-
-| What exists | Why it is not enough |
-|---|---|
-| `tests/roundtrip.rs` `mixed_regular_and_spring_pack_trailer_is_ayzptlr1_and_rehydrates` | Tiny ZipWriter fixtures, not Maven. Stays as-is. |
-| `tests/corpus.rs` `corpus_overlap_roundtrip` | `assert_functional_identity` only (entries/CRC/order). No whole-file hash. No Spring wrappers. |
-| `corpus.yml` CLI overlap step | dehydrate/rehydrate only; no `cmp`/`sha256`. No Spring wrappers. |
-
-### Mix to build (no extra Maven downloads)
-
-Reuse pinned `.corpus` artifacts + in-tree `tests/fixtures/spring-boot-3.5.0-launch.script` (rendered via `spring_boot_launch_script()`, same as the tiny mix). Build a temp mix directory:
-
-1. **Regular (unmodified copies):** `failureaccess-1.0.2.jar`, `slf4j-api-2.0.16.jar`, `jackson-annotations-2.17.2.jar` (small, classic ZIP, not Zip64).
-2. **Spring unadjusted:** official launch.script prepended to **unmodified** `jackson-core-2.17.2.jar` bytes. CD offsets stay zip-relative.
-3. **zip -A adjusted:** launch.script prepended to `slf4j-api-2.0.16.jar` (or failureaccess), then `adjust_self_extracting_offsets` (make that helper `pub` in `tests/fixtures.rs`). Classic EOCD only — do **not** zip -A a Zip64 Maven JAR; the helper only patches u32 CD/EOCD fields.
-4. **Zip64 nested-lib fat:** `write_wrapped_zip64_jar` with official script + `BOOT-INF/lib/failureaccess.jar` = real failureaccess bytes + a tiny `App.class`. Zip crate `large_file` + `set_zip64_comment` so Zip64 EOCD/locator exist. Nested JAR stays an opaque entry (not exploded). This wrapper is zip-crate DEFLATE → expected **codec hit** → whole-file hash **must** match.
-
-One `.ayz` for the whole mix. Rehydrate. Compare **blake3 and sha256** of each source file vs restored (`hashutil::hash_reader`, not a silent entry-map substitute).
-
-### Hash-compare gate (do not silently weaken)
-
-Whole-file hash equality is the gate for **bit-identical** restore.
-
-Mix filenames must be **unique basenames** (`unique_basename` is filename-only). Do not write two `slf4j-api-2.0.16.jar` into the mix dir. Example names: `plain-failureaccess.jar`, `plain-slf4j.jar`, `plain-jackson-annotations.jar`, `spring-jackson-core.jar`, `spring-zipa-slf4j.jar`, `spring-zip64-nested.jar`. `failureaccess` lives at **corpus root** (not under `apps/*/lib`).
-
-For each restored file vs its source:
-
-1. Always compute and print `blake3` + `sha256` (before/after). This is the compare; do not drop it.
-2. If `jar.bit_identical_restore()` (codec hit / STORE / `cdata_blob` / `raw_zip`): **fail** if either hash differs.
-3. If hashes differ: **fail** unless the jar is `metadata_rebuild()` **and** every method-8 **file** has no `cdata_codec` (proven flate2 miss). That proof is an assertion, not a comment.
-4. On that proven-miss branch, **also** `assert_functional_identity` (ZipArchive opens; names/order/uncompressed bytes/CRC) and, for prefixed jars, assert the restored file still starts with the official launch.script bytes. Hash compare stays; functional identity is the residual so a garbage rebuild cannot pass on “hashes differ + miss.” Do **not** replace the hash loop with functional-only.
-5. The **Zip64 nested-lib fat** (mix item 4) is zip-crate DEFLATE: must be `bit_identical_restore()` and hash-match. If it rebuilds, fail.
-6. Maven members (regular + Spring-wrapped **real** JARs, mix items 1–3) are expected to miss (Java zlib ≠ miniz; earlier unique-26 run was **0 / 19410** file codec hits). Hash mismatch on those is allowed **only** after the miss proof in (3)+(4). Say so in the PR. Still print the hashes.
-
-Also print mix pack stats: `bytes_in_jars`, `output_len`, `bytes_unique_blobs`, codec hit/miss/`cdata_blob` counts, `.ayz / sum(jars)`.
-
-### Wiring
-
-- New env-gated test in `tests/corpus.rs`: `corpus_mix_regular_and_spring_whole_file_hashes` (skip unless `AYZENPACK_CORPUS_DIR`). Offline default `cargo test` stays offline.
-- `.github/workflows/corpus.yml` already runs `cargo test --locked --test corpus` with that env on every PR/main — **that is the hash-gate CI path**. Do **not** add `ci/corpus-mix.sh` / a second zip-A implementation / a `list --json` jq on `metadata_rebuild` (`Jar` methods are not serde fields; `list --json` cannot express the gate without duplicating `can_exact_cdata`).
-- Optional extra CLI step: after release build, `ayzenpack list --json` is **not** used as the gate. The existing overlap CLI step stays functional-only (as today).
-- Bump `timeout-minutes` **20 → 25** and update `corpus_yml_linux_timeout_cache_dev_profile` (string `timeout-minutes: 25`).
-- Export `adjust_self_extracting_offsets` (or a `pub fn prepend_launcher(zip, launcher, zip_a: bool) -> Vec<u8>`) from `tests/fixtures.rs`. Corpus test `#[path = "fixtures.rs"]` and uses `spring_boot_launch_script()` (rendered), not the raw `{{placeholder}}` template. zip-A `delta` = prepended length.
-
-Do not add `--exact-cdata`. Do not explode nested JARs. Do not download extra artifacts.
+PR open (not merged, not tagged). `cargo test` green. `clippy -D warnings`. PR body has sweep counts and mix size vs 569539.

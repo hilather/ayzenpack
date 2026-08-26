@@ -1,27 +1,40 @@
-//! On-disk `.ayz` container codecs (header, records, trailer).
+//! On-disk `.ayz` container codecs (header, records, TOC, trailer).
 
 mod header;
 mod record;
+mod toc;
 mod trailer;
+mod writer;
 
-pub use header::{read_header, write_header, FileHeader};
+pub use header::{file_magic, read_header, write_header, FileHeader};
 pub use record::{
-    read_ayz_file, read_record, read_records, write_ayz_file, write_record, Record, BUF_WRITER_CAP,
+    blob_record_len, decode_payload, open_ayz_layout, read_ayz_file, read_manifest_records,
+    read_record, read_records, read_toc_at, write_ayz_file, write_ayz_file_v1, write_record,
+    AyzLayout, Record, BUF_WRITER_CAP,
 };
+pub use toc::{read_toc, write_toc, Toc, TocEntry, TOC_ENTRY_SIZE, TOC_MAGIC, TOC_OVERHEAD};
 pub use trailer::{read_trailer, write_trailer, Trailer};
+pub use writer::{verify_finished_ayz, AyzWriter, BLOB_FRAME_FLUSH};
 
 use crate::error::AyzenpackError;
 
-pub const FILE_MAGIC: [u8; 8] = *b"AYZP\x01\x00\x00\x00";
+/// Current write magic (`AYZP` + `FORMAT_VERSION` + three zero pad bytes).
+pub const FILE_MAGIC: [u8; 8] = *b"AYZP\x02\x00\x00\x00";
+/// v1 write/read magic. Kept so tests and `write_ayz_file_v1` can name it.
+pub const FILE_MAGIC_V1: [u8; 8] = *b"AYZP\x01\x00\x00\x00";
 pub const TRAILER_MAGIC: [u8; 8] = *b"AYZPTLR1";
-pub const FORMAT_VERSION: u8 = 1;
+pub const FORMAT_VERSION: u8 = 2;
+pub const FORMAT_VERSION_V1: u8 = 1;
 pub const REC_BLOB: u8 = 0x01;
 pub const REC_MANIFEST: u8 = 0x02;
 pub const REC_END: u8 = 0x03;
 pub const TRAILER_LEN: u64 = 64;
 
 const _: () = assert!(FILE_MAGIC[4] == FORMAT_VERSION);
+const _: () = assert!(FILE_MAGIC_V1[4] == FORMAT_VERSION_V1);
 const _: () = assert!(TRAILER_LEN == 64);
+const _: () = assert!(TOC_OVERHEAD == 28);
+const _: () = assert!(TOC_ENTRY_SIZE == 56);
 
 pub(crate) fn io_error(err: std::io::Error) -> AyzenpackError {
     AyzenpackError::Io {
@@ -36,6 +49,10 @@ pub(crate) fn map_truncated(err: std::io::Error, msg: &'static str) -> Ayzenpack
     } else {
         io_error(err)
     }
+}
+
+pub(crate) fn supported_write_version(version: u32) -> bool {
+    version == 1 || version == 2
 }
 
 #[cfg(test)]
@@ -55,7 +72,8 @@ mod tests {
             blob_bytes: 0xA1B2_C3D4_E5F6_7788,
             jar_count: 2,
             header_len,
-            version: 1,
+            version: 2,
+            toc_len: 0,
         }
     }
 
@@ -74,6 +92,7 @@ mod tests {
         let json = std::str::from_utf8(&bytes[12..12 + header_len as usize]).unwrap();
         assert!(json.contains("\"format\":\"ayzenpack\""));
         assert!(json.contains("\"tool\":\"ayzenpack\""));
+        assert!(json.contains("\"version\":2"));
         assert!(!json.contains("jded"));
         assert!(!json.contains('\n'), "header JSON must be compact: {json}");
 
@@ -102,7 +121,7 @@ mod tests {
             &trailer.jar_count.to_le_bytes()
         );
         assert_eq!(&bytes[t_off + 48..t_off + 52], &header_len.to_le_bytes());
-        assert_eq!(&bytes[t_off + 52..t_off + 56], &1u32.to_le_bytes());
+        assert_eq!(&bytes[t_off + 52..t_off + 56], &2u32.to_le_bytes());
         assert_eq!(&bytes[t_off + 56..t_off + 64], &[0u8; 8]);
 
         cur.seek(SeekFrom::Start(0)).unwrap();
@@ -114,6 +133,7 @@ mod tests {
         assert_eq!(got_header.format, "ayzenpack");
         assert_eq!(got_header.tool, "ayzenpack");
         assert_eq!(got_header.tool_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(got_header.version, 2);
 
         // Unknown keys ignored (do not deny_unknown_fields).
         let mut extra = serde_json::to_value(&header).unwrap();

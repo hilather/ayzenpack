@@ -17,7 +17,7 @@
 
 A fat classpath repeats Guava, Jackson, Netty, Log4j — the same class bytes, over and over, inside every JAR. `tar` does not notice. Exploding to a class forest is slow and throws away ZIP metadata.
 
-ayzenpack **dehydrates** a set of JAR/ZIP/WAR/EAR files into one `.ayz`: each unique uncompressed entry stored once, addressed by BLAKE3, wrapped in a single zstd frame, with a JSON manifest that knows how to put the JARs back together. **Rehydrate** writes the JARs out again.
+ayzenpack **dehydrates** a set of JAR/ZIP/WAR/EAR files into one `.ayz`: each unique uncompressed entry stored once, addressed by BLAKE3, wrapped in record-aligned zstd frames (format v2), with a JSON manifest that knows how to put the JARs back together. **Rehydrate** writes the JARs out again. v1 archives still open.
 
 ```text
 ayzenpack dehydrate -o libs.ayz app.jar lib/*.jar
@@ -180,14 +180,17 @@ Exact restore keeps `META-INF/*.SF` / `*.RSA` / `*.DSA` / `*.EC` bytes, so those
 
 ## Archive
 
-One file. Uncompressed header (`AYZP` + version 1), one zstd frame of length-prefixed BLOB / MANIFEST / END records, uncompressed 64-byte trailer (`AYZPTLR1`).
+One file. Uncompressed header (`AYZP` + version 2), record-aligned zstd BLOB groups (flush at 4 MiB uncompressed BLOB record bytes), a final zstd frame of MANIFEST + END, uncompressed TOC (`AYZPTOC2`), uncompressed 64-byte trailer (`AYZPTLR1`, `toc_len` in bytes 56–63). v1 is one zstd frame and `toc_len = 0`.
 
 ```
 ┌──────────────────────────────┐
-│  FileHeader  AYZP v1  JSON   │  uncompressed
+│  FileHeader  AYZP v2  JSON   │  uncompressed
 ├──────────────────────────────┤
-│  zstd frame                  │
-│    BLOB*  MANIFEST  END      │  unique entries, then catalog
+│  zstd BLOB frames            │  grouped, not per-blob
+├──────────────────────────────┤
+│  zstd MANIFEST + END         │  last frame
+├──────────────────────────────┤
+│  TOC  AYZPTOC2               │  uncompressed
 ├──────────────────────────────┤
 │  Trailer  AYZPTLR1  64 B     │  uncompressed
 └──────────────────────────────┘

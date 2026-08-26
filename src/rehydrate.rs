@@ -19,7 +19,7 @@ use crate::exact::{
     detect_offset_mode, encode_offset, patch_central_directory, patch_data_descriptor,
     patch_eocd_cd_start, patch_local_compressed_size,
 };
-use crate::format::{read_header, read_record, read_trailer, Record};
+use crate::format::{decode_payload, open_ayz_layout, read_record, Record};
 use crate::hashutil::{blake3_bytes, hash_reader, hex_lower, parse_blake3_hex, parse_hex};
 use crate::manifest::{Entry, Jar, Manifest, MANIFEST_FORMAT};
 use crate::scan::ZipView;
@@ -114,17 +114,9 @@ fn spill_to_cas(input: &Path, cas_dir: &Path) -> Result<Manifest> {
         source,
         path: Some(input.to_path_buf()),
     })?;
-    let trailer = read_trailer(&mut file)?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|source| AyzenpackError::Io {
-            source,
-            path: Some(input.to_path_buf()),
-        })?;
-    let _header = read_header(&mut file)?;
-    let limited = Read::take(&mut file, trailer.payload_bytes);
-    let mut decoder = zstd::stream::Decoder::new(limited)
-        .map_err(crate::format::io_error)?
-        .single_frame();
+    let layout = open_ayz_layout(&mut file)?;
+    let limited = Read::take(&mut file, layout.trailer.payload_bytes);
+    let mut decoder = decode_payload(limited, layout.header.version)?;
 
     let mut stream_hasher = blake3::Hasher::new();
     let mut seen_manifest = false;

@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, Seek, SeekFrom};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -15,10 +15,7 @@ use walkdir::WalkDir;
 
 use crate::error::{AyzenpackError, Result};
 use crate::exact::{capture_zip_exact, ExactLocal, ZipExact};
-use crate::format::{
-    write_header, write_record, write_trailer, FileHeader, Record, Trailer, BUF_WRITER_CAP,
-    REC_BLOB, TRAILER_LEN, TRAILER_MAGIC,
-};
+use crate::format::{verify_finished_ayz, AyzWriter, FileHeader};
 use crate::hashutil::{hash_both, hex_lower};
 use crate::manifest::{Blob, Entry, Jar, Manifest, Stats, MANIFEST_FORMAT};
 use crate::scan::{for_each_jar_entry_with_len, ScannedEntry};
@@ -99,15 +96,11 @@ pub struct DehydrateSummary {
     pub signed_jars: Vec<String>,
 }
 
-struct AyzWriter {
-    enc: zstd::stream::Encoder<'static, BufWriter<File>>,
-    header_total: u64,
-    header_len: u32,
-}
+type PackWriter = AyzWriter<File>;
 
 /// First-seen writes plus catalog updates. Lives on the sequencer/writer thread.
 struct BlobSink<'a> {
-    writer: &'a mut Option<AyzWriter>,
+    writer: &'a mut Option<PackWriter>,
     seen: &'a mut HashMap<[u8; 32], usize>,
     blobs: &'a mut Vec<Blob>,
     first_seen: &'a mut blake3::Hasher,
@@ -385,7 +378,7 @@ fn remember_blob(sink: &mut BlobSink<'_>, buf: &[u8], b3: [u8; 32], s256: [u8; 3
         sink.blobs[i].ref_count += 1;
     } else {
         if let Some(ref mut w) = sink.writer {
-            write_blob_record(&mut w.enc, &b3, buf)?;
+            w.write_blob(&b3, buf)?;
         }
         sink.first_seen.update(&b3);
         sink.seen.insert(b3, sink.blobs.len());
@@ -639,16 +632,25 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
     let digest = *first_seen.finalize().as_bytes();
     let manifest_len = json.len() as u64;
 
-    let output_len = if let Some(mut w) = writer {
-        write_record(&mut w.enc, &Record::Manifest { json })?;
-        write_record(&mut w.enc, &Record::End { digest })?;
-        finish_ayz_file(
-            w,
-            manifest_len,
+    let output_len = if let Some(w) = writer {
+        let (trailer, output_len) = w.finish(
+            &json,
+            digest,
             unique_blob_count,
             bytes_unique_blobs,
             jar_count,
-        )?
+            2,
+        )?;
+        debug_assert_eq!(trailer.manifest_len, manifest_len);
+        if let Some(p) = pending.as_ref() {
+            let mut f = File::open(&p.tmp).map_err(|source| AyzenpackError::Io {
+                source,
+                path: Some(p.tmp.clone()),
+            })?;
+            f.seek(SeekFrom::End(0)).map_err(crate::format::io_error)?;
+            verify_finished_ayz(&mut f, output_len)?;
+        }
+        output_len
     } else {
         0
     };
@@ -764,113 +766,8 @@ fn maybe_inject_commit_failure() -> Result<()> {
     Ok(())
 }
 
-fn start_ayz_file(output: &Path, header: &FileHeader) -> Result<AyzWriter> {
-    let mut file = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(output)
-        .map_err(|source| AyzenpackError::Io {
-            source,
-            path: Some(output.to_path_buf()),
-        })?;
-    let header_len = write_header(&mut file, header)?;
-    let header_total = file.stream_position().map_err(crate::format::io_error)?;
-
-    let mut enc = zstd::stream::Encoder::new(
-        BufWriter::with_capacity(BUF_WRITER_CAP, file),
-        header.zstd_level,
-    )
-    .map_err(crate::format::io_error)?;
-    enc.include_checksum(false)
-        .map_err(crate::format::io_error)?;
-    Ok(AyzWriter {
-        enc,
-        header_total,
-        header_len,
-    })
-}
-
-/// After flush: `stream_position` must match `metadata().len()`, and the last 64 bytes
-/// must be a real `AYZPTLR1` trailer. Do not trust length alone.
-fn verify_finished_ayz(file: &mut File, expected_len: u64) -> Result<()> {
-    let file_len = file.metadata().map_err(crate::format::io_error)?.len();
-    let pos = file.stream_position().map_err(crate::format::io_error)?;
-    if pos != file_len {
-        return Err(AyzenpackError::Format(
-            "stream position != written file length",
-        ));
-    }
-    if file_len != expected_len {
-        return Err(AyzenpackError::Format(
-            "file length != header_total + payload_bytes + 64",
-        ));
-    }
-    if file_len < TRAILER_LEN {
-        return Err(AyzenpackError::Format("truncated trailer"));
-    }
-    file.seek(SeekFrom::Start(file_len - TRAILER_LEN))
-        .map_err(crate::format::io_error)?;
-    let mut tail = [0u8; 64];
-    file.read_exact(&mut tail)
-        .map_err(crate::format::io_error)?;
-    if tail[0..8] != TRAILER_MAGIC {
-        return Err(AyzenpackError::Format("trailer magic missing after write"));
-    }
-    Ok(())
-}
-
-/// Finish the zstd frame, measure `payload_bytes`, then write the trailer on the same BufWriter.
-/// Measuring after trailer would bake the 64-byte trailer into `payload_bytes`.
-fn finish_ayz_file(
-    writer: AyzWriter,
-    manifest_len: u64,
-    blob_count: u64,
-    blob_bytes: u64,
-    jar_count: u64,
-) -> Result<u64> {
-    let AyzWriter {
-        enc,
-        header_total,
-        header_len,
-    } = writer;
-    let mut w = enc.finish().map_err(crate::format::io_error)?;
-    w.flush().map_err(crate::format::io_error)?;
-    let mid_len = w
-        .get_ref()
-        .metadata()
-        .map_err(crate::format::io_error)?
-        .len();
-    if mid_len < header_total {
-        return Err(AyzenpackError::Format(
-            "zstd payload shorter than file header",
-        ));
-    }
-    let payload_bytes = mid_len - header_total;
-    let trailer = Trailer {
-        payload_bytes,
-        manifest_len,
-        blob_count,
-        blob_bytes,
-        jar_count,
-        header_len,
-        version: 1,
-    };
-    write_trailer(&mut w, &trailer)?;
-    w.flush().map_err(crate::format::io_error)?;
-    let expected_len = header_total + payload_bytes + TRAILER_LEN;
-    verify_finished_ayz(w.get_mut(), expected_len)?;
-    Ok(expected_len)
-}
-
-fn write_blob_record<W: Write>(w: &mut W, hash: &[u8; 32], data: &[u8]) -> Result<()> {
-    w.write_all(&[REC_BLOB]).map_err(crate::format::io_error)?;
-    w.write_all(hash).map_err(crate::format::io_error)?;
-    w.write_all(&(data.len() as u64).to_le_bytes())
-        .map_err(crate::format::io_error)?;
-    w.write_all(data).map_err(crate::format::io_error)?;
-    Ok(())
+fn start_ayz_file(output: &Path, header: &FileHeader) -> Result<PackWriter> {
+    AyzWriter::start(output, header)
 }
 
 fn write_sidecar(path: &Path, manifest: &Manifest, pretty: bool) -> Result<()> {
@@ -1321,6 +1218,8 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::{verify_finished_ayz, TRAILER_MAGIC};
+    use std::io::{Seek, SeekFrom};
 
     #[test]
     fn jar_store_policy_covers_all_four_classes() {
