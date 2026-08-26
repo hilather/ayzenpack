@@ -13,7 +13,7 @@ use std::path::Path;
 use zip::ZipArchive;
 
 use crate::error::{AyzenpackError, Result};
-use crate::scan::{detect_zip_layout, find_cd_bounds, find_eocd, io_at, ZipLayout, ZipView};
+use crate::scan::{detect_zip_layout, find_cd_bounds, io_at, ZipLayout, ZipView};
 
 pub(crate) const LOCAL_FILE_MAGIC: [u8; 4] = *b"PK\x03\x04";
 pub(crate) const CD_MAGIC: [u8; 4] = *b"PK\x01\x02";
@@ -40,6 +40,7 @@ pub(crate) struct ExactSlice {
     pub tail: Vec<u8>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) enum ZipExact {
     Sliced(ExactSlice),
@@ -56,6 +57,7 @@ pub(crate) struct CdRecord {
     zip_rel_offset: u64,
 }
 
+#[cfg(test)]
 pub(crate) fn capture_zip_exact(path: &Path) -> Result<ZipExact> {
     match slice_zip(path) {
         Ok(slice) => Ok(ZipExact::Sliced(slice)),
@@ -175,6 +177,7 @@ fn archive_local_records(path: &Path, layout: &ZipLayout) -> Result<Vec<CdRecord
 
 /// Homemade CD record count vs `ZipArchive::len()` on the **source** file.
 /// `None` homemade means parse failed. Used as the second-bug gate (not tautological).
+#[cfg(test)]
 pub(crate) fn homemade_cd_count_and_archive_len(path: &Path) -> Result<(Option<usize>, usize)> {
     let (layout, archive_len) = {
         let mut file = File::open(path).map_err(|source| io_at(source, path))?;
@@ -241,6 +244,7 @@ fn archive_entry_err(err: zip::result::ZipError, path: &Path) -> AyzenpackError 
     }
 }
 
+#[cfg(test)]
 fn read_zip_portion(path: &Path) -> Result<Vec<u8>> {
     let mut file = File::open(path).map_err(|source| io_at(source, path))?;
     let layout = detect_zip_layout(path, &mut file)?;
@@ -256,6 +260,7 @@ fn read_zip_portion(path: &Path) -> Result<Vec<u8>> {
     Ok(zip)
 }
 
+#[cfg(test)]
 fn slice_zip(path: &Path) -> Result<ExactSlice> {
     let mut file = File::open(path).map_err(|source| io_at(source, path))?;
     let layout = detect_zip_layout(path, &mut file)?;
@@ -335,8 +340,9 @@ fn slice_zip(path: &Path) -> Result<ExactSlice> {
     Ok(ExactSlice { locals, tail })
 }
 
+#[cfg(test)]
 fn check_not_spanned(path: &Path, file: &mut File, file_len: u64) -> Result<()> {
-    let (eocd_off, _cd_size, _cd_off, _entries) = find_eocd(path, file, file_len)?;
+    let (eocd_off, _cd_size, _cd_off, _entries) = crate::scan::find_eocd(path, file, file_len)?;
     file.seek(SeekFrom::Start(eocd_off))
         .map_err(|source| io_at(source, path))?;
     let mut eocd = [0u8; 22];
@@ -1269,6 +1275,30 @@ mod tests {
     }
 
     #[test]
+    fn zip64_large_file_homemade_cd_matches_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("z64.jar");
+        let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        z.set_zip64_comment(Some(""));
+        let opts = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .large_file(true);
+        z.start_file("a.txt", opts).unwrap();
+        z.write_all(b"hello").unwrap();
+        z.start_file("b.txt", opts).unwrap();
+        z.write_all(b"world").unwrap();
+        let zip = z.finish().unwrap().into_inner();
+        let mut out = b"#!/bin/bash\n# stub\n".to_vec();
+        out.extend_from_slice(&zip);
+        std::fs::write(&path, &out).unwrap();
+        let (home, arch) = homemade_cd_count_and_archive_len(&path).unwrap();
+        assert_eq!(home, Some(2));
+        assert_eq!(arch, 2);
+        let sliced = slice_from_archive(&path).expect("Zip64 fat must slice from archive");
+        assert_eq!(sliced.locals.len(), 2);
+    }
+
+    #[test]
     fn homemade_cd_matches_archive_on_plain_zipwriter() {
         let (_dir, path) = write_temp_zip(&[("a.txt", b"hello"), ("b.txt", b"world")], false);
         let (home, arch) = homemade_cd_count_and_archive_len(&path).unwrap();
@@ -1308,7 +1338,7 @@ mod tests {
         let path = dir.path().join("overlap.jar");
         write_stored_named(
             &path,
-            &[("a.txt", b"AAAA-payload"), ("b.txt", b"BBBB-payload")],
+            &[("a.txt", b"SAME-payload"), ("b.txt", b"SAME-payload")],
         );
         let mut buf = std::fs::read(&path).unwrap();
         let eocd = find_eocd_in(&buf).unwrap();

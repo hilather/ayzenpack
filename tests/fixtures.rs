@@ -250,13 +250,14 @@ pub fn write_stored_zip(path: &Path, files: &[(&str, &[u8], u32)]) {
 /// Two distinct-name CD records that share local offset 0.
 /// ZipArchive still lists both; homemade `slice_zip` fails (overlap) → 0.2.1 `Raw`.
 pub fn write_overlapping_local_zip(path: &Path) {
-    let a = b"AAAA-payload";
-    let b = b"BBBB-payload";
+    // Same CRC so ZipArchive::by_index lists both; distinct names so last-wins
+    // does not collapse. Homemade slice still fails (overlapping offsets).
+    let payload = b"SAME-payload";
     write_stored_zip(
         path,
         &[
-            ("a.txt", a, crc32fast::hash(a)),
-            ("b.txt", b, crc32fast::hash(b)),
+            ("a.txt", payload, crc32fast::hash(payload)),
+            ("b.txt", payload, crc32fast::hash(payload)),
         ],
     );
     let mut buf = std::fs::read(path).unwrap();
