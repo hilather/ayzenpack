@@ -233,6 +233,44 @@ fn scan_official_script_plus_zip64_nested_lib() {
 }
 
 #[test]
+fn scan_decoy_pk_in_launcher_keeps_full_prefix() {
+    // Issue #24: first PK\x03\x04 is in the stub, not the ZIP.
+    let prefix = b"#!/bin/bash\n# decoy PK\x03\x04 here\nexit 0\n";
+    assert_eq!(prefix.len(), 37);
+    assert_eq!(prefix.windows(4).position(|w| w == b"PK\x03\x04"), Some(20));
+    let (_dir, path) = temp_jar("falsepk.jar");
+    write_wrapped_jar(&path, prefix, &[("App.class", b"hello-app")]);
+    assert_eq!(zip_prefix_len(&path).unwrap(), prefix.len() as u64);
+    let scanned = scan_jar(&path, MAX_ENTRY).unwrap();
+    assert_eq!(scanned.prefix.as_deref(), Some(prefix.as_slice()));
+    assert_eq!(scanned.entries.len(), 1);
+    assert_eq!(scanned.entries[0].name, "App.class");
+}
+
+#[test]
+fn scan_decoy_pk_zip_a_keeps_full_prefix() {
+    let prefix = b"#!/bin/bash\n# decoy PK\x03\x04 here\nexit 0\n";
+    let (_dir, path) = temp_jar("falsepkA.jar");
+    write_wrapped_jar_adjusted(&path, prefix, &[("App.class", b"hello-app")]);
+    assert_eq!(zip_prefix_len(&path).unwrap(), prefix.len() as u64);
+    let scanned = scan_jar(&path, MAX_ENTRY).unwrap();
+    assert_eq!(scanned.prefix.as_deref(), Some(prefix.as_slice()));
+    assert_eq!(scanned.entries[0].name, "App.class");
+}
+
+#[test]
+fn scan_empty_prefixed_zip_a() {
+    // Issue #25: empty ZIP + prefix after zip -A (no PK\x03\x04, extra == 0).
+    let prefix = b"#!/bin/bash\nexit 0\n";
+    let (_dir, path) = temp_jar("empty_zipA.jar");
+    write_wrapped_jar_adjusted(&path, prefix, &[]);
+    assert_eq!(zip_prefix_len(&path).unwrap(), prefix.len() as u64);
+    let scanned = scan_jar(&path, MAX_ENTRY).unwrap();
+    assert_eq!(scanned.prefix.as_deref(), Some(prefix.as_slice()));
+    assert!(scanned.entries.is_empty());
+}
+
+#[test]
 fn scan_shebang_without_zip_is_not_zip() {
     let (_dir, path) = temp_jar("script.jar");
     fs::write(&path, b"#!/bin/bash\necho no zip here\n").unwrap();

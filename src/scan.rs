@@ -20,9 +20,11 @@ const HASH_CHUNK: usize = 16 * 1024;
 const ZIP_BUF: usize = 64 * 1024;
 
 const LOCAL_FILE_MAGIC: [u8; 4] = *b"PK\x03\x04";
+const CD_MAGIC: [u8; 4] = *b"PK\x01\x02";
 const EOCD_MAGIC: [u8; 4] = *b"PK\x05\x06";
 const ZIP64_LOCATOR_MAGIC: [u8; 4] = *b"PK\x06\x07";
 const ZIP64_EOCD_MAGIC: [u8; 4] = *b"PK\x06\x06";
+const ZIP64_EXTRA_ID: u16 = 0x0001;
 
 const EOCD_MIN: u64 = 22;
 const EOCD_MAX_COMMENT: u64 = 65_535;
@@ -297,13 +299,16 @@ fn method_label_and_code(method: CompressionMethod) -> (String, u16) {
 
 /// Detect a prepended launcher. No CLI flag.
 ///
-/// If the file does not start with ZIP magic, scan from offset 0 for the first
-/// `PK\x03\x04` within [`MAX_PREFIX`]. Prefix bytes are `[0, first_pk)`. Then:
-/// 1. Try `ZipArchive` through `ZipView` shifted to `first_pk` (unadjusted).
+/// If the file does not start with ZIP magic, the prefix ends at the central
+/// directory's first local header (CD min local offset, or that offset after
+/// `zip -A` made it file-absolute) — not the first `PK\x03\x04` in the stub.
+/// Prefix bytes are `[0, first_real_lh)`. Then:
+/// 1. Try `ZipArchive` through `ZipView` shifted to that offset (unadjusted).
 /// 2. If that fails, try the full file (`zip -A` file-absolute offsets).
 ///
-/// A file with no `PK\x03\x04` is `NotZip`, except an empty prefixed archive
-/// (EOCD-only) which still uses extra-data math.
+/// A file with no local headers is `NotZip`, except an empty prefixed archive
+/// (EOCD-only). Unadjusted empty archives use extra-data math. After `zip -A`,
+/// extra is 0 and the recorded CD offset is the prefix.
 pub(crate) fn detect_zip_layout(path: &Path, file: &mut (impl Read + Seek)) -> Result<ZipLayout> {
     let file_len = file
         .seek(SeekFrom::End(0))
@@ -338,13 +343,14 @@ fn detect_zip_prefix(path: &Path, file: &mut (impl Read + Seek)) -> Result<u64> 
     Ok(detect_zip_layout(path, file)?.prefix_len)
 }
 
-/// First `PK\x03\x04` + try `ZipArchive`. Does not use EOCD extra-data math.
+/// Real first local header (CD min offset) + try `ZipArchive`.
+/// Does not use EOCD extra-data math.
 fn layout_from_first_pk(
     path: &Path,
     file: &mut (impl Read + Seek),
     file_len: u64,
 ) -> Result<Option<ZipLayout>> {
-    let Some(first) = find_first_local(path, file, file_len)? else {
+    let Some(first) = find_cd_first_local(path, file, file_len)? else {
         return Ok(None);
     };
     if first == 0 || first > MAX_PREFIX {
@@ -376,7 +382,8 @@ fn zip_archive_opens(path: &Path, file: &mut (impl Read + Seek), view_shift: u64
     }
 }
 
-/// Empty prefixed ZIP (no local header): EOCD extra-data math only.
+/// Empty prefixed ZIP (no local header): EOCD extra-data math, or the
+/// file-absolute CD offset after `zip -A` (extra == 0).
 fn layout_from_eocd_empty(
     path: &Path,
     file: &mut (impl Read + Seek),
@@ -397,8 +404,22 @@ fn layout_from_eocd_empty(
     let Some(extra) = cd_start.checked_sub(cd_off) else {
         return Ok(None);
     };
-    if extra == 0 || extra > MAX_PREFIX {
+    if extra > MAX_PREFIX {
         return Ok(None);
+    }
+    if extra == 0 {
+        // zip -A: recorded CD offset is file-absolute and points at the EOCD.
+        if cd_off == 0 || cd_off > MAX_PREFIX {
+            return Ok(None);
+        }
+        return match confirm_zip_at(path, file, cd_off, true) {
+            Ok(()) => Ok(Some(ZipLayout {
+                prefix_len: cd_off,
+                view_shift: 0,
+            })),
+            Err(AyzenpackError::NotZip { .. }) => Ok(None),
+            Err(err) => Err(err),
+        };
     }
     match confirm_zip_at(path, file, extra, true) {
         Ok(()) => Ok(Some(ZipLayout {
@@ -410,12 +431,151 @@ fn layout_from_eocd_empty(
     }
 }
 
-fn find_first_local(
+/// File offset of the CD's first local header, ignoring decoy `PK\x03\x04` in the stub.
+fn find_cd_first_local(
     path: &Path,
     file: &mut (impl Read + Seek),
     file_len: u64,
 ) -> Result<Option<u64>> {
-    let scan = file_len.min(MAX_PREFIX);
+    // Prefer Zip64 EOCD when the locator is present, even if classic EOCD
+    // fields are not sentinels (rust zip `large_file` writes sizes as MAX
+    // but leaves a 32-bit CD offset). Classic `eocd - cd_size` then lands
+    // in the Zip64 footer instead of the CD.
+    let (eocd_off, cd_size32, _cd_off32, entries16) = match find_eocd(path, file, file_len) {
+        Ok(bounds) => bounds,
+        Err(AyzenpackError::NotZip { .. }) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let (struct_off, cd_size, entries) = match find_zip64_cd_bounds(path, file, eocd_off) {
+        Ok((off, size, _, n)) => (off, size, n),
+        Err(AyzenpackError::NotZip { .. }) => {
+            (eocd_off, u64::from(cd_size32), u64::from(entries16))
+        }
+        Err(err) => return Err(err),
+    };
+    if entries == 0 || cd_size == 0 {
+        return Ok(None);
+    }
+    let Some(phys_cd) = struct_off.checked_sub(cd_size) else {
+        return Ok(None);
+    };
+    if !magic_at(path, file, phys_cd, &CD_MAGIC)? {
+        return Ok(None);
+    }
+    let Some((min_off, name)) = read_cd_min_local(path, file, phys_cd, cd_size)? else {
+        return Ok(None);
+    };
+    // zip -A: CD local offsets are already file-absolute.
+    if local_name_eq(path, file, min_off, &name)? {
+        return Ok(Some(min_off));
+    }
+    find_local_named(path, file, file_len, &name)
+}
+
+fn read_cd_min_local(
+    path: &Path,
+    file: &mut (impl Read + Seek),
+    phys_cd: u64,
+    cd_size: u64,
+) -> Result<Option<(u64, Vec<u8>)>> {
+    let Ok(cd_len) = usize::try_from(cd_size) else {
+        return Ok(None);
+    };
+    file.seek(SeekFrom::Start(phys_cd))
+        .map_err(|source| io_at(source, path))?;
+    let mut cd = vec![0u8; cd_len];
+    file.read_exact(&mut cd)
+        .map_err(|source| io_at(source, path))?;
+
+    let mut best: Option<(u64, Vec<u8>)> = None;
+    let mut i = 0usize;
+    while i < cd.len() {
+        if i + 46 > cd.len() || cd[i..i + 4] != CD_MAGIC {
+            return Ok(None);
+        }
+        let name_len = u16::from_le_bytes(cd[i + 28..i + 30].try_into().unwrap()) as usize;
+        let extra_len = u16::from_le_bytes(cd[i + 30..i + 32].try_into().unwrap()) as usize;
+        let comment_len = u16::from_le_bytes(cd[i + 32..i + 34].try_into().unwrap()) as usize;
+        let uncomp32 = u32::from_le_bytes(cd[i + 24..i + 28].try_into().unwrap());
+        let comp32 = u32::from_le_bytes(cd[i + 20..i + 24].try_into().unwrap());
+        let off32 = u32::from_le_bytes(cd[i + 42..i + 46].try_into().unwrap());
+        let Some(rec_end) = i
+            .checked_add(46)
+            .and_then(|n| n.checked_add(name_len))
+            .and_then(|n| n.checked_add(extra_len))
+            .and_then(|n| n.checked_add(comment_len))
+        else {
+            return Ok(None);
+        };
+        if rec_end > cd.len() {
+            return Ok(None);
+        }
+        let name = cd[i + 46..i + 46 + name_len].to_vec();
+        let extra = &cd[i + 46 + name_len..i + 46 + name_len + extra_len];
+        let Some(local_off) = cd_local_offset(extra, uncomp32, comp32, off32) else {
+            return Ok(None);
+        };
+        match &best {
+            Some((off, _)) if local_off >= *off => {}
+            _ => best = Some((local_off, name)),
+        }
+        i = rec_end;
+    }
+    if i != cd.len() {
+        return Ok(None);
+    }
+    Ok(best)
+}
+
+fn cd_local_offset(extra: &[u8], uncomp32: u32, comp32: u32, off32: u32) -> Option<u64> {
+    if off32 != u32::MAX {
+        return Some(u64::from(off32));
+    }
+    let data = zip64_extra_payload(extra)?;
+    let mut cur = data;
+    if uncomp32 == u32::MAX {
+        if cur.len() < 8 {
+            return None;
+        }
+        cur = &cur[8..];
+    }
+    if comp32 == u32::MAX {
+        if cur.len() < 8 {
+            return None;
+        }
+        cur = &cur[8..];
+    }
+    if cur.len() < 8 {
+        return None;
+    }
+    Some(u64::from_le_bytes(cur[..8].try_into().ok()?))
+}
+
+fn zip64_extra_payload(extra: &[u8]) -> Option<&[u8]> {
+    let mut i = 0usize;
+    while i + 4 <= extra.len() {
+        let tag = u16::from_le_bytes(extra[i..i + 2].try_into().ok()?);
+        let size = u16::from_le_bytes(extra[i + 2..i + 4].try_into().ok()?) as usize;
+        let start = i + 4;
+        let end = start.checked_add(size)?;
+        if end > extra.len() {
+            return None;
+        }
+        if tag == ZIP64_EXTRA_ID {
+            return Some(&extra[start..end]);
+        }
+        i = end;
+    }
+    None
+}
+
+fn find_local_named(
+    path: &Path,
+    file: &mut (impl Read + Seek),
+    file_len: u64,
+    name: &[u8],
+) -> Result<Option<u64>> {
+    let scan = file_len.min(MAX_PREFIX.saturating_add(4));
     if scan < 4 {
         return Ok(None);
     }
@@ -426,11 +586,61 @@ fn find_first_local(
         .map_err(|source| io_at(source, path))?;
     let end = buf.len() - 3;
     for i in 0..end {
-        if buf[i..i + 4] == LOCAL_FILE_MAGIC {
-            return Ok(Some(i as u64));
+        if buf[i..i + 4] != LOCAL_FILE_MAGIC {
+            continue;
+        }
+        let off = i as u64;
+        if off == 0 || off > MAX_PREFIX {
+            continue;
+        }
+        if local_name_eq(path, file, off, name)? {
+            return Ok(Some(off));
         }
     }
     Ok(None)
+}
+
+fn local_name_eq(
+    path: &Path,
+    file: &mut (impl Read + Seek),
+    offset: u64,
+    name: &[u8],
+) -> Result<bool> {
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|source| io_at(source, path))?;
+    let mut fixed = [0u8; 30];
+    match file.read_exact(&mut fixed) {
+        Ok(()) => {}
+        Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+        Err(source) => return Err(io_at(source, path)),
+    }
+    if fixed[..4] != LOCAL_FILE_MAGIC {
+        return Ok(false);
+    }
+    let name_len = u16::from_le_bytes([fixed[26], fixed[27]]) as usize;
+    if name_len != name.len() {
+        return Ok(false);
+    }
+    let mut got = vec![0u8; name_len];
+    match file.read_exact(&mut got) {
+        Ok(()) => {}
+        Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+        Err(source) => return Err(io_at(source, path)),
+    }
+    Ok(got.as_slice() == name)
+}
+
+fn magic_at(
+    path: &Path,
+    file: &mut (impl Read + Seek),
+    offset: u64,
+    magic: &[u8; 4],
+) -> Result<bool> {
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|source| io_at(source, path))?;
+    let mut buf = [0u8; 4];
+    let n = file.read(&mut buf).map_err(|source| io_at(source, path))?;
+    Ok(n == 4 && buf == *magic)
 }
 
 fn not_zip(path: &Path) -> AyzenpackError {
@@ -860,6 +1070,72 @@ mod tests {
             detect_zip_prefix(Path::new("empty.jar"), &mut cur).unwrap(),
             launcher.len() as u64
         );
+    }
+
+    /// Issue #24: first `PK\x03\x04` in the stub is a decoy, not the ZIP.
+    const DECOY_LAUNCHER: &[u8] = b"#!/bin/bash\n# decoy PK\x03\x04 here\nexit 0\n";
+
+    #[test]
+    fn cd_first_local_skips_decoy_pk_in_stub() {
+        assert_eq!(DECOY_LAUNCHER.len(), 37);
+        assert_eq!(
+            DECOY_LAUNCHER
+                .windows(4)
+                .position(|w| w == LOCAL_FILE_MAGIC),
+            Some(20)
+        );
+        let zip = make_zip(&[("App.class", b"hello-app")]);
+        let mut wrapped = DECOY_LAUNCHER.to_vec();
+        wrapped.extend_from_slice(&zip);
+        let mut cur = Cursor::new(wrapped);
+        let layout = detect_zip_layout(Path::new("falsepk.jar"), &mut cur).unwrap();
+        assert_eq!(layout.prefix_len, DECOY_LAUNCHER.len() as u64);
+        assert_eq!(layout.view_shift, DECOY_LAUNCHER.len() as u64);
+    }
+
+    #[test]
+    fn cd_first_local_skips_decoy_pk_after_zip_a() {
+        let zip = make_zip(&[("App.class", b"hello-app")]);
+        let mut wrapped = DECOY_LAUNCHER.to_vec();
+        wrapped.extend_from_slice(&zip);
+        adjust_self_extracting_offsets(&mut wrapped, DECOY_LAUNCHER.len() as u32);
+        let mut extra_cur = Cursor::new(wrapped.clone());
+        assert_eq!(eocd_extra(&mut extra_cur), Some(0));
+        let mut cur = Cursor::new(wrapped);
+        let layout = detect_zip_layout(Path::new("falsepkA.jar"), &mut cur).unwrap();
+        assert_eq!(layout.prefix_len, DECOY_LAUNCHER.len() as u64);
+        assert_eq!(layout.view_shift, 0);
+    }
+
+    #[test]
+    fn cd_first_local_skips_decoy_pk_plus_zip64() {
+        let zip = make_zip64(&[("BOOT-INF/lib/dep.jar", b"nested-zip64-opaque")]);
+        let mut wrapped = DECOY_LAUNCHER.to_vec();
+        wrapped.extend_from_slice(&zip);
+        let mut extra_cur = Cursor::new(wrapped.clone());
+        let extra = eocd_extra(&mut extra_cur).expect("classic EOCD still present");
+        assert!(extra > DECOY_LAUNCHER.len() as u64);
+        let mut cur = Cursor::new(wrapped);
+        let layout = detect_zip_layout(Path::new("falsepk64.jar"), &mut cur).unwrap();
+        assert_eq!(layout.prefix_len, DECOY_LAUNCHER.len() as u64);
+        assert_eq!(layout.view_shift, DECOY_LAUNCHER.len() as u64);
+    }
+
+    #[test]
+    fn empty_zip_a_adjusted_prefix() {
+        // Issue #25: empty ZIP has no PK\x03\x04; zip -A makes extra == 0.
+        let zip = make_zip(&[]);
+        let launcher = b"#!/bin/bash\nexit 0\n";
+        let mut wrapped = launcher.to_vec();
+        wrapped.extend_from_slice(&zip);
+        adjust_self_extracting_offsets(&mut wrapped, launcher.len() as u32);
+        assert!(!wrapped.windows(4).any(|w| w == LOCAL_FILE_MAGIC));
+        let mut extra_cur = Cursor::new(wrapped.clone());
+        assert_eq!(eocd_extra(&mut extra_cur), Some(0));
+        let mut cur = Cursor::new(wrapped);
+        let layout = detect_zip_layout(Path::new("empty_zipA.jar"), &mut cur).unwrap();
+        assert_eq!(layout.prefix_len, launcher.len() as u64);
+        assert_eq!(layout.view_shift, 0);
     }
 
     #[test]

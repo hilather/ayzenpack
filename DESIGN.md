@@ -191,12 +191,12 @@ Invalid DOS pairs including `0,0` still fall back to 1980-01-01 on the content p
 
 Spring Boot “fully executable” JARs (`spring-boot-maven-plugin` `executable: true` / `bootJar { launchScript() }`) prepend the official `launch.script` before a ZIP (often Zip64). The file starts with `#!/bin/bash`, the Spring Boot banner, `### BEGIN INIT INFO` / chkconfig, and ends with `exit 0` — not `PK\x03\x04`. Placeholders like `{{mode:auto}}` are already substituted in a real build.
 
-Detection uses no CLI flag. If the file does not start with ZIP magic, scan from offset 0 for the first `PK\x03\x04` within 16 MiB. Prefix bytes are `[0, first_pk)`. Then try, in order:
+Detection uses no CLI flag. If the file does not start with ZIP magic, the prefix ends at the central directory's first local header (CD min local offset, or that offset after `zip -A` made it file-absolute) — not the first `PK\x03\x04` in the stub. Prefix bytes are `[0, first_real_lh)` within 16 MiB. Then try, in order:
 
-1. **Unadjusted** (Spring default): `ZipArchive` through `ZipView` shifted to `first_pk`. ZIP offsets are relative to the ZIP start. This is what `file` sees after the script is deleted.
+1. **Unadjusted** (Spring default): `ZipArchive` through `ZipView` shifted to the real first local header. ZIP offsets are relative to the ZIP start. This is what `file` sees after the script is deleted.
 2. **Adjusted** (`zip -A`): if that open fails, open the full file (no `ZipView` shift). CD and local-header offsets are already file-absolute.
 
-A file with no `PK\x03\x04` stays `NotZip` (except an empty prefixed archive, which still uses EOCD extra-data math). 0.1.4 extra-data math alone is not sufficient: after `zip -A`, `extra == 0` and `confirm_zip_at(0)` reads `#!` / ELF.
+A file with no local headers stays `NotZip` except an empty prefixed archive (EOCD-only). Unadjusted empty archives use EOCD extra-data math. After `zip -A` on an empty archive, extra is 0 and the recorded CD offset is the prefix (file-absolute EOCD). 0.1.4 extra-data math alone is not sufficient for non-empty `zip -A` / Zip64: `extra == 0` (or inflated by the Zip64 footer) and `confirm_zip_at(0)` reads `#!` / ELF.
 
 ```
 extra = (eocd_file_offset - cd_size) - recorded_cd_offset
