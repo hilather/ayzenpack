@@ -15,7 +15,8 @@ use ayzenpack::manifest::Manifest;
 use ayzenpack::{dehydrate, rehydrate, verify, DehydrateOptions, RehydrateOptions};
 use fixtures::{
     spring_boot_launch_script, write_data_descriptor_zip, write_deflate_miss_plus_dir_cdata,
-    write_deflate_miss_plus_empty_deflate_dir, write_fat_spring_zip64_zipa_jar, write_jar,
+    write_deflate_miss_plus_empty_deflate_dir, write_fat_spring_store_nested_jar,
+    write_fat_spring_store_nested_zipa_jar, write_fat_spring_zip64_zipa_jar, write_jar,
     write_jar_entries, write_jar_with_comment, write_non_utf8_name_zip,
     write_overlapping_local_zip, write_padded_locals_zip, write_signed_looking_jar,
     write_store_file_plus_dir_cdata, write_store_file_plus_empty_deflate_dir,
@@ -1040,6 +1041,68 @@ fn fat_spring_zip64_zipa_is_listed_raw_on_v021_no_dual_copy_now() {
     if m.jars[0].bit_identical_restore() {
         assert_bit_identical(&jar, &restored);
     }
+}
+
+#[test]
+fn store_nested_zipa_fat_is_outer_listing_tail_no_raw_zip() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("app.jar");
+    write_fat_spring_store_nested_zipa_jar(&jar);
+    let src_len = fs::metadata(&jar).unwrap().len();
+    let src_n = ZipArchive::new(File::open(&jar).unwrap()).unwrap().len();
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert_eq!(m.jars[0].entries.len(), src_n);
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    assert!(
+        m.jars[0].tail_blob.is_some(),
+        "STORE nested zip -A must slice (tail), not skip-exact"
+    );
+    assert_eq!(
+        m.jars[0].prefix_size,
+        Some(spring_boot_launch_script().len() as u64)
+    );
+    for e in &m.jars[0].entries {
+        assert!(
+            e.cdata_blob.is_none(),
+            "{} must not grow cdata_blob",
+            e.name
+        );
+    }
+    assert!(
+        m.jars[0]
+            .entries
+            .iter()
+            .any(|e| e.name.starts_with("BOOT-INF/lib/")),
+        "outer listing must keep nested libs opaque"
+    );
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("app.jar");
+    assert_functional_identity(&jar, &restored);
+    let got = fs::metadata(&restored).unwrap().len();
+    assert!(
+        got * 2 >= src_len,
+        "restored {got} must stay in the same league as source {src_len}"
+    );
+}
+
+#[test]
+fn store_nested_unadjusted_fat_uses_prefix_shift() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("app.jar");
+    write_fat_spring_store_nested_jar(&jar);
+    let src_n = ZipArchive::new(File::open(&jar).unwrap()).unwrap().len();
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert_eq!(m.jars[0].entries.len(), src_n);
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    assert!(m.jars[0].tail_blob.is_some());
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_functional_identity(&jar, &dest.join("app.jar"));
 }
 
 #[test]

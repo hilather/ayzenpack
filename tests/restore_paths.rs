@@ -4,13 +4,14 @@
 mod fixtures;
 
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use ayzenpack::Manifest;
-use fixtures::write_jar;
+use fixtures::{write_fat_spring_store_nested_zipa_jar, write_jar};
 use predicates::prelude::*;
+use zip::ZipArchive;
 
 fn ayzenpack() -> Command {
     Command::cargo_bin("ayzenpack").expect("binary must be named ayzenpack")
@@ -298,6 +299,100 @@ fn restore_paths_recorded_mode_wins_over_prefix_0755() {
         .success();
     let mode = fs::metadata(&jar).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o644, "recorded mode must win over prefix 0755");
+}
+
+#[test]
+fn restore_paths_overwrite_keeps_store_nested_zipa_entries() {
+    // Matt's flags: dehydrate --recursive --sort-inputs --restore-paths
+    // then rehydrate --restore-paths --overwrite (in place, no -d).
+    let dir = tempfile::tempdir().unwrap();
+    let jars = dir.path().join("jars");
+    fs::create_dir_all(&jars).unwrap();
+    let fat = jars.join("app.jar");
+    let classic = jars.join("plain.jar");
+    write_fat_spring_store_nested_zipa_jar(&fat);
+    write_jar(&classic, &[("x.txt", b"classic-plain")]);
+    let fat_src = fs::read(&fat).unwrap();
+    let _classic_src = fs::read(&classic).unwrap();
+    let fat_n = ZipArchive::new(File::open(&fat).unwrap()).unwrap().len();
+    let classic_n = ZipArchive::new(File::open(&classic).unwrap())
+        .unwrap()
+        .len();
+
+    let pack = dir.path().join("pack.ayz");
+    let sidecar = dir.path().join("pack.ayz.manifest.json");
+    ayzenpack()
+        .args([
+            "dehydrate",
+            "--recursive",
+            "--sort-inputs",
+            "--restore-paths",
+            "--write-sidecar-manifest",
+        ])
+        .arg(&sidecar)
+        .arg("-o")
+        .arg(&pack)
+        .arg(&jars)
+        .assert()
+        .success();
+    let m: Manifest = serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+    let fat_rec = m
+        .jars
+        .iter()
+        .find(|j| j.name == "app.jar")
+        .expect("app.jar");
+    assert!(fat_rec.raw_zip_blob.is_none());
+    assert!(fat_rec.tail_blob.is_some());
+    for e in &fat_rec.entries {
+        assert!(e.cdata_blob.is_none());
+    }
+    assert_eq!(fat_rec.entries.len(), fat_n);
+
+    ayzenpack()
+        .args(["rehydrate", "--restore-paths", "--overwrite", "-i"])
+        .arg(&pack)
+        .assert()
+        .success();
+
+    let fat_got = fs::read(&fat).unwrap();
+    let classic_got = fs::read(&classic).unwrap();
+    assert!(
+        fat_got.len() * 2 >= fat_src.len(),
+        "in-place fat {} must not collapse vs source {}",
+        fat_got.len(),
+        fat_src.len()
+    );
+    let fat_zn = ZipArchive::new(std::io::Cursor::new(&fat_got))
+        .unwrap()
+        .len();
+    let classic_zn = ZipArchive::new(std::io::Cursor::new(&classic_got))
+        .unwrap()
+        .len();
+    assert_eq!(fat_zn, fat_n);
+    assert_eq!(classic_zn, classic_n);
+
+    let mut zs = ZipArchive::new(std::io::Cursor::new(&fat_src)).unwrap();
+    let mut zd = ZipArchive::new(std::io::Cursor::new(&fat_got)).unwrap();
+    let mut src_names = Vec::new();
+    let mut dst_names = Vec::new();
+    for i in 0..zs.len() {
+        let mut e = zs.by_index(i).unwrap();
+        src_names.push(e.name().to_string());
+        if e.is_dir() {
+            continue;
+        }
+        let mut a = Vec::new();
+        e.read_to_end(&mut a).unwrap();
+        let mut f = zd.by_name(src_names.last().unwrap()).unwrap();
+        dst_names.push(f.name().to_string());
+        let mut b = Vec::new();
+        f.read_to_end(&mut b).unwrap();
+        assert_eq!(a, b, "uncompressed bytes {}", src_names.last().unwrap());
+    }
+    let dst_order: Vec<String> = (0..zd.len())
+        .map(|i| zd.by_index(i).unwrap().name().to_string())
+        .collect();
+    assert_eq!(src_names, dst_order);
 }
 
 #[test]

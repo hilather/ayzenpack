@@ -96,8 +96,10 @@ fn wrapped_zip64_bytes(launcher: &[u8], files: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 /// Official launch.script + Zip64 outer + `zip -A` + several fat `BOOT-INF/lib`
-/// members (STORE). Listable on 0.2.1; homemade `find_cd_bounds` there missed
-/// the Zip64 locator (classic EOCD fields are not sentinels) → `ZipExact::Raw`.
+/// members (**DEFLATED**, not STORE). DEFLATE hides rust zip's STORE-nested
+/// EOCD latch on `ZipView(prefix)` — keep this fixture; do not flip it to STORE.
+/// Listable on 0.2.1; homemade `find_cd_bounds` there missed the Zip64 locator
+/// (classic EOCD fields are not sentinels) → `ZipExact::Raw`.
 pub fn write_fat_spring_zip64_zipa_jar(path: &Path) {
     use std::io::Cursor;
     let launcher = spring_boot_launch_script();
@@ -128,6 +130,54 @@ pub fn write_fat_spring_zip64_zipa_jar(path: &Path) {
         "outer must be Zip64"
     );
     std::fs::write(path, prepend_launcher(&zip, launcher, true)).unwrap();
+}
+
+/// Classic-u32 fat: official launch.script + `zip -A` + ≥2 STORE `BOOT-INF/lib`
+/// members that are **complete inner zips** (own `PK\x05\x06`). This is the
+/// 0.2.2 latch: `ZipArchive::new(ZipView(prefix))` binds an inner EOCD.
+pub fn write_fat_spring_store_nested_zipa_jar(path: &Path) {
+    write_fat_spring_store_nested(path, true);
+}
+
+/// Same STORE nested libs, unadjusted prefix (Spring default, no `zip -A`).
+pub fn write_fat_spring_store_nested_jar(path: &Path) {
+    write_fat_spring_store_nested(path, false);
+}
+
+fn write_fat_spring_store_nested(path: &Path, zip_a: bool) {
+    use std::io::Cursor;
+    let launcher = spring_boot_launch_script();
+    let nested: Vec<Vec<u8>> = (0..2)
+        .map(|i| inner_incompressible_jar(i, 128 * 1024))
+        .collect();
+    let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    z.start_file("App.class", opts).unwrap();
+    z.write_all(b"class-bytes-outer").unwrap();
+    z.start_file("BOOT-INF/classes/application.properties", opts)
+        .unwrap();
+    z.write_all(b"x=1\n").unwrap();
+    for (i, lib) in nested.iter().enumerate() {
+        let name = format!("BOOT-INF/lib/lib{i}.jar");
+        z.start_file(&name, opts).unwrap();
+        z.write_all(lib).unwrap();
+    }
+    let zip = z.finish().unwrap().into_inner();
+    assert!(
+        zip.windows(4).any(|w| w == b"PK\x05\x06"),
+        "outer must have a classic EOCD"
+    );
+    assert!(
+        !zip.windows(4).any(|w| w == b"PK\x06\x06"),
+        "classic u32 helper must not be Zip64"
+    );
+    for lib in &nested {
+        assert!(
+            lib.windows(4).any(|w| w == b"PK\x05\x06"),
+            "STORE member must be a complete inner zip"
+        );
+    }
+    std::fs::write(path, prepend_launcher(&zip, launcher, zip_a)).unwrap();
 }
 
 fn inner_incompressible_jar(i: usize, nbytes: usize) -> Vec<u8> {
