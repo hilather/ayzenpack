@@ -484,16 +484,26 @@ pub(crate) fn encode_offset(mode: OffsetMode, zip_rel: u64, prefix_len: u64) -> 
     }
 }
 
-/// Patch compressed size + local offset on each CD record. Returns CD byte length.
+/// Rebuild patch for one CD / local record. Beyond `(zip_rel, csize)`: method, crc, usize.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RebuildPatch {
+    pub zip_rel: u64,
+    pub method: u16,
+    pub crc: u32,
+    pub compressed_size: u64,
+    pub uncompressed_size: u64,
+}
+
+/// Patch method, crc, sizes, and local offset on each CD record. Returns CD byte length.
 pub(crate) fn patch_central_directory(
     tail: &mut [u8],
-    updates: &[(u64, u64)],
+    updates: &[RebuildPatch],
     mode: OffsetMode,
     prefix_len: u64,
     jar_name: &str,
 ) -> Result<usize> {
     let mut i = 0usize;
-    for (idx, &(new_zip_rel, new_csize)) in updates.iter().enumerate() {
+    for (idx, update) in updates.iter().enumerate() {
         if i + 46 > tail.len() || tail[i..i + 4] != CD_MAGIC {
             return Err(AyzenpackError::FormatOwned(format!(
                 "{jar_name}: CD record {idx} missing"
@@ -515,10 +525,12 @@ pub(crate) fn patch_central_directory(
         }
         let extra_start = 46 + name_len;
         let rec = &mut tail[i..rec_end];
+        rec[10..12].copy_from_slice(&update.method.to_le_bytes());
+        rec[16..20].copy_from_slice(&update.crc.to_le_bytes());
         let comp32 = u32::from_le_bytes(rec[20..24].try_into().unwrap());
         let uncomp32 = u32::from_le_bytes(rec[24..28].try_into().unwrap());
         let off32 = u32::from_le_bytes(rec[42..46].try_into().unwrap());
-        let new_off = encode_offset(mode, new_zip_rel, prefix_len);
+        let new_off = encode_offset(mode, update.zip_rel, prefix_len);
         let (head, rest) = rec.split_at_mut(extra_start);
         let extra = &mut rest[..extra_len];
         patch_size32_or_zip64(
@@ -526,8 +538,17 @@ pub(crate) fn patch_central_directory(
             extra,
             uncomp32,
             comp32,
-            new_csize,
+            update.compressed_size,
             SizeSlot::Compressed,
+            jar_name,
+        )?;
+        patch_size32_or_zip64(
+            &mut head[24..28],
+            extra,
+            uncomp32,
+            comp32,
+            update.uncompressed_size,
+            SizeSlot::Uncompressed,
             jar_name,
         )?;
         patch_offset32_or_zip64(
@@ -546,6 +567,7 @@ pub(crate) fn patch_central_directory(
 
 enum SizeSlot {
     Compressed,
+    Uncompressed,
 }
 
 fn patch_size32_or_zip64(
@@ -557,14 +579,28 @@ fn patch_size32_or_zip64(
     slot: SizeSlot,
     jar_name: &str,
 ) -> Result<()> {
-    let _ = slot;
-    if comp32 == u32::MAX {
-        patch_zip64_u64(extra, uncomp32 == u32::MAX, true, false, new_val, jar_name)?;
+    let use_zip64 = match slot {
+        SizeSlot::Compressed => comp32 == u32::MAX,
+        SizeSlot::Uncompressed => uncomp32 == u32::MAX,
+    };
+    if use_zip64 {
+        match slot {
+            SizeSlot::Compressed => {
+                patch_zip64_u64(extra, uncomp32 == u32::MAX, true, false, new_val, jar_name)?;
+            }
+            SizeSlot::Uncompressed => {
+                patch_zip64_u64(extra, true, false, false, new_val, jar_name)?;
+            }
+        }
         return Ok(());
     }
     if new_val > u64::from(u32::MAX) {
+        let which = match slot {
+            SizeSlot::Compressed => "compressed",
+            SizeSlot::Uncompressed => "uncompressed",
+        };
         return Err(AyzenpackError::FormatOwned(format!(
-            "{jar_name}: compressed size {new_val} needs Zip64 extra the source did not have"
+            "{jar_name}: {which} size {new_val} needs Zip64 extra the source did not have"
         )));
     }
     field32.copy_from_slice(&(new_val as u32).to_le_bytes());
@@ -624,6 +660,15 @@ fn patch_zip64_u64(
         }
         if tag == ZIP64_EXTRA_ID {
             let mut off = 0usize;
+            if has_uncomp && !has_comp && !has_off {
+                if off + 8 > size {
+                    return Err(AyzenpackError::FormatOwned(format!(
+                        "{jar_name}: Zip64 extra missing uncompressed size"
+                    )));
+                }
+                extra[start + off..start + off + 8].copy_from_slice(&value.to_le_bytes());
+                return Ok(());
+            }
             if has_uncomp {
                 off += 8;
             }
@@ -659,6 +704,7 @@ fn patch_zip64_u64(
     )))
 }
 
+/// Csize-only. GPBF bit 3 returns immediately — that early-return is csize-only.
 pub(crate) fn patch_local_compressed_size(
     header: &mut [u8],
     new_csize: u64,
@@ -673,6 +719,40 @@ pub(crate) fn patch_local_compressed_size(
     if flags & GPBF_DATA_DESC != 0 {
         return Ok(());
     }
+    patch_local_size_fields(header, Some(new_csize), None, jar_name)
+}
+
+/// Class-4 / exotic-method rebuild: write method always, then crc/sizes unless bit 3.
+/// Bit 3 still skips local csize/crc/uncomp (they live in the descriptor).
+pub(crate) fn patch_local_rebuild_fields(
+    header: &mut [u8],
+    method: u16,
+    crc: u32,
+    new_csize: u64,
+    new_uncomp: u64,
+    jar_name: &str,
+) -> Result<()> {
+    if header.len() < 30 {
+        return Err(AyzenpackError::FormatOwned(format!(
+            "{jar_name}: local header too short"
+        )));
+    }
+    header[8..10].copy_from_slice(&method.to_le_bytes());
+    let flags = u16::from_le_bytes([header[6], header[7]]);
+    if flags & GPBF_DATA_DESC != 0 {
+        return Ok(());
+    }
+    header[14..18].copy_from_slice(&crc.to_le_bytes());
+    patch_local_compressed_size(header, new_csize, jar_name)?;
+    patch_local_size_fields(header, None, Some(new_uncomp), jar_name)
+}
+
+fn patch_local_size_fields(
+    header: &mut [u8],
+    new_csize: Option<u64>,
+    new_uncomp: Option<u64>,
+    jar_name: &str,
+) -> Result<()> {
     let comp32 = u32::from_le_bytes(header[18..22].try_into().unwrap());
     let uncomp32 = u32::from_le_bytes(header[22..26].try_into().unwrap());
     let name_len = u16::from_le_bytes([header[26], header[27]]) as usize;
@@ -682,47 +762,68 @@ pub(crate) fn patch_local_compressed_size(
             "{jar_name}: local header extra length mismatch"
         )));
     }
-    let extra = &mut header[30 + name_len..];
-    if comp32 == u32::MAX {
-        patch_zip64_u64(
-            extra,
-            uncomp32 == u32::MAX,
-            true,
-            false,
-            new_csize,
-            jar_name,
-        )?;
-        return Ok(());
+    if let Some(new_csize) = new_csize {
+        let mut field = [0u8; 4];
+        field.copy_from_slice(&header[18..22]);
+        {
+            let extra = &mut header[30 + name_len..];
+            patch_size32_or_zip64(
+                &mut field,
+                extra,
+                uncomp32,
+                comp32,
+                new_csize,
+                SizeSlot::Compressed,
+                jar_name,
+            )?;
+        }
+        header[18..22].copy_from_slice(&field);
     }
-    if new_csize > u64::from(u32::MAX) {
-        return Err(AyzenpackError::FormatOwned(format!(
-            "{jar_name}: compressed size {new_csize} needs Zip64 extra the source did not have"
-        )));
+    if let Some(new_uncomp) = new_uncomp {
+        let mut field = [0u8; 4];
+        field.copy_from_slice(&header[22..26]);
+        {
+            let extra = &mut header[30 + name_len..];
+            patch_size32_or_zip64(
+                &mut field,
+                extra,
+                uncomp32,
+                comp32,
+                new_uncomp,
+                SizeSlot::Uncompressed,
+                jar_name,
+            )?;
+        }
+        header[22..26].copy_from_slice(&field);
     }
-    header[18..22].copy_from_slice(&(new_csize as u32).to_le_bytes());
     Ok(())
 }
 
 pub(crate) fn patch_data_descriptor(
     desc: &[u8],
+    crc: u32,
     new_csize: u64,
+    new_uncomp: u64,
     jar_name: &str,
 ) -> Result<Vec<u8>> {
     let mut d = desc.to_vec();
     let has_sig = d.starts_with(&DATA_DESC_MAGIC);
     let crc_off = if has_sig { 4 } else { 0 };
     let csize_off = crc_off + 4;
+    d[crc_off..crc_off + 4].copy_from_slice(&crc.to_le_bytes());
     match d.len() {
         12 | 16 => {
-            if new_csize > u64::from(u32::MAX) {
+            if new_csize > u64::from(u32::MAX) || new_uncomp > u64::from(u32::MAX) {
                 return Err(AyzenpackError::FormatOwned(format!(
-                    "{jar_name}: descriptor compressed size does not fit u32"
+                    "{jar_name}: descriptor size does not fit u32"
                 )));
             }
             d[csize_off..csize_off + 4].copy_from_slice(&(new_csize as u32).to_le_bytes());
+            d[csize_off + 4..csize_off + 8].copy_from_slice(&(new_uncomp as u32).to_le_bytes());
         }
         20 | 24 => {
             d[csize_off..csize_off + 8].copy_from_slice(&new_csize.to_le_bytes());
+            d[csize_off + 8..csize_off + 16].copy_from_slice(&new_uncomp.to_le_bytes());
         }
         _ => {
             return Err(AyzenpackError::FormatOwned(format!(
@@ -871,6 +972,47 @@ mod tests {
             }
             ZipExact::Raw(_) => panic!("stored zip must slice"),
         }
+    }
+
+    #[test]
+    fn patch_local_rebuild_writes_method_when_gpbf_bit3() {
+        let mut header = vec![0u8; 30];
+        header[0..4].copy_from_slice(&LOCAL_FILE_MAGIC);
+        header[6..8].copy_from_slice(&GPBF_DATA_DESC.to_le_bytes());
+        header[8..10].copy_from_slice(&8u16.to_le_bytes());
+        header[14..18].copy_from_slice(&0x1111_1111u32.to_le_bytes());
+        header[18..22].copy_from_slice(&4u32.to_le_bytes());
+        header[22..26].copy_from_slice(&4u32.to_le_bytes());
+        patch_local_rebuild_fields(&mut header, 0, 0, 0, 0, "bit3.jar").unwrap();
+        assert_eq!(u16::from_le_bytes([header[8], header[9]]), 0);
+        assert_eq!(
+            u32::from_le_bytes(header[14..18].try_into().unwrap()),
+            0x1111_1111,
+            "bit 3 must not write crc in the local header"
+        );
+        assert_eq!(
+            u32::from_le_bytes(header[18..22].try_into().unwrap()),
+            4,
+            "bit 3 early-return stays csize-only"
+        );
+        assert_eq!(
+            u32::from_le_bytes(header[22..26].try_into().unwrap()),
+            4,
+            "bit 3 must not write uncomp in the local header"
+        );
+    }
+
+    #[test]
+    fn patch_data_descriptor_writes_crc_csize_uncomp() {
+        let mut desc = vec![0u8; 16];
+        desc[0..4].copy_from_slice(&DATA_DESC_MAGIC);
+        desc[4..8].copy_from_slice(&0xaaaaaaaau32.to_le_bytes());
+        desc[8..12].copy_from_slice(&4u32.to_le_bytes());
+        desc[12..16].copy_from_slice(&4u32.to_le_bytes());
+        let out = patch_data_descriptor(&desc, 0, 0, 0, "bit3.jar").unwrap();
+        assert_eq!(&out[4..8], &0u32.to_le_bytes());
+        assert_eq!(&out[8..12], &0u32.to_le_bytes());
+        assert_eq!(&out[12..16], &0u32.to_le_bytes());
     }
 
     #[test]

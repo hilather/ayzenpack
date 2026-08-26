@@ -28,9 +28,7 @@ The manifest is a ZIP-slot index (ratarmount-style pointers), not a second copy 
 
 ## Current tree vs this contract
 
-Crate **0.2.0** / format **v2** already groups uncompressed blobs in 4 MiB record-aligned zstd frames. That part is correct.
-
-`src/dehydrate.rs` `StorePolicy::MixedExact` / `ExactWithExotic` still **writes** `cdata_blob` (class-4 / mixed-exotic). That violates this contract. `PLAN.md` is the 0.2.1 fix. Do not expand those arms. Do not add new `cdata_blob` puts. Do not “fix” mix size by storing more cdata.
+Crate **0.2.1** / format **v2** groups uncompressed blobs in 4 MiB record-aligned zstd frames and **never writes** `cdata_blob` on STORE/DEFLATE (CleanMiss rebuilds class-4 / mixed-exotic). Crate 0.2.0 leftover MixedExact / ExactWithExotic dual copies still read. Do not add new `cdata_blob` puts. Do not “fix” mix size by storing more cdata.
 
 ## Tests that must fail
 

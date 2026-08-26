@@ -78,9 +78,11 @@ impl Entry {
             return true;
         }
         if self.is_dir {
-            // Empty STORE / empty-cdata dirs splice `[]`. A method-8 empty
-            // DEFLATE dir (`03 00`) needs `cdata_codec` or rebuild.
-            return self.method_code == 0 || self.compressed_size == 0;
+            // Exact-splice a directory only when both sizes are 0 (empty STORE).
+            // A method-0 dir with leftover local cdata (csize != 0) is not a splice.
+            // A payload dir (uncompressed_size != 0, fixture DIRC) is not a splice.
+            // A method-8 empty DEFLATE dir (`03 00`) needs `cdata_codec` or rebuild.
+            return self.uncompressed_size == 0 && self.compressed_size == 0;
         }
         self.method_code == 0
     }
@@ -520,6 +522,55 @@ mod tests {
         assert_key_order(&s2, &["utf8_flag", "name_raw_hex"]);
         let round: Entry = serde_json::from_str(&s2).unwrap();
         assert_eq!(round, with);
+    }
+
+    fn dir_entry(uncomp: u64, csize: u64, method: u16) -> Entry {
+        let mut e = sample_file_entry();
+        e.name = "marked/".into();
+        e.is_dir = true;
+        e.blob = None;
+        e.sha256 = None;
+        e.method = if method == 0 {
+            "stored".into()
+        } else {
+            "deflated".into()
+        };
+        e.method_code = method;
+        e.uncompressed_size = uncomp;
+        e.compressed_size = csize;
+        e
+    }
+
+    #[test]
+    fn can_exact_cdata_dir_requires_both_sizes_zero() {
+        let empty = dir_entry(0, 0, 0);
+        assert!(empty.can_exact_cdata(), "empty STORE dir is exact-splice");
+
+        let payload = dir_entry(4, 4, 0);
+        assert!(
+            !payload.can_exact_cdata(),
+            "method-0 dir with payload must not splice []"
+        );
+
+        let leftover_csize = dir_entry(0, 4, 0);
+        assert!(
+            !leftover_csize.can_exact_cdata(),
+            "method-0 dir with leftover local cdata is not exact"
+        );
+
+        let maven = dir_entry(0, 2, 8);
+        assert!(
+            !maven.can_exact_cdata(),
+            "empty DEFLATE dir needs codec or rebuild"
+        );
+
+        let mut with_blob = payload.clone();
+        with_blob.cdata_blob = Some(EMPTY_BLAKE3.into());
+        assert!(with_blob.can_exact_cdata(), "legacy cdata_blob still wins");
+
+        let mut with_codec = maven.clone();
+        with_codec.cdata_codec = Some("deflate-raw:flate2:6".into());
+        assert!(with_codec.can_exact_cdata(), "cdata_codec still wins");
     }
 
     #[test]

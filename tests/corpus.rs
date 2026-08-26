@@ -511,13 +511,14 @@ fn corpus_mix_regular_and_spring_whole_file_hashes() {
     let mut hash_mismatch_proven_miss = 0u64;
     for jar in &manifest.jars {
         for e in &jar.entries {
+            if e.cdata_blob.is_some() {
+                cdata_blob += 1;
+            }
             if e.is_dir || e.method_code != 8 {
                 continue;
             }
             if e.cdata_codec.is_some() {
                 codec_hit += 1;
-            } else if e.cdata_blob.is_some() {
-                cdata_blob += 1;
             } else {
                 codec_miss += 1;
             }
@@ -599,6 +600,10 @@ fn corpus_mix_regular_and_spring_whole_file_hashes() {
         cdata_blob,
         hash_match,
         hash_mismatch_proven_miss
+    );
+    assert_eq!(
+        cdata_blob, 0,
+        "mix must not write cdata_blob on any entry (file or dir, any method)"
     );
     assert!(
         hash_match >= 1,
