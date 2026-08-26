@@ -14,13 +14,13 @@ use ayzenpack::hashutil::blake3_bytes;
 use ayzenpack::manifest::Manifest;
 use ayzenpack::{dehydrate, rehydrate, verify, DehydrateOptions, RehydrateOptions};
 use fixtures::{
-    spring_boot_launch_script, write_data_descriptor_zip,     write_deflate_miss_plus_dir_cdata,
-    write_deflate_miss_plus_empty_deflate_dir, write_store_file_plus_empty_deflate_dir,
-    write_jar, write_jar_entries, write_jar_with_comment, write_non_utf8_name_zip,
-    write_padded_locals_zip, write_signed_looking_jar, write_stored_block_deflate_wrapped,
-    write_stored_block_deflate_zip, write_stored_jar_dos_zero, write_stored_zip,
-    write_wrapped_jar, write_wrapped_jar_adjusted, write_wrapped_zip64_jar, zip64_jar_bytes,
-    JarEntry, SPRING_LAUNCHER,
+    spring_boot_launch_script, write_data_descriptor_zip, write_deflate_miss_plus_dir_cdata,
+    write_deflate_miss_plus_empty_deflate_dir, write_jar, write_jar_entries,
+    write_jar_with_comment, write_non_utf8_name_zip, write_padded_locals_zip,
+    write_signed_looking_jar, write_store_file_plus_empty_deflate_dir,
+    write_stored_block_deflate_wrapped, write_stored_block_deflate_zip, write_stored_jar_dos_zero,
+    write_stored_zip, write_wrapped_jar, write_wrapped_jar_adjusted, write_wrapped_zip64_jar,
+    zip64_jar_bytes, JarEntry, SPRING_LAUNCHER,
 };
 use zip::{CompressionMethod, DateTime, ZipArchive};
 
@@ -1830,14 +1830,12 @@ fn class4_miss_plus_dir_cdata_keeps_cdata_blob() {
     dehydrate(&opts(&out, vec![jar.clone()]))
         .expect("class-4 fixture must be dehydratable (dir-with-cdata + stored-block miss)");
     let m = manifest_from_records(&read_archive(&out).2);
-    let file = m
-        .jars[0]
+    let file = m.jars[0]
         .entries
         .iter()
         .find(|e| e.name == "a.txt")
         .expect("file");
-    let dir_ent = m
-        .jars[0]
+    let dir_ent = m.jars[0]
         .entries
         .iter()
         .find(|e| e.is_dir || e.name.ends_with('/'))

@@ -1094,8 +1094,10 @@ fn fill_exact_entry(
         let (b3, s256) = hash_both(&local.cdata);
         remember_blob(sink, &local.cdata, b3, s256)?;
         entry.cdata_blob = Some(hex_lower(&b3));
-    } else if let (StorePolicy::CleanExact | StorePolicy::ExactWithExotic, LocalClass::DeflateHit(level)) =
-        (policy, class)
+    } else if let (
+        StorePolicy::CleanExact | StorePolicy::ExactWithExotic,
+        LocalClass::DeflateHit(level),
+    ) = (policy, class)
     {
         entry.cdata_codec = Some(crate::deflate::codec_string(level));
     }

@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 pub mod cas;
-pub mod dehydrate;
 mod deflate;
+pub mod dehydrate;
 pub mod error;
 mod exact;
 pub mod format;

@@ -95,8 +95,20 @@ fn wrapped_zip64_bytes(launcher: &[u8], files: &[(&str, &[u8])]) -> Vec<u8> {
     out
 }
 
+/// Prepend `launcher` to an existing ZIP/JAR. `zip_a` applies Info-ZIP `zip -A`
+/// (classic u32 CD/EOCD only — do not use on Zip64).
+pub fn prepend_launcher(zip: &[u8], launcher: &[u8], zip_a: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(launcher.len() + zip.len());
+    out.extend_from_slice(launcher);
+    out.extend_from_slice(zip);
+    if zip_a {
+        adjust_self_extracting_offsets(&mut out, u32::try_from(launcher.len()).unwrap());
+    }
+    out
+}
+
 /// Info-ZIP `zip -A`: CD/local offsets become file-absolute (include the stub).
-fn adjust_self_extracting_offsets(buf: &mut [u8], delta: u32) {
+pub fn adjust_self_extracting_offsets(buf: &mut [u8], delta: u32) {
     const EOCD_MIN: usize = 22;
     let eocd = {
         assert!(buf.len() >= EOCD_MIN);

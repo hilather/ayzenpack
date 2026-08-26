@@ -248,3 +248,51 @@ Existing `tests/corpus.rs` overlap tests (env-gated) should still pass; update a
 - Rebuild does not preserve zipalign padding (pads dropped). Miss fixtures are not aligned.
 - Rebuild refuses rather than invent Zip64 extras if a size crosses 4 GiB without an existing extra.
 - Residual: a crafted pack with `cdata_codec` but wrong content still fails encode-size/`source_*` checks on the exact path.
+
+## Follow-up: corpus mix + whole-file hash CI
+
+Matt: CI must pack a **complex mix** of regular JARs plus Spring Boot bash-prefix JARs and compare **before/after whole-file hashes**. Existing coverage is not enough:
+
+| What exists | Why it is not enough |
+|---|---|
+| `tests/roundtrip.rs` `mixed_regular_and_spring_pack_trailer_is_ayzptlr1_and_rehydrates` | Tiny ZipWriter fixtures, not Maven. Stays as-is. |
+| `tests/corpus.rs` `corpus_overlap_roundtrip` | `assert_functional_identity` only (entries/CRC/order). No whole-file hash. No Spring wrappers. |
+| `corpus.yml` CLI overlap step | dehydrate/rehydrate only; no `cmp`/`sha256`. No Spring wrappers. |
+
+### Mix to build (no extra Maven downloads)
+
+Reuse pinned `.corpus` artifacts + in-tree `tests/fixtures/spring-boot-3.5.0-launch.script` (rendered via `spring_boot_launch_script()`, same as the tiny mix). Build a temp mix directory:
+
+1. **Regular (unmodified copies):** `failureaccess-1.0.2.jar`, `slf4j-api-2.0.16.jar`, `jackson-annotations-2.17.2.jar` (small, classic ZIP, not Zip64).
+2. **Spring unadjusted:** official launch.script prepended to **unmodified** `jackson-core-2.17.2.jar` bytes. CD offsets stay zip-relative.
+3. **zip -A adjusted:** launch.script prepended to `slf4j-api-2.0.16.jar` (or failureaccess), then `adjust_self_extracting_offsets` (make that helper `pub` in `tests/fixtures.rs`). Classic EOCD only — do **not** zip -A a Zip64 Maven JAR; the helper only patches u32 CD/EOCD fields.
+4. **Zip64 nested-lib fat:** `write_wrapped_zip64_jar` with official script + `BOOT-INF/lib/failureaccess.jar` = real failureaccess bytes + a tiny `App.class`. Zip crate `large_file` + `set_zip64_comment` so Zip64 EOCD/locator exist. Nested JAR stays an opaque entry (not exploded). This wrapper is zip-crate DEFLATE → expected **codec hit** → whole-file hash **must** match.
+
+One `.ayz` for the whole mix. Rehydrate. Compare **blake3 and sha256** of each source file vs restored (`hashutil::hash_reader`, not a silent entry-map substitute).
+
+### Hash-compare gate (do not silently weaken)
+
+Whole-file hash equality is the gate for **bit-identical** restore.
+
+Mix filenames must be **unique basenames** (`unique_basename` is filename-only). Do not write two `slf4j-api-2.0.16.jar` into the mix dir. Example names: `plain-failureaccess.jar`, `plain-slf4j.jar`, `plain-jackson-annotations.jar`, `spring-jackson-core.jar`, `spring-zipa-slf4j.jar`, `spring-zip64-nested.jar`. `failureaccess` lives at **corpus root** (not under `apps/*/lib`).
+
+For each restored file vs its source:
+
+1. Always compute and print `blake3` + `sha256` (before/after). This is the compare; do not drop it.
+2. If `jar.bit_identical_restore()` (codec hit / STORE / `cdata_blob` / `raw_zip`): **fail** if either hash differs.
+3. If hashes differ: **fail** unless the jar is `metadata_rebuild()` **and** every method-8 **file** has no `cdata_codec` (proven flate2 miss). That proof is an assertion, not a comment.
+4. On that proven-miss branch, **also** `assert_functional_identity` (ZipArchive opens; names/order/uncompressed bytes/CRC) and, for prefixed jars, assert the restored file still starts with the official launch.script bytes. Hash compare stays; functional identity is the residual so a garbage rebuild cannot pass on “hashes differ + miss.” Do **not** replace the hash loop with functional-only.
+5. The **Zip64 nested-lib fat** (mix item 4) is zip-crate DEFLATE: must be `bit_identical_restore()` and hash-match. If it rebuilds, fail.
+6. Maven members (regular + Spring-wrapped **real** JARs, mix items 1–3) are expected to miss (Java zlib ≠ miniz; earlier unique-26 run was **0 / 19410** file codec hits). Hash mismatch on those is allowed **only** after the miss proof in (3)+(4). Say so in the PR. Still print the hashes.
+
+Also print mix pack stats: `bytes_in_jars`, `output_len`, `bytes_unique_blobs`, codec hit/miss/`cdata_blob` counts, `.ayz / sum(jars)`.
+
+### Wiring
+
+- New env-gated test in `tests/corpus.rs`: `corpus_mix_regular_and_spring_whole_file_hashes` (skip unless `AYZENPACK_CORPUS_DIR`). Offline default `cargo test` stays offline.
+- `.github/workflows/corpus.yml` already runs `cargo test --locked --test corpus` with that env on every PR/main — **that is the hash-gate CI path**. Do **not** add `ci/corpus-mix.sh` / a second zip-A implementation / a `list --json` jq on `metadata_rebuild` (`Jar` methods are not serde fields; `list --json` cannot express the gate without duplicating `can_exact_cdata`).
+- Optional extra CLI step: after release build, `ayzenpack list --json` is **not** used as the gate. The existing overlap CLI step stays functional-only (as today).
+- Bump `timeout-minutes` **20 → 25** and update `corpus_yml_linux_timeout_cache_dev_profile` (string `timeout-minutes: 25`).
+- Export `adjust_self_extracting_offsets` (or a `pub fn prepend_launcher(zip, launcher, zip_a: bool) -> Vec<u8>`) from `tests/fixtures.rs`. Corpus test `#[path = "fixtures.rs"]` and uses `spring_boot_launch_script()` (rendered), not the raw `{{placeholder}}` template. zip-A `delta` = prepended length.
+
+Do not add `--exact-cdata`. Do not explode nested JARs. Do not download extra artifacts.

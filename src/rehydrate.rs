@@ -627,7 +627,12 @@ fn read_entry_content(jar: &Jar, e: &Entry, cas_dir: &Path) -> Result<Vec<u8>> {
     read_named_blob(cas_dir, hex, &format!("{}!{}", jar.name, e.name))
 }
 
-fn write_rebuilt_jar(jar: &Jar, cas_dir: &Path, dest: &Path, apply_prefix_chmod: bool) -> Result<()> {
+fn write_rebuilt_jar(
+    jar: &Jar,
+    cas_dir: &Path,
+    dest: &Path,
+    apply_prefix_chmod: bool,
+) -> Result<()> {
     let mut file = File::create(dest).map_err(|source| AyzenpackError::Io {
         source,
         path: Some(dest.to_path_buf()),

@@ -54,12 +54,12 @@ pub fn codec_string(level: u32) -> String {
 }
 
 pub fn parse_codec(codec: &str) -> Result<u32> {
-    let rest = codec.strip_prefix(CODEC_PREFIX).ok_or_else(|| {
-        AyzenpackError::FormatOwned(format!("unrecognized cdata_codec {codec}"))
-    })?;
-    let level: u32 = rest.parse().map_err(|_| {
-        AyzenpackError::FormatOwned(format!("unrecognized cdata_codec {codec}"))
-    })?;
+    let rest = codec
+        .strip_prefix(CODEC_PREFIX)
+        .ok_or_else(|| AyzenpackError::FormatOwned(format!("unrecognized cdata_codec {codec}")))?;
+    let level: u32 = rest
+        .parse()
+        .map_err(|_| AyzenpackError::FormatOwned(format!("unrecognized cdata_codec {codec}")))?;
     if !matches!(level, 1 | 3 | 6 | 9) {
         return Err(AyzenpackError::FormatOwned(format!(
             "unrecognized cdata_codec {codec}"
@@ -83,10 +83,7 @@ pub fn match_deflate(plain: &[u8], want: &[u8], flags: u16) -> Result<Option<u32
 }
 
 fn io_err(source: io::Error) -> AyzenpackError {
-    AyzenpackError::Io {
-        source,
-        path: None,
-    }
+    AyzenpackError::Io { source, path: None }
 }
 
 #[cfg(test)]

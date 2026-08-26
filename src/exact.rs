@@ -684,7 +684,14 @@ pub(crate) fn patch_local_compressed_size(
     }
     let extra = &mut header[30 + name_len..];
     if comp32 == u32::MAX {
-        patch_zip64_u64(extra, uncomp32 == u32::MAX, true, false, new_csize, jar_name)?;
+        patch_zip64_u64(
+            extra,
+            uncomp32 == u32::MAX,
+            true,
+            false,
+            new_csize,
+            jar_name,
+        )?;
         return Ok(());
     }
     if new_csize > u64::from(u32::MAX) {
@@ -696,7 +703,11 @@ pub(crate) fn patch_local_compressed_size(
     Ok(())
 }
 
-pub(crate) fn patch_data_descriptor(desc: &[u8], new_csize: u64, jar_name: &str) -> Result<Vec<u8>> {
+pub(crate) fn patch_data_descriptor(
+    desc: &[u8],
+    new_csize: u64,
+    jar_name: &str,
+) -> Result<Vec<u8>> {
     let mut d = desc.to_vec();
     let has_sig = d.starts_with(&DATA_DESC_MAGIC);
     let crc_off = if has_sig { 4 } else { 0 };
@@ -740,8 +751,7 @@ pub(crate) fn patch_eocd_cd_start(
                 "{jar_name}: new CD offset does not fit classic EOCD"
             )));
         }
-        tail[eocd + 16..eocd + 20]
-            .copy_from_slice(&(new_cd_start_encoded as u32).to_le_bytes());
+        tail[eocd + 16..eocd + 20].copy_from_slice(&(new_cd_start_encoded as u32).to_le_bytes());
     }
     if eocd >= 20 && tail[eocd - 20..eocd][..4] == ZIP64_LOCATOR_MAGIC {
         let loc = eocd - 20;
