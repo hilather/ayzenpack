@@ -1,0 +1,54 @@
+name: Corpus
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  corpus:
+    name: pinned-maven-corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        id: corpus-cache
+        with:
+          path: ${{ github.workspace }}/.corpus
+          key: corpus-${{ hashFiles('ci/corpus.lock.json') }}
+      - name: Download pinned corpus
+        run: ci/download-corpus.sh
+        env:
+          CORPUS_DIR: ${{ github.workspace }}/.corpus
+          LOCKFILE: ${{ github.workspace }}/ci/corpus.lock.json
+      - uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        if: steps.corpus-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ github.workspace }}/.corpus
+          key: corpus-${{ hashFiles('ci/corpus.lock.json') }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: cargo fetch
+        run: cargo fetch --locked
+      - name: cargo test corpus (dev profile)
+        # Dev profile only: [profile.release] panic = abort breaks the harness.
+        run: cargo test --locked --test corpus -- --nocapture
+        env:
+          CARGO_NET_OFFLINE: "true"
+          AYZENPACK_CORPUS_DIR: ${{ github.workspace }}/.corpus
+      - name: cargo build --release
+        run: cargo build --release --locked
+        env:
+          CARGO_NET_OFFLINE: "true"
+      - name: CLI overlap round-trip
+        env:
+          CORPUS_DIR: ${{ github.workspace }}/.corpus
+        run: |
+          set -euo pipefail
+          ./target/release/ayzenpack dehydrate --sort-inputs -o /tmp/overlap.ayz --recursive "${CORPUS_DIR}/apps"
+          ./target/release/ayzenpack verify -i /tmp/overlap.ayz
+          ./target/release/ayzenpack rehydrate -i /tmp/overlap.ayz -d /tmp/restored --overwrite

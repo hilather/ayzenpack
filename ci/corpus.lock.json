@@ -1,0 +1,202 @@
+{
+  "artifacts": [
+    {
+      "dest": "guava-33.2.1-jre.jar",
+      "url": "https://repo1.maven.org/maven2/com/google/guava/guava/33.2.1-jre/guava-33.2.1-jre.jar",
+      "sha256": "452b2d9787b7d366fa8cf5ed9a1c40404542d05effa7a598da03bbbbb76d9f31"
+    },
+    {
+      "dest": "jackson-core-2.17.2.jar",
+      "url": "https://repo1.maven.org/maven2/com/fasterxml/jackson/core/jackson-core/2.17.2/jackson-core-2.17.2.jar",
+      "sha256": "721a189241dab0525d9e858e5cb604d3ecc0ede081e2de77d6f34fa5779a5b46",
+      "size": 581927
+    },
+    {
+      "dest": "jackson-databind-2.17.2.jar",
+      "url": "https://repo1.maven.org/maven2/com/fasterxml/jackson/core/jackson-databind/2.17.2/jackson-databind-2.17.2.jar",
+      "sha256": "c04993f33c0f845342653784f14f38373d005280e6359db5f808701cfae73c0c",
+      "size": 1649454
+    },
+    {
+      "dest": "jackson-annotations-2.17.2.jar",
+      "url": "https://repo1.maven.org/maven2/com/fasterxml/jackson/core/jackson-annotations/2.17.2/jackson-annotations-2.17.2.jar",
+      "sha256": "873a606e23507969f9bbbea939d5e19274a88775ea5a169ba7e2d795aa5156e1",
+      "size": 78492
+    },
+    {
+      "dest": "spring-core-6.1.12.jar",
+      "url": "https://repo1.maven.org/maven2/org/springframework/spring-core/6.1.12/spring-core-6.1.12.jar",
+      "sha256": "010d6398c7f65bc2da3c38bcd6c0ebb796f4fe3255800bc05e712f43d4fca7fb",
+      "size": 1882923
+    },
+    {
+      "dest": "spring-beans-6.1.12.jar",
+      "url": "https://repo1.maven.org/maven2/org/springframework/spring-beans/6.1.12/spring-beans-6.1.12.jar",
+      "sha256": "5035e862c4faa34349f99eef28380dedf9940a3002218c3e501d60a8cc893e3f",
+      "size": 862392
+    },
+    {
+      "dest": "spring-context-6.1.12.jar",
+      "url": "https://repo1.maven.org/maven2/org/springframework/spring-context/6.1.12/spring-context-6.1.12.jar",
+      "sha256": "576350e8390c59057e7d339441e0ae8c2bf08e1f2c8e1d59415c21dc7ed2c9f0",
+      "size": 1305612
+    },
+    {
+      "dest": "spring-web-6.1.12.jar",
+      "url": "https://repo1.maven.org/maven2/org/springframework/spring-web/6.1.12/spring-web-6.1.12.jar",
+      "sha256": "a9e1315efafdd2a2f280b77819cfcfd0970e83c768a4ac92d54be448e8189764",
+      "size": 1901655
+    },
+    {
+      "dest": "lucene-core-9.11.1.jar",
+      "url": "https://repo1.maven.org/maven2/org/apache/lucene/lucene-core/9.11.1/lucene-core-9.11.1.jar",
+      "sha256": "cb7a9b121bce4ce054ab690ab43ac13ee11ae516d6cef67650130066beee7c9b"
+    },
+    {
+      "dest": "lucene-analysis-common-9.11.1.jar",
+      "url": "https://repo1.maven.org/maven2/org/apache/lucene/lucene-analysis-common/9.11.1/lucene-analysis-common-9.11.1.jar",
+      "sha256": "8dfda34e75bc53906a611bae1b5870b38fd5aa3779a390565da40aa71e98d5d9"
+    },
+    {
+      "dest": "lucene-queryparser-9.11.1.jar",
+      "url": "https://repo1.maven.org/maven2/org/apache/lucene/lucene-queryparser/9.11.1/lucene-queryparser-9.11.1.jar",
+      "sha256": "63e3f7d0cd7a08975d0cba31d2898de7fa00dc9f3677e37820f4413824538898"
+    },
+    {
+      "dest": "lucene-highlighter-9.11.1.jar",
+      "url": "https://repo1.maven.org/maven2/org/apache/lucene/lucene-highlighter/9.11.1/lucene-highlighter-9.11.1.jar",
+      "sha256": "af91d9a44a6519e6283ec004cf751dbd429018ae80881dd5073b3862fdfd404d"
+    },
+    {
+      "dest": "lucene-suggest-9.11.1.jar",
+      "url": "https://repo1.maven.org/maven2/org/apache/lucene/lucene-suggest/9.11.1/lucene-suggest-9.11.1.jar",
+      "sha256": "ce03d7178182694a14ed0433cff532a44b3647cec8d9c1ac541afe7887972105"
+    },
+    {
+      "dest": "lucene-backward-codecs-9.11.1.jar",
+      "url": "https://repo1.maven.org/maven2/org/apache/lucene/lucene-backward-codecs/9.11.1/lucene-backward-codecs-9.11.1.jar",
+      "sha256": "d542520817bc9e30b4ece418b36696cfa913425ba6ccdabcb1b5250c08316556"
+    },
+    {
+      "dest": "lucene-codecs-9.11.1.jar",
+      "url": "https://repo1.maven.org/maven2/org/apache/lucene/lucene-codecs/9.11.1/lucene-codecs-9.11.1.jar",
+      "sha256": "3259aa9e06ea96cfb57b1929eb35a0228da51a334f452b9bbcc8f009eae6dc6d"
+    },
+    {
+      "dest": "kafka-clients-3.8.0.jar",
+      "url": "https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.8.0/kafka-clients-3.8.0.jar",
+      "sha256": "68877a34a19b5f7ef1c3e2ee0abf727e0be626556dc0dbbf20527380252f1745"
+    },
+    {
+      "dest": "kafka_2.13-3.8.0.jar",
+      "url": "https://repo1.maven.org/maven2/org/apache/kafka/kafka_2.13/3.8.0/kafka_2.13-3.8.0.jar",
+      "sha256": "28360898432938ea4c5cd6cf8049eb41a0118a7b88337891708bed657a736cbb"
+    },
+    {
+      "dest": "netty-common-4.1.112.Final.jar",
+      "url": "https://repo1.maven.org/maven2/io/netty/netty-common/4.1.112.Final/netty-common-4.1.112.Final.jar",
+      "sha256": "b03967f32c65de5ed339b97729170e0289b22ffa5729e7f45f68bf6b431fb567",
+      "size": 694486
+    },
+    {
+      "dest": "netty-buffer-4.1.112.Final.jar",
+      "url": "https://repo1.maven.org/maven2/io/netty/netty-buffer/4.1.112.Final/netty-buffer-4.1.112.Final.jar",
+      "sha256": "bc182c48f5369d48cd8370d2ab0c5b8d99dd8ffa4a0f8ac701652d57bd380eff",
+      "size": 336505
+    },
+    {
+      "dest": "netty-codec-4.1.112.Final.jar",
+      "url": "https://repo1.maven.org/maven2/io/netty/netty-codec/4.1.112.Final/netty-codec-4.1.112.Final.jar",
+      "sha256": "72db4f93629f7ea520d2998c08e2b1d69f9c6a4792b53da5e9a001d24c78b151",
+      "size": 352121
+    },
+    {
+      "dest": "netty-transport-4.1.112.Final.jar",
+      "url": "https://repo1.maven.org/maven2/io/netty/netty-transport/4.1.112.Final/netty-transport-4.1.112.Final.jar",
+      "sha256": "d38e31624d25ca790ee413d529c152170217ebedbcdcf61164fa6291f3a56c92",
+      "size": 517957
+    },
+    {
+      "dest": "netty-handler-4.1.112.Final.jar",
+      "url": "https://repo1.maven.org/maven2/io/netty/netty-handler/4.1.112.Final/netty-handler-4.1.112.Final.jar",
+      "sha256": "ea4d6062a5fb10a6e2364d8bbdebc1cfa814f1fc9f910ef57e5caf02fb15c588",
+      "size": 571223
+    },
+    {
+      "dest": "slf4j-api-2.0.16.jar",
+      "url": "https://repo1.maven.org/maven2/org/slf4j/slf4j-api/2.0.16/slf4j-api-2.0.16.jar",
+      "sha256": "a12578dde1ba00bd9b816d388a0b879928d00bab3c83c240f7013bf4196c579a",
+      "size": 69435
+    },
+    {
+      "dest": "log4j-api-2.23.1.jar",
+      "url": "https://repo1.maven.org/maven2/org/apache/logging/log4j/log4j-api/2.23.1/log4j-api-2.23.1.jar",
+      "sha256": "92ec1fd36ab3bc09de6198d2d7c0914685c0f7127ea931acc32fd2ecdd82ea89",
+      "size": 342535
+    },
+    {
+      "dest": "log4j-core-2.23.1.jar",
+      "url": "https://repo1.maven.org/maven2/org/apache/logging/log4j/log4j-core/2.23.1/log4j-core-2.23.1.jar",
+      "sha256": "7079368005fc34f56248f57f8a8a53361c3a53e9007d556dbc66fc669df081b5",
+      "size": 1901886
+    },
+    {
+      "dest": "failureaccess-1.0.2.jar",
+      "url": "https://repo1.maven.org/maven2/com/google/guava/failureaccess/1.0.2/failureaccess-1.0.2.jar",
+      "sha256": "8a8f81cf9b359e3f6dfa691a1e776985c061ef2f223c9b2c80753e1b458e8064",
+      "size": 4740
+    }
+  ],
+  "copies": [
+    {
+      "dir": "apps/web/lib",
+      "artifacts": [
+        "guava-33.2.1-jre.jar",
+        "jackson-core-2.17.2.jar",
+        "jackson-databind-2.17.2.jar",
+        "jackson-annotations-2.17.2.jar",
+        "spring-core-6.1.12.jar",
+        "spring-beans-6.1.12.jar",
+        "spring-context-6.1.12.jar",
+        "spring-web-6.1.12.jar",
+        "slf4j-api-2.0.16.jar",
+        "log4j-api-2.23.1.jar",
+        "log4j-core-2.23.1.jar"
+      ]
+    },
+    {
+      "dir": "apps/search/lib",
+      "artifacts": [
+        "guava-33.2.1-jre.jar",
+        "jackson-core-2.17.2.jar",
+        "jackson-databind-2.17.2.jar",
+        "jackson-annotations-2.17.2.jar",
+        "lucene-core-9.11.1.jar",
+        "lucene-analysis-common-9.11.1.jar",
+        "lucene-queryparser-9.11.1.jar",
+        "lucene-highlighter-9.11.1.jar",
+        "lucene-suggest-9.11.1.jar",
+        "lucene-backward-codecs-9.11.1.jar",
+        "lucene-codecs-9.11.1.jar"
+      ]
+    },
+    {
+      "dir": "apps/mq/lib",
+      "artifacts": [
+        "jackson-core-2.17.2.jar",
+        "jackson-databind-2.17.2.jar",
+        "jackson-annotations-2.17.2.jar",
+        "kafka-clients-3.8.0.jar",
+        "kafka_2.13-3.8.0.jar",
+        "netty-common-4.1.112.Final.jar",
+        "netty-buffer-4.1.112.Final.jar",
+        "netty-codec-4.1.112.Final.jar",
+        "netty-transport-4.1.112.Final.jar",
+        "netty-handler-4.1.112.Final.jar",
+        "slf4j-api-2.0.16.jar",
+        "log4j-api-2.23.1.jar",
+        "log4j-core-2.23.1.jar"
+      ]
+    }
+  ]
+}
