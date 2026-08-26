@@ -13,7 +13,9 @@ use ayzenpack::format::{read_ayz_file, write_ayz_file, Record, BUF_WRITER_CAP, T
 use ayzenpack::hashutil::blake3_bytes;
 use ayzenpack::manifest::Manifest;
 use ayzenpack::{dehydrate, rehydrate, DehydrateOptions, RehydrateOptions};
-use fixtures::{write_jar, write_jar_entries, write_stored_jar_dos_zero, JarEntry};
+use fixtures::{
+    write_jar, write_jar_entries, write_stored_jar_dos_zero, write_stored_zip, JarEntry,
+};
 use zip::{CompressionMethod, DateTime, ZipArchive};
 
 const EMPTY_BLAKE3: &str = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
@@ -589,4 +591,182 @@ fn rehydrate_reject_dotdot_jar_name() {
     );
     assert!(!dir.path().join("x.jar").exists());
     assert!(!dest.join("x.jar").exists());
+}
+
+/// CD-order file payloads. Unlike `entry_map`, this keeps duplicate names.
+fn cd_payloads(path: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut z = ZipArchive::new(File::open(path).unwrap()).unwrap();
+    let mut out = Vec::new();
+    for i in 0..z.len() {
+        let mut e = z.by_index(i).unwrap();
+        if e.is_dir() {
+            continue;
+        }
+        let name = e.name().to_string();
+        let mut buf = Vec::new();
+        e.read_to_end(&mut buf).unwrap();
+        out.push((name, buf));
+    }
+    out
+}
+
+fn count_cd_names(bytes: &[u8], name: &str) -> usize {
+    let name_b = name.as_bytes();
+    let mut n = 0usize;
+    let mut i = 0usize;
+    while i + 46 + name_b.len() <= bytes.len() {
+        if &bytes[i..i + 4] == b"PK\x01\x02" {
+            let name_len = u16::from_le_bytes([bytes[i + 28], bytes[i + 29]]) as usize;
+            if name_len == name_b.len() && &bytes[i + 46..i + 46 + name_len] == name_b {
+                n += 1;
+            }
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    n
+}
+
+#[test]
+fn many_small_200_files_two_jars_dedup_to_200_blobs() {
+    // Two identical 200-entry JARs must share one copy's blobs, not 400.
+    let dir = tempfile::tempdir().unwrap();
+    let owned: Vec<(String, Vec<u8>)> = (0u16..200)
+        .map(|i| (format!("f{i:03}.dat"), vec![i as u8; 32]))
+        .collect();
+    let files: Vec<(&str, &[u8])> = owned
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+    let a = dir.path().join("a.jar");
+    let b = dir.path().join("b.jar");
+    write_jar(&a, &files);
+    fs::copy(&a, &b).unwrap();
+    let jar_sum = fs::metadata(&a).unwrap().len() + fs::metadata(&b).unwrap().len();
+
+    let out = dir.path().join("out.ayz");
+    let summary = dehydrate(&opts(&out, vec![a.clone(), b.clone()])).unwrap();
+    assert_eq!(summary.jar_count, 2);
+    assert_eq!(summary.file_entry_count, 400);
+    assert_eq!(
+        summary.unique_blob_count, 200,
+        "two identical JARs must dedup to 200 blobs, not 400"
+    );
+    assert_eq!(
+        summary.bytes_unique_blobs,
+        summary.bytes_uncompressed_entries / 2
+    );
+    assert!(
+        summary.output_len < jar_sum,
+        "archive {} must be smaller than sum of JARs {}",
+        summary.output_len,
+        jar_sum
+    );
+
+    let (_header, trailer, records) = read_archive(&out);
+    assert_eq!(trailer.blob_count, 200);
+    assert_eq!(blob_records(&records).len(), 200);
+
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_functional_identity(&a, &dest.join("a.jar"));
+    assert_functional_identity(&b, &dest.join("b.jar"));
+}
+
+#[test]
+fn duplicate_entry_names_in_one_jar_all_restored() {
+    // Two CD entries share a name. Restore every entry ZipArchive yields, in order.
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("dup.jar");
+    let first = b"first-payload".as_slice();
+    let second = b"second-payload".as_slice();
+    write_stored_zip(
+        &jar,
+        &[
+            ("dup.txt", first, crc32fast::hash(first)),
+            ("dup.txt", second, crc32fast::hash(second)),
+        ],
+    );
+    assert_eq!(
+        count_cd_names(&fs::read(&jar).unwrap(), "dup.txt"),
+        2,
+        "fixture must contain two central-directory records named dup.txt"
+    );
+
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("dup.jar");
+
+    let src = cd_payloads(&jar);
+    let dest_entries = cd_payloads(&restored);
+    assert!(!src.is_empty(), "scanner must yield at least one dup.txt");
+    assert!(
+        src.iter().all(|(n, _)| n == "dup.txt"),
+        "unexpected names: {src:?}"
+    );
+    match src.len() {
+        2 => {
+            assert_eq!(src[0].1, first);
+            assert_eq!(src[1].1, second);
+        }
+        1 => {
+            // zip 2.x indexes CD by name (IndexMap last-wins).
+            assert_eq!(src[0].1, second);
+        }
+        n => panic!("unexpected scanner-visible entry count {n}"),
+    }
+    assert_eq!(
+        dest_entries, src,
+        "all scanner-visible duplicate-name entries must be restored in CD order"
+    );
+}
+
+#[test]
+fn nested_jar_not_exploded() {
+    // Nested JARs are opaque blobs; inner classes must not become their own entries.
+    let dir = tempfile::tempdir().unwrap();
+    let inner = dir.path().join("inner.jar");
+    write_jar(&inner, &[("com/Inner.class", b"inner-class-bytes")]);
+    let inner_bytes = fs::read(&inner).unwrap();
+
+    let outer = dir.path().join("outer.jar");
+    write_jar(
+        &outer,
+        &[
+            ("lib/inner.jar", inner_bytes.as_slice()),
+            ("App.class", b"app"),
+        ],
+    );
+
+    let out = dir.path().join("out.ayz");
+    let summary = dehydrate(&opts(&out, vec![outer.clone()])).unwrap();
+    assert_eq!(summary.jar_count, 1);
+    assert_eq!(summary.file_entry_count, 2);
+    assert_eq!(
+        summary.unique_blob_count, 2,
+        "inner.jar bytes are one blob; do not explode Inner.class"
+    );
+
+    let m = manifest_from_records(&read_archive(&out).2);
+    let names: Vec<&str> = m.jars[0].entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["lib/inner.jar", "App.class"]);
+    assert!(
+        !m.jars[0].entries.iter().any(|e| e.name.contains("Inner")),
+        "nested jar must stay opaque, got {names:?}"
+    );
+
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("outer.jar");
+    assert_functional_identity(&outer, &restored);
+    let map = entry_map(&restored);
+    assert_eq!(
+        map.get("lib/inner.jar").map(Vec::as_slice),
+        Some(inner_bytes.as_slice())
+    );
+    assert!(!map.contains_key("com/Inner.class"));
+    assert_eq!(map.len(), 2);
 }

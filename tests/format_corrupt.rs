@@ -6,10 +6,12 @@ mod fixtures;
 use std::fs::{self, File};
 use std::path::Path;
 
+use assert_cmd::Command;
 use ayzenpack::error::AyzenpackError;
 use ayzenpack::format::{read_ayz_file, write_ayz_file, Record};
 use ayzenpack::{dehydrate, list, verify, DehydrateOptions};
-use fixtures::write_jar;
+use fixtures::{write_jar, write_stored_zip};
+use predicates::prelude::*;
 
 fn opts(output: &Path, inputs: Vec<std::path::PathBuf>) -> DehydrateOptions {
     DehydrateOptions {
@@ -119,4 +121,105 @@ fn truncated_trailer_errors() {
         matches!(err, AyzenpackError::Format("truncated trailer")),
         "truncated finished archive must not verify, got {err:?}"
     );
+}
+
+fn ayzenpack() -> Command {
+    Command::cargo_bin("ayzenpack").expect("binary must be named ayzenpack, not jded")
+}
+
+fn write_signed_jar(path: &Path) {
+    write_jar(
+        path,
+        &[
+            ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n"),
+            ("META-INF/FOO.SF", b"Signature-Version: 1.0\n"),
+            ("META-INF/FOO.RSA", b"pkcs7-placeholder"),
+            ("com/App.class", b"class"),
+        ],
+    );
+}
+
+#[test]
+fn fail_on_signed_exits_error() {
+    // Signed notice is a warning unless --fail-on-signed (strict does not promote it).
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("signed.jar");
+    write_signed_jar(&jar);
+
+    let out_ok = dir.path().join("ok.ayz");
+    let mut o = opts(&out_ok, vec![jar.clone()]);
+    o.strict = true;
+    let summary = dehydrate(&o).unwrap();
+    assert_eq!(summary.signed_jars, vec!["signed.jar".to_string()]);
+    assert!(
+        out_ok.is_file(),
+        "signed JAR must still pack without the flag"
+    );
+
+    let out_fail = dir.path().join("fail.ayz");
+    let mut o = opts(&out_fail, vec![jar.clone()]);
+    o.fail_on_signed = true;
+    let err = dehydrate(&o).unwrap_err();
+    assert!(
+        matches!(err, AyzenpackError::Usage(ref s) if s.contains("signed")),
+        "fail_on_signed must be Usage, got {err:?}"
+    );
+
+    ayzenpack()
+        .arg("dehydrate")
+        .arg("-o")
+        .arg(dir.path().join("cli-ok.ayz"))
+        .arg(&jar)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("signed"));
+
+    ayzenpack()
+        .arg("dehydrate")
+        .arg("--fail-on-signed")
+        .arg("-o")
+        .arg(dir.path().join("cli-fail.ayz"))
+        .arg(&jar)
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("signed"));
+}
+
+#[test]
+fn crc_mismatch_warns_or_strict_errors() {
+    // Lying CD CRC. zip 2.x Crc32Reader often rejects this before dehydrate's check.
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("lie.jar");
+    let payload = b"payload-with-lying-crc";
+    let real = crc32fast::hash(payload);
+    write_stored_zip(&jar, &[("a.txt", payload, real.wrapping_add(1))]);
+
+    let out = dir.path().join("out.ayz");
+    let mut o = opts(&out, vec![jar.clone()]);
+    match dehydrate(&o) {
+        Ok(_) => {
+            o.strict = true;
+            let err = dehydrate(&o).unwrap_err();
+            assert!(
+                matches!(err, AyzenpackError::FormatOwned(ref s) if s.to_ascii_lowercase().contains("crc")),
+                "--strict must error on CRC mismatch, got {err:?}"
+            );
+            ayzenpack()
+                .arg("dehydrate")
+                .arg("-o")
+                .arg(dir.path().join("warn.ayz"))
+                .arg(&jar)
+                .assert()
+                .success()
+                .stderr(predicate::str::contains("CRC mismatch"));
+        }
+        Err(err) => {
+            // Skip: zip crate validates CRC on inflate, so dehydrate never sees a lying header.
+            assert!(
+                matches!(err, AyzenpackError::Io { .. } | AyzenpackError::Zip { .. }),
+                "lying CRC must not be silently accepted, got {err:?}"
+            );
+        }
+    }
 }

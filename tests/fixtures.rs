@@ -56,11 +56,23 @@ pub fn write_jar_entries_with_mtime(path: &Path, entries: &[JarEntry<'_>], mtime
 /// Stored ZIP whose local + central DOS timestamps are the invalid pair 0,0.
 /// Scan records `dos_date=0, dos_time=0`; rehydrate must not panic.
 pub fn write_stored_jar_dos_zero(path: &Path, files: &[(&str, &[u8])]) {
+    write_stored_zip(
+        path,
+        &files
+            .iter()
+            .map(|(name, data)| (*name, *data, crc32fast::hash(data)))
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// Stored ZIP (method 0, DOS 0,0). Duplicate names become separate CD entries.
+/// `crc` may disagree with the payload (lying CRC fixture).
+pub fn write_stored_zip(path: &Path, files: &[(&str, &[u8], u32)]) {
     let mut local = Vec::new();
     let mut central = Vec::new();
-    for (name, data) in files {
+    for (name, data, crc) in files {
         let name_b = name.as_bytes();
-        let crc = crc32fast::hash(data);
+        let crc = *crc;
         let off = local.len() as u32;
         local.extend_from_slice(b"PK\x03\x04");
         local.extend_from_slice(&20u16.to_le_bytes());
