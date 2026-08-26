@@ -1,3 +1,10 @@
+#![forbid(unsafe_code)]
+
+mod cli;
+
 fn main() {
-    println!("ayzenpack: dehydrate/rehydrate not yet implemented");
+    if let Err(err) = cli::run() {
+        eprintln!("ayzenpack: {err:#}");
+        std::process::exit(1);
+    }
 }

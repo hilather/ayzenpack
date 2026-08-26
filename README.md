@@ -13,7 +13,7 @@ ayzenpack rehydrate -i libs.ayz -d restored/
 
 Aliases: `pack` = `dehydrate`, `unpack` = `rehydrate`.
 
-These commands are not implemented yet.
+`dehydrate` (alias `pack`) writes a `.ayz` archive and overwrites `-o` if it exists. `rehydrate` / `unpack` / `list` / `verify` are not implemented yet.
 
 The archive MANIFEST is compact JSON with `"format": "ayzenpack-manifest"`. See `schemas/manifest.v1.schema.json` and `examples/tiny.manifest.json`.
 
