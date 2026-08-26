@@ -302,9 +302,10 @@ fn restore_paths_recorded_mode_wins_over_prefix_0755() {
 }
 
 #[test]
-fn restore_paths_overwrite_keeps_store_nested_zipa_entries() {
+fn restore_paths_in_place_keeps_store_nested_zipa_entries() {
     // Matt's flags: dehydrate --recursive --sort-inputs --restore-paths
-    // then rehydrate --restore-paths --overwrite (in place, no -d).
+    // then rehydrate --restore-paths only (no --overwrite, no -d).
+    // --restore-paths already unlinks via prepare_restore_dest; --overwrite is unused.
     let dir = tempfile::tempdir().unwrap();
     let jars = dir.path().join("jars");
     fs::create_dir_all(&jars).unwrap();
@@ -358,7 +359,7 @@ fn restore_paths_overwrite_keeps_store_nested_zipa_entries() {
     );
 
     ayzenpack()
-        .args(["rehydrate", "--restore-paths", "--overwrite", "-i"])
+        .args(["rehydrate", "--restore-paths", "-i"])
         .arg(&pack)
         .assert()
         .success();

@@ -29,10 +29,10 @@ Matt's flags, not a generic `-d` restore:
 
 ```
 ayzenpack dehydrate --recursive --sort-inputs --restore-paths -o pack.ayz <dir-of-jars>
-ayzenpack rehydrate --restore-paths --overwrite -i pack.ayz
+ayzenpack rehydrate --restore-paths -i pack.ayz
 ```
 
-`--recursive` is only the input walk. `--sort-inputs` zeros `created_unix` and sorts/dedupes. Rehydrate writes each jar to its recorded absolute `restore_path` (`prepare_restore_dest` unlinks, then `File::create`).
+`--recursive` is only the input walk. `--sort-inputs` zeros `created_unix` and sorts/dedupes. `--overwrite` is **not** used and is not required: `--restore-paths` skips the overwrite guard, `prepare_restore_dest` unlinks an existing file, then `write_jar` / splice `File::create`.
 
 | Input | Source size | Restored size | Zip listing | tail / raw_zip | Notes |
 |---|---|---|---|---|---|
@@ -105,7 +105,7 @@ After (1), zip -A + STORE nested Spring must:
 - Scan `entries.len() ==` outer `ZipArchive::len()` (418 on dataflow).
 - `tail_blob.is_some() && raw_zip_blob.is_none()` (homemade CD count agrees; attach_exact stores tail).
 - Every entry `cdata_blob` absent.
-- `--restore-paths --overwrite` in-place: restored **file size** in the same league as the source (not 134→5.5 / 133.6→1.7). `ZipArchive` names, CD order, and uncompressed file bytes match the source. Whole-file hash **may** change (rebuild / deflate).
+- `--restore-paths` in-place (no `--overwrite`, no `-d`): restored **file size** in the same league as the source (not 134→5.5 / 133.6→1.7). `ZipArchive` names, CD order, and uncompressed file bytes match the source. Whole-file hash **may** change (rebuild / deflate).
 
 Do not add a Java deflater, `cdata_blob`, or `raw_zip` to keep `source_*`.
 
@@ -128,7 +128,7 @@ Do not change `write_jar` / `File::create` / `prepare_restore_dest` unless a pos
 
 1. **STORE-nested complete inner zip + official launch.script + `zip -A` (always-on).** New **classic-u32** helper (do not change `write_fat_spring_zip64_zipa_jar` to STORE; fix its docstring — it claims STORE but DEFLATEs). Outer method **0** members must be a **complete inner zip** (own `PK\x05\x06`), not a random blob named `*.jar`. **0.2.2 latch proof (must be true on the fixture before the detector change):** `ZipArchive::new(ZipView(file, prefix_len))` is `Ok` and `len() ≠` homemade outer CD count (names omit outer `App.class` / `BOOT-INF/lib`). After the fix: `prefix_len ==` script length, **`view_shift == 0`**, `ZipArchive::len() ==` homemade outer count, names include every `BOOT-INF/lib/` member. `raw_zip_blob.is_none()`, `tail_blob.is_some()`, every `cdata_blob` absent.
 
-2. **Matt's flags, in-place.** Directory of jars (Test 1 fixture with **≥2** STORE `BOOT-INF/lib/` complete inner zips + one classic ZipWriter jar). `dehydrate --recursive --sort-inputs --restore-paths`. `rehydrate --restore-paths --overwrite` onto copies of the original paths (no `-d`). Restored fat: `ZipArchive::len()` equal, names + order + uncompressed file bytes equal; file size not &lt; 50% of source (a 1-lib latch can stay inside 15%). Classic: counts/bytes equal; small size delta OK. `raw_zip` still absent.
+2. **Matt's flags, in-place.** Directory of jars (Test 1 fixture with **≥2** STORE `BOOT-INF/lib/` complete inner zips + one classic ZipWriter jar). `dehydrate --recursive --sort-inputs --restore-paths`. `rehydrate --restore-paths` onto copies of the original paths (no `--overwrite`, no `-d`). Restored fat: `ZipArchive::len()` equal, names + order + uncompressed file bytes equal; file size not &lt; 50% of source (a 1-lib latch can stay inside 15%). Classic: counts/bytes equal; small size delta OK. `raw_zip` still absent.
 
 3. **Unadjusted prefix + same complete STORE inner zip** (no zip -A): `view_shift == prefix_len`, outer listing, tail, no `raw_zip`. An inverted `header_start` gate must not make this `NotZip`.
 
