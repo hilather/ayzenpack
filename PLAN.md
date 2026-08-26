@@ -140,6 +140,8 @@ Do not change `write_jar` / `File::create` / `prepare_restore_dest` unless a pos
 
 Do **not** require whole-file hash match on rebuild / Maven codec-miss. Do **not** add `cdata_blob`.
 
+Further Matt CLI coverage (Zip64 fixture + few-MiB classic in one `--restore-paths` pack, two nearby zip-A fats sharing nested lib bytes, listed-pack manifest shape) lives in `PLAN-coverage.md`. STORE-nested in-place is fat-only (`in_place_restore_paths_store_nested_zipa_must_not_collapse`); do not restage the tiny `a.jar` overwrite-without-`--overwrite` test.
+
 ---
 
 ## Out of scope

@@ -144,22 +144,35 @@ pub fn write_fat_spring_store_nested_jar(path: &Path) {
     write_fat_spring_store_nested(path, false);
 }
 
+/// zip-A STORE-nested fat with caller `App.class` and planted inner-jar bytes.
+pub fn write_fat_spring_store_nested_zipa_with(
+    path: &Path,
+    app_class: &[u8],
+    lib_payloads: &[Vec<u8>],
+) {
+    write_store_nested_fat(path, true, app_class, lib_payloads);
+}
+
 fn write_fat_spring_store_nested(path: &Path, zip_a: bool) {
-    use std::io::Cursor;
-    let launcher = spring_boot_launch_script();
     let nested: Vec<Vec<u8>> = (0..2)
         .map(|i| inner_incompressible_jar(i, 128 * 1024))
         .collect();
+    write_store_nested_fat(path, zip_a, b"class-bytes-outer", &nested);
+}
+
+fn write_store_nested_fat(path: &Path, zip_a: bool, app_class: &[u8], lib_payloads: &[Vec<u8>]) {
+    use std::io::Cursor;
+    let launcher = spring_boot_launch_script();
     let mut z = ZipWriter::new(Cursor::new(Vec::new()));
     let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     z.start_file("App.class", opts).unwrap();
-    z.write_all(b"class-bytes-outer").unwrap();
+    z.write_all(app_class).unwrap();
     z.start_file("BOOT-INF/classes/application.properties", opts)
         .unwrap();
     z.write_all(b"x=1\n").unwrap();
-    for (i, lib) in nested.iter().enumerate() {
+    for (i, lib) in lib_payloads.iter().enumerate() {
         let name = format!("BOOT-INF/lib/lib{i}.jar");
-        z.start_file(&name, opts).unwrap();
+        z.start_file(name, opts).unwrap();
         z.write_all(lib).unwrap();
     }
     let zip = z.finish().unwrap().into_inner();
@@ -171,7 +184,7 @@ fn write_fat_spring_store_nested(path: &Path, zip_a: bool) {
         !zip.windows(4).any(|w| w == b"PK\x06\x06"),
         "classic u32 helper must not be Zip64"
     );
-    for lib in &nested {
+    for lib in lib_payloads {
         assert!(
             lib.windows(4).any(|w| w == b"PK\x05\x06"),
             "STORE member must be a complete inner zip"
@@ -180,7 +193,20 @@ fn write_fat_spring_store_nested(path: &Path, zip_a: bool) {
     std::fs::write(path, prepend_launcher(&zip, launcher, zip_a)).unwrap();
 }
 
-fn inner_incompressible_jar(i: usize, nbytes: usize) -> Vec<u8> {
+/// No prefix. A few MiB of STORE nested payload (complete inner zip).
+pub fn write_classic_nested_store_jar(path: &Path) {
+    use std::io::Cursor;
+    let lib = inner_incompressible_jar(7, 2 * 1024 * 1024);
+    let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    z.start_file("App.class", opts).unwrap();
+    z.write_all(b"classic-app").unwrap();
+    z.start_file("lib/payload.jar", opts).unwrap();
+    z.write_all(&lib).unwrap();
+    std::fs::write(path, z.finish().unwrap().into_inner()).unwrap();
+}
+
+pub fn inner_incompressible_jar(i: usize, nbytes: usize) -> Vec<u8> {
     use std::io::Cursor;
     let mut payload = vec![0u8; nbytes];
     let mut x: u32 = 0xA5A5_0000 ^ (i as u32).wrapping_mul(0x9E37);
