@@ -1115,6 +1115,9 @@ fn store_nested_unadjusted_fat_uses_prefix_shift() {
     );
     assert!(m.jars[0].raw_zip_blob.is_none());
     assert!(m.jars[0].tail_blob.is_some());
+    for e in &m.jars[0].entries {
+        assert!(e.cdata_blob.is_none(), "{} must not grow cdata_blob", e.name);
+    }
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
     // rust ZipArchive::new(File) latches on unadjusted prefix; use scan (correct view).
