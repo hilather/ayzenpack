@@ -947,6 +947,9 @@ mod tests {
         assert!(matches!(err, AyzenpackError::Usage(_)), "{err}");
         let err = restore_dest(&jar_restore("\0/abs.jar")).unwrap_err();
         assert!(matches!(err, AyzenpackError::UnsafePath(_)), "{err}");
+        #[cfg(unix)]
         restore_dest(&jar_restore("/abs/a.jar")).unwrap();
+        #[cfg(windows)]
+        restore_dest(&jar_restore(r"C:\abs\a.jar")).unwrap();
     }
 }
