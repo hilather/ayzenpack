@@ -81,7 +81,7 @@ Unknown header keys are ignored. Version byte (offset 4) `> 1` is `unsupported v
   "zstd_level": 3,
   "created_unix": 1710000000,
   "tool": "ayzenpack",
-  "tool_version": "0.1.6"
+  "tool_version": "0.1.7"
 }
 ```
 
