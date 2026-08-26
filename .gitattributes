@@ -1,0 +1,2 @@
+# Official Spring Boot launch.script is LF; Windows autocrlf must not rewrite it.
+tests/fixtures/spring-boot-3.5.0-launch.script text eol=lf

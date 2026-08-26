@@ -8,16 +8,22 @@ use std::sync::OnceLock;
 
 const TEMPLATE: &[u8] = include_bytes!("fixtures/spring-boot-3.5.0-launch.script");
 
-/// Exact upstream bytes (placeholders still present).
+fn lf_template() -> &'static [u8] {
+    static LF: OnceLock<Vec<u8>> = OnceLock::new();
+    LF.get_or_init(|| TEMPLATE.iter().copied().filter(|&b| b != b'\r').collect())
+        .as_slice()
+}
+
+/// Exact upstream bytes (placeholders still present). CRLF checkouts are folded to LF.
 pub fn official_launch_script_template() -> &'static [u8] {
-    TEMPLATE
+    lf_template()
 }
 
 /// Rendered as in a real `executable: true` / `bootJar { launchScript() }` build.
 pub fn spring_boot_launch_script() -> &'static [u8] {
     static RENDERED: OnceLock<Vec<u8>> = OnceLock::new();
     RENDERED
-        .get_or_init(|| render_spring_placeholders(TEMPLATE))
+        .get_or_init(|| render_spring_placeholders(lf_template()))
         .as_slice()
 }
 
