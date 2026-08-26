@@ -333,6 +333,7 @@ fn detect_zip_layout(path: &Path, file: &mut (impl Read + Seek)) -> Result<ZipLa
     }
 }
 
+#[cfg(test)]
 fn detect_zip_prefix(path: &Path, file: &mut (impl Read + Seek)) -> Result<u64> {
     Ok(detect_zip_layout(path, file)?.prefix_len)
 }
