@@ -770,3 +770,117 @@ fn nested_jar_not_exploded() {
     assert!(!map.contains_key("com/Inner.class"));
     assert_eq!(map.len(), 2);
 }
+
+#[test]
+fn sort_inputs_jobs_1_eq_jobs_n_byte_identical() {
+    // Guards hash-completion order leaking into BLOB records or created_unix.
+    let dir = tempfile::tempdir().unwrap();
+    let mut inputs = Vec::new();
+    let shared = b"SHARED-PAYLOAD";
+    let other = b"OTHER-PAYLOAD";
+    for i in 0..8 {
+        let p = dir.path().join(format!("j{i}.jar"));
+        let unique = format!("unique-{i}-payload");
+        write_jar(
+            &p,
+            &[
+                ("shared.txt", shared.as_slice()),
+                ("unique.txt", unique.as_bytes()),
+                ("other.txt", other.as_slice()),
+            ],
+        );
+        inputs.push(p);
+    }
+
+    let out1 = dir.path().join("j1.ayz");
+    let outn = dir.path().join("jn.ayz");
+    let mut o1 = opts(&out1, inputs.clone());
+    o1.sort_inputs = true;
+    o1.jobs = 1;
+    o1.quiet = true;
+    let mut on = opts(&outn, inputs);
+    on.sort_inputs = true;
+    on.jobs = 4;
+    on.quiet = true;
+    dehydrate(&o1).unwrap();
+    dehydrate(&on).unwrap();
+    assert_eq!(
+        fs::read(&out1).unwrap(),
+        fs::read(&outn).unwrap(),
+        "sort_inputs archives must be byte-identical at jobs=1 and jobs=N"
+    );
+}
+
+#[test]
+fn first_seen_blob_order_matches_scan_order_with_jobs() {
+    // Guards writing BLOBs in hash-completion order instead of first-seen scan order.
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.jar");
+    let b = dir.path().join("b.jar");
+    write_jar_entries(
+        &a,
+        &[
+            JarEntry::File {
+                name: "1.txt",
+                data: b"alpha-payload",
+                method: CompressionMethod::Deflated,
+            },
+            JarEntry::Dir { name: "d/" },
+            JarEntry::File {
+                name: "2.txt",
+                data: b"bravo-payload",
+                method: CompressionMethod::Deflated,
+            },
+            JarEntry::File {
+                name: "3.txt",
+                data: b"charlie-payload",
+                method: CompressionMethod::Deflated,
+            },
+        ],
+    );
+    write_jar(
+        &b,
+        &[
+            ("2.txt", b"bravo-payload"),
+            ("4.txt", b"delta-payload"),
+            ("1.txt", b"alpha-payload"),
+        ],
+    );
+
+    let out = dir.path().join("out.ayz");
+    let mut o = opts(&out, vec![a, b]);
+    o.jobs = 4;
+    o.sort_inputs = true;
+    o.quiet = true;
+    dehydrate(&o).unwrap();
+
+    let expected = [
+        blake3_bytes(b"alpha-payload"),
+        blake3_bytes(b"bravo-payload"),
+        blake3_bytes(b"charlie-payload"),
+        blake3_bytes(b"delta-payload"),
+    ];
+    let (_h, _t, records) = read_archive(&out);
+    let got: Vec<[u8; 32]> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Blob { hash, .. } => Some(*hash),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        got, expected,
+        "BLOB record order must match first-seen scan"
+    );
+
+    let m = manifest_from_records(&records);
+    let hexes: Vec<String> = m.blobs.iter().map(|b| b.blake3.clone()).collect();
+    let expected_hex: Vec<String> = expected
+        .iter()
+        .map(|h| ayzenpack::hashutil::hex_lower(h))
+        .collect();
+    assert_eq!(
+        hexes, expected_hex,
+        "manifest blobs[] must match first-seen"
+    );
+}

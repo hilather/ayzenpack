@@ -95,6 +95,10 @@ ayzenpack dehydrate -o <OUT> [OPTIONS] <INPUTS>...
 | `--fail-on-signed` | error if a JAR looks signed |
 | `--dry-run` | stats only; write nothing |
 | `--exclude <GLOB>` | repeatable; matches CLI path or basename (`*` does not cross `/`) |
+| `--jobs <N>` | hash workers; default **1** (sequential). `0` = available parallelism |
+| `--max-inflight-bytes` | cap on uncompressed entry buffers in the hash pipeline, default **64 MiB** |
+
+`--jobs` hashes in parallel; BLOB records stay in first-seen (scan) order so `--sort-inputs` archives are byte-identical at any `--jobs`.
 
 Shell-expanded globs are the caller’s job. Directories are not recursed unless `--recursive`. Duplicate basenames become `a.jar`, `a__2.jar`, `a__3.jar`.
 

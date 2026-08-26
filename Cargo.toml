@@ -32,6 +32,8 @@ hex = "0.4"
 indicatif = "0.17"
 # zip depends on indexmap ^2; 2.12+ is MSRV 1.82 and 2.14 is 1.85/edition 2024.
 indexmap = "=2.11.4"
+# 1.11 lists MSRV 1.80 but pulls newer deps; 1.10 is crate MSRV 1.63 and stays on 1.80 lockfile pins.
+rayon = "~1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

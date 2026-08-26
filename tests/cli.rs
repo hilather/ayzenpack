@@ -47,6 +47,17 @@ fn help_lists_pretty_manifest() {
 }
 
 #[test]
+fn help_lists_jobs_and_max_inflight_bytes() {
+    // Guards clap sketch dropping PR-18 pipeline flags.
+    ayzenpack()
+        .args(["dehydrate", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--jobs"))
+        .stdout(predicate::str::contains("--max-inflight-bytes"));
+}
+
+#[test]
 fn dehydrate_requires_output_exit_2() {
     // Guards treating missing -o as an operational error (exit 1) instead of clap usage.
     ayzenpack()

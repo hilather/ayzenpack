@@ -57,14 +57,20 @@ pub fn scan_jar(path: &Path, max_entry: u64) -> Result<ScannedJar> {
 
 /// Inflate one entry at a time. `payload` is `None` for directories and
 /// `Some` for files; the slice is invalid after `f` returns.
-pub fn for_each_jar_entry<F>(path: &Path, max_entry: u64, f: F) -> Result<ScannedJar>
+pub fn for_each_jar_entry<F>(path: &Path, max_entry: u64, mut f: F) -> Result<ScannedJar>
 where
     F: FnMut(&ScannedEntry, Option<&[u8]>) -> Result<()>,
 {
-    for_each_jar_entry_with_len(path, max_entry, |_| {}, f)
+    for_each_jar_entry_with_len(
+        path,
+        max_entry,
+        |_| {},
+        |meta, payload| f(meta, payload.as_deref()),
+    )
 }
 
 /// Same as [`for_each_jar_entry`], then `on_len(archive.len())` before the first entry.
+/// File payloads are owned so dehydrate can hand them to hash workers without a second copy.
 pub(crate) fn for_each_jar_entry_with_len<L, F>(
     path: &Path,
     max_entry: u64,
@@ -73,7 +79,7 @@ pub(crate) fn for_each_jar_entry_with_len<L, F>(
 ) -> Result<ScannedJar>
 where
     L: FnMut(u64),
-    F: FnMut(&ScannedEntry, Option<&[u8]>) -> Result<()>,
+    F: FnMut(&ScannedEntry, Option<Vec<u8>>) -> Result<()>,
 {
     let mut file = File::open(path).map_err(|source| io_at(source, path))?;
     let source_size = file.metadata().map_err(|source| io_at(source, path))?.len();
@@ -161,8 +167,7 @@ where
             )));
         }
 
-        f(&meta, Some(buf.as_slice()))?;
-        drop(buf);
+        f(&meta, Some(buf))?;
         entries.push(meta);
     }
 

@@ -28,10 +28,15 @@ fn cargo_toml_has_indicatif() {
 }
 
 #[test]
-fn cargo_toml_has_no_deferred_deps() {
-    // Guards pulling rayon before PR-18. proptest is already a dev-dep from PR-19.
+fn cargo_toml_has_rayon() {
+    // Guards shipping the hash pipeline without the deferred crate this PR adds.
     let toml = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
-    assert!(!toml.contains("rayon"), "Cargo.toml must not pull rayon yet");
+    assert!(toml.contains("rayon"), "PR-18 Cargo.toml must add rayon");
+}
+
+#[test]
+fn cargo_toml_has_no_deferred_deps() {
+    let toml = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
     let (runtime, dev) = toml
         .split_once("[dev-dependencies]")
         .expect("Cargo.toml has [dev-dependencies]");

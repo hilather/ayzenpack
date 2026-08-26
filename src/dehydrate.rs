@@ -1,11 +1,14 @@
 //! Dehydrate JARs into one `.ayz` (dedup BLOBs + embedded manifest).
 //!
-//! Payloads are hashed, written if first-seen, then dropped. Rehydrate is a later PR.
+//! Scan is sequential. `--jobs` hashes on a pool; a single writer emits BLOBs in
+//! first-seen (scan) order so END digest and `blobs[]` stay deterministic.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Seek, Write};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use walkdir::WalkDir;
@@ -17,11 +20,14 @@ use crate::format::{
 };
 use crate::hashutil::{hash_both, hex_lower};
 use crate::manifest::{Blob, Entry, Jar, Manifest, Stats, MANIFEST_FORMAT};
-use crate::scan::for_each_jar_entry_with_len;
+use crate::scan::{for_each_jar_entry_with_len, ScannedEntry};
 use crate::stats::{dedup_ratio, json_event, PackProgress};
 
 const DEFAULT_LEVEL: i32 = 3;
 const DEFAULT_MAX_ENTRY: u64 = 2_147_483_647;
+const DEFAULT_JOBS: usize = 1;
+/// Default `--max-inflight-bytes`: 64 MiB of uncompressed entry buffers.
+const DEFAULT_MAX_INFLIGHT_BYTES: u64 = 64 * 1024 * 1024;
 
 pub struct DehydrateOptions {
     pub output: PathBuf,
@@ -40,6 +46,10 @@ pub struct DehydrateOptions {
     pub quiet: bool,
     pub verbose: bool,
     pub json_logs: bool,
+    /// Hash worker threads. `1` = sequential (default). `0` = available parallelism.
+    pub jobs: usize,
+    /// Cap on uncompressed entry buffers in the hash pipeline (default 64 MiB).
+    pub max_inflight_bytes: u64,
 }
 
 impl Default for DehydrateOptions {
@@ -61,6 +71,8 @@ impl Default for DehydrateOptions {
             quiet: false,
             verbose: false,
             json_logs: false,
+            jobs: DEFAULT_JOBS,
+            max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
         }
     }
 }
@@ -86,6 +98,296 @@ struct AyzWriter {
     header_len: u32,
 }
 
+/// First-seen writes plus catalog updates. Lives on the sequencer/writer thread.
+struct BlobSink<'a> {
+    writer: &'a mut Option<AyzWriter>,
+    seen: &'a mut HashMap<[u8; 32], usize>,
+    blobs: &'a mut Vec<Blob>,
+    first_seen: &'a mut blake3::Hasher,
+}
+
+/// In-order item from the sequencer (scan order, not hash-completion order).
+enum Sequenced {
+    Dir(ScannedEntry),
+    File(HashedFile),
+}
+
+struct HashedFile {
+    seq: u64,
+    meta: ScannedEntry,
+    payload: Vec<u8>,
+    blake3: [u8; 32],
+    sha256: [u8; 32],
+    crc: u32,
+}
+
+/// Hash pool + first-seen sequencer. The zstd encoder is never sent here.
+struct HashPipeline {
+    pool: rayon::ThreadPool,
+    tx: Sender<std::result::Result<HashedFile, ()>>,
+    rx: Receiver<std::result::Result<HashedFile, ()>>,
+    pending: BTreeMap<u64, Sequenced>,
+    next_seq: u64,
+    next_emit: u64,
+    spawned: u64,
+    received: u64,
+    inflight_bytes: u64,
+    max_inflight_bytes: u64,
+    peak_inflight_bytes: u64,
+}
+
+impl HashPipeline {
+    fn new(jobs: usize, max_inflight_bytes: u64) -> Result<Self> {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(jobs)
+            .thread_name(|i| format!("ayzenpack-hash-{i}"))
+            .build()
+            .map_err(|err| AyzenpackError::Usage(format!("failed to build hash pool: {err}")))?;
+        let (tx, rx) = mpsc::channel();
+        Ok(Self {
+            pool,
+            tx,
+            rx,
+            pending: BTreeMap::new(),
+            next_seq: 0,
+            next_emit: 0,
+            spawned: 0,
+            received: 0,
+            inflight_bytes: 0,
+            max_inflight_bytes,
+            peak_inflight_bytes: 0,
+        })
+    }
+
+    fn push_dir(&mut self, meta: ScannedEntry) -> Result<Vec<Sequenced>> {
+        self.try_recv_all()?;
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.pending.insert(seq, Sequenced::Dir(meta));
+        Ok(self.take_in_order())
+    }
+
+    fn wait_admit(&mut self, next: u64) -> Result<Vec<Sequenced>> {
+        let mut batch = Vec::new();
+        loop {
+            self.try_recv_all()?;
+            batch.extend(self.take_in_order());
+            if can_admit_inflight(self.inflight_bytes, next, self.max_inflight_bytes) {
+                return Ok(batch);
+            }
+            if self.received == self.spawned {
+                if batch.is_empty() {
+                    return Err(AyzenpackError::Format("inflight accounting deadlock"));
+                }
+                return Ok(batch);
+            }
+            self.recv_one()?;
+        }
+    }
+
+    fn spawn_file(&mut self, meta: ScannedEntry, payload: Vec<u8>) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.inflight_bytes += payload.len() as u64;
+        self.peak_inflight_bytes = self.peak_inflight_bytes.max(self.inflight_bytes);
+        self.spawned += 1;
+        let tx = self.tx.clone();
+        self.pool.spawn(move || {
+            let sent = panic::catch_unwind(AssertUnwindSafe(|| {
+                let crc = crc32fast::hash(&payload);
+                let (blake3, sha256) = hash_both(&payload);
+                HashedFile {
+                    seq,
+                    meta,
+                    payload,
+                    blake3,
+                    sha256,
+                    crc,
+                }
+            }));
+            match sent {
+                Ok(out) => {
+                    let _ = tx.send(Ok(out));
+                }
+                Err(_) => {
+                    let _ = tx.send(Err(()));
+                }
+            }
+        });
+    }
+
+    fn drain_nonblocking(&mut self) -> Result<Vec<Sequenced>> {
+        self.try_recv_all()?;
+        Ok(self.take_in_order())
+    }
+
+    fn finish_jar(&mut self) -> Result<Vec<Sequenced>> {
+        let mut batch = Vec::new();
+        while self.received < self.spawned {
+            self.recv_one()?;
+            self.try_recv_all()?;
+            batch.extend(self.take_in_order());
+        }
+        batch.extend(self.take_in_order());
+        self.next_seq = 0;
+        self.next_emit = 0;
+        self.spawned = 0;
+        self.received = 0;
+        Ok(batch)
+    }
+
+    fn recv_one(&mut self) -> Result<()> {
+        match self.rx.recv() {
+            Ok(Ok(out)) => {
+                self.received += 1;
+                self.pending.insert(out.seq, Sequenced::File(out));
+                Ok(())
+            }
+            Ok(Err(())) => Err(AyzenpackError::Format("hash worker panicked")),
+            Err(_) => Err(AyzenpackError::Format("hash worker channel closed")),
+        }
+    }
+
+    fn try_recv_all(&mut self) -> Result<()> {
+        loop {
+            match self.rx.try_recv() {
+                Ok(Ok(out)) => {
+                    self.received += 1;
+                    self.pending.insert(out.seq, Sequenced::File(out));
+                }
+                Ok(Err(())) => return Err(AyzenpackError::Format("hash worker panicked")),
+                Err(mpsc::TryRecvError::Empty) => return Ok(()),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if self.received < self.spawned {
+                        return Err(AyzenpackError::Format("hash worker channel closed"));
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    fn take_in_order(&mut self) -> Vec<Sequenced> {
+        let mut out = Vec::new();
+        while let Some(item) = self.pending.remove(&self.next_emit) {
+            if let Sequenced::File(ref f) = item {
+                self.inflight_bytes = self.inflight_bytes.saturating_sub(f.payload.len() as u64);
+            }
+            self.next_emit += 1;
+            out.push(item);
+        }
+        out
+    }
+}
+
+/// `jobs == 0` means available parallelism (at least 1).
+fn resolve_jobs(jobs: usize) -> usize {
+    if jobs == 0 {
+        std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+    } else {
+        jobs
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_PEAK_INFLIGHT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn last_peak_inflight_bytes() -> u64 {
+    LAST_PEAK_INFLIGHT.with(std::cell::Cell::get)
+}
+
+/// Admit at least one buffer so a single entry larger than the cap still processes.
+pub(crate) fn can_admit_inflight(
+    inflight_bytes: u64,
+    next_bytes: u64,
+    max_inflight_bytes: u64,
+) -> bool {
+    inflight_bytes == 0 || inflight_bytes.saturating_add(next_bytes) <= max_inflight_bytes
+}
+
+fn apply_sequenced(
+    opts: &DehydrateOptions,
+    path: &Path,
+    sink: &mut BlobSink<'_>,
+    jar_entries: &mut Vec<Entry>,
+    items: Vec<Sequenced>,
+) -> Result<()> {
+    for item in items {
+        match item {
+            Sequenced::Dir(meta) => {
+                jar_entries.push(entry_from_scan(&meta, None, None));
+            }
+            Sequenced::File(file) => {
+                check_crc(opts, path, &file.meta, file.crc)?;
+                commit_blob(
+                    sink,
+                    &file.meta,
+                    &file.payload,
+                    file.blake3,
+                    file.sha256,
+                    jar_entries,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_crc(opts: &DehydrateOptions, path: &Path, meta: &ScannedEntry, crc: u32) -> Result<()> {
+    if crc == meta.crc32 {
+        return Ok(());
+    }
+    let msg = format!(
+        "CRC mismatch for {}!{}: header {:#x} computed {:#x}",
+        path.display(),
+        meta.name,
+        meta.crc32,
+        crc
+    );
+    if opts.strict {
+        return Err(AyzenpackError::FormatOwned(msg));
+    }
+    warn(opts, &msg);
+    Ok(())
+}
+
+fn commit_blob(
+    sink: &mut BlobSink<'_>,
+    meta: &ScannedEntry,
+    buf: &[u8],
+    b3: [u8; 32],
+    s256: [u8; 32],
+    jar_entries: &mut Vec<Entry>,
+) -> Result<()> {
+    if let Some(&i) = sink.seen.get(&b3) {
+        sink.blobs[i].ref_count += 1;
+    } else {
+        if let Some(ref mut w) = sink.writer {
+            // Write from the scan/hash buffer; do not clone a second payload Vec.
+            write_blob_record(&mut w.enc, &b3, buf)?;
+        }
+        sink.first_seen.update(&b3);
+        sink.seen.insert(b3, sink.blobs.len());
+        sink.blobs.push(Blob {
+            blake3: hex_lower(&b3),
+            sha256: hex_lower(&s256),
+            size: buf.len() as u64,
+            ref_count: 1,
+        });
+    }
+    jar_entries.push(entry_from_scan(
+        meta,
+        Some(hex_lower(&b3)),
+        Some(hex_lower(&s256)),
+    ));
+    Ok(())
+}
+
 pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
     if !(1..=19).contains(&opts.level) {
         return Err(AyzenpackError::Usage(format!(
@@ -105,6 +407,13 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
         Some(start_ayz_file(&opts.output, &header)?)
     };
 
+    let jobs = resolve_jobs(opts.jobs);
+    let mut pipeline = if jobs > 1 {
+        Some(HashPipeline::new(jobs, opts.max_inflight_bytes)?)
+    } else {
+        None
+    };
+
     let mut seen: HashMap<[u8; 32], usize> = HashMap::new();
     let mut blobs: Vec<Blob> = Vec::new();
     let mut jars: Vec<Jar> = Vec::new();
@@ -117,127 +426,145 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
     let mut bytes_uncompressed_entries = 0u64;
     let progress = PackProgress::new(opts.quiet, opts.json_logs);
 
-    for path in &inputs {
-        match fs::metadata(path) {
-            Err(source) => {
-                let err = AyzenpackError::Io {
-                    source,
-                    path: Some(path.clone()),
-                };
-                if opts.strict {
-                    return Err(err);
+    {
+        let mut sink = BlobSink {
+            writer: &mut writer,
+            seen: &mut seen,
+            blobs: &mut blobs,
+            first_seen: &mut first_seen,
+        };
+
+        for path in &inputs {
+            match fs::metadata(path) {
+                Err(source) => {
+                    let err = AyzenpackError::Io {
+                        source,
+                        path: Some(path.clone()),
+                    };
+                    if opts.strict {
+                        return Err(err);
+                    }
+                    warn(opts, &err.to_string());
+                    continue;
                 }
-                warn(opts, &err.to_string());
-                continue;
+                Ok(meta) if meta.is_dir() => {
+                    let msg = format!(
+                        "skipping directory {} (recursive walk is not enabled)",
+                        path.display()
+                    );
+                    if opts.strict {
+                        return Err(AyzenpackError::Usage(msg));
+                    }
+                    warn(opts, &msg);
+                    continue;
+                }
+                Ok(_) => {}
             }
-            Ok(meta) if meta.is_dir() => {
-                let msg = format!(
-                    "skipping directory {} (recursive walk is not enabled)",
-                    path.display()
-                );
-                if opts.strict {
+
+            let jar_name = unique_basename(path, &mut used_names)?;
+            verbose(opts, &format!("{}", path.display()));
+            let mut jar_entries = Vec::new();
+            let scanned = for_each_jar_entry_with_len(
+                path,
+                opts.max_entry_bytes,
+                |n| progress.start_jar(&jar_name, n),
+                |meta, payload| {
+                    progress.inc_entry();
+                    entry_count += 1;
+                    if meta.is_dir {
+                        if let Some(pipe) = pipeline.as_mut() {
+                            apply_sequenced(
+                                opts,
+                                path,
+                                &mut sink,
+                                &mut jar_entries,
+                                pipe.push_dir(meta.clone())?,
+                            )?;
+                        } else {
+                            jar_entries.push(entry_from_scan(meta, None, None));
+                        }
+                        return Ok(());
+                    }
+                    let buf = payload.ok_or_else(|| {
+                        AyzenpackError::FormatOwned(format!(
+                            "missing payload for file entry {}!{}",
+                            path.display(),
+                            meta.name
+                        ))
+                    })?;
+                    file_entry_count += 1;
+                    bytes_uncompressed_entries += buf.len() as u64;
+
+                    if opts.strict && meta.name_raw_hex.is_some() {
+                        return Err(AyzenpackError::FormatOwned(format!(
+                            "non-UTF-8 entry name in {}!{}",
+                            path.display(),
+                            meta.name
+                        )));
+                    }
+
+                    if let Some(pipe) = pipeline.as_mut() {
+                        let n = buf.len() as u64;
+                        loop {
+                            let ready = pipe.wait_admit(n)?;
+                            if ready.is_empty() {
+                                break;
+                            }
+                            apply_sequenced(opts, path, &mut sink, &mut jar_entries, ready)?;
+                        }
+                        pipe.spawn_file(meta.clone(), buf);
+                        apply_sequenced(
+                            opts,
+                            path,
+                            &mut sink,
+                            &mut jar_entries,
+                            pipe.drain_nonblocking()?,
+                        )?;
+                    } else {
+                        let recomputed = crc32fast::hash(&buf);
+                        check_crc(opts, path, meta, recomputed)?;
+                        let (b3, s256) = hash_both(&buf);
+                        commit_blob(&mut sink, meta, &buf, b3, s256, &mut jar_entries)?;
+                    }
+                    Ok(())
+                },
+            )?;
+            if let Some(pipe) = pipeline.as_mut() {
+                apply_sequenced(opts, path, &mut sink, &mut jar_entries, pipe.finish_jar()?)?;
+            }
+            progress.finish_jar(&jar_name, scanned.entries.len() as u64);
+
+            if scanned.signed {
+                signed_jars.push(jar_name.clone());
+                let msg = format!("signed JAR {jar_name} (rebuild will break the signature)");
+                if opts.fail_on_signed {
                     return Err(AyzenpackError::Usage(msg));
                 }
                 warn(opts, &msg);
-                continue;
             }
-            Ok(_) => {}
+            bytes_in_jars += scanned.source_size;
+            jars.push(Jar {
+                name: jar_name,
+                source_path: path.to_string_lossy().into_owned(),
+                source_size: scanned.source_size,
+                source_blake3: hex_lower(&scanned.source_blake3),
+                source_sha256: hex_lower(&scanned.source_sha256),
+                comment: scanned.comment,
+                signed: scanned.signed,
+                entries: jar_entries,
+            });
         }
-
-        let jar_name = unique_basename(path, &mut used_names)?;
-        verbose(opts, &format!("{}", path.display()));
-        let mut jar_entries = Vec::new();
-        let scanned = for_each_jar_entry_with_len(
-            path,
-            opts.max_entry_bytes,
-            |n| progress.start_jar(&jar_name, n),
-            |meta, payload| {
-                progress.inc_entry();
-                entry_count += 1;
-                if meta.is_dir {
-                    jar_entries.push(entry_from_scan(meta, None, None));
-                    return Ok(());
-                }
-                let buf = payload.ok_or_else(|| {
-                    AyzenpackError::FormatOwned(format!(
-                        "missing payload for file entry {}!{}",
-                        path.display(),
-                        meta.name
-                    ))
-                })?;
-                file_entry_count += 1;
-                bytes_uncompressed_entries += buf.len() as u64;
-
-                if opts.strict && meta.name_raw_hex.is_some() {
-                    return Err(AyzenpackError::FormatOwned(format!(
-                        "non-UTF-8 entry name in {}!{}",
-                        path.display(),
-                        meta.name
-                    )));
-                }
-
-                let recomputed = crc32fast::hash(buf);
-                if recomputed != meta.crc32 {
-                    let msg = format!(
-                        "CRC mismatch for {}!{}: header {:#x} computed {:#x}",
-                        path.display(),
-                        meta.name,
-                        meta.crc32,
-                        recomputed
-                    );
-                    if opts.strict {
-                        return Err(AyzenpackError::FormatOwned(msg));
-                    }
-                    warn(opts, &msg);
-                }
-
-                let (b3, s256) = hash_both(buf);
-                if let Some(&i) = seen.get(&b3) {
-                    blobs[i].ref_count += 1;
-                } else {
-                    if let Some(ref mut w) = writer {
-                        // Write from the scan buffer; do not clone a second payload Vec.
-                        write_blob_record(&mut w.enc, &b3, buf)?;
-                    }
-                    first_seen.update(&b3);
-                    seen.insert(b3, blobs.len());
-                    blobs.push(Blob {
-                        blake3: hex_lower(&b3),
-                        sha256: hex_lower(&s256),
-                        size: buf.len() as u64,
-                        ref_count: 1,
-                    });
-                }
-                jar_entries.push(entry_from_scan(
-                    meta,
-                    Some(hex_lower(&b3)),
-                    Some(hex_lower(&s256)),
-                ));
-                Ok(())
-            },
-        )?;
-        progress.finish_jar(&jar_name, scanned.entries.len() as u64);
-
-        if scanned.signed {
-            signed_jars.push(jar_name.clone());
-            let msg = format!("signed JAR {jar_name} (rebuild will break the signature)");
-            if opts.fail_on_signed {
-                return Err(AyzenpackError::Usage(msg));
-            }
-            warn(opts, &msg);
-        }
-        bytes_in_jars += scanned.source_size;
-        jars.push(Jar {
-            name: jar_name,
-            source_path: path.to_string_lossy().into_owned(),
-            source_size: scanned.source_size,
-            source_blake3: hex_lower(&scanned.source_blake3),
-            source_sha256: hex_lower(&scanned.source_sha256),
-            comment: scanned.comment,
-            signed: scanned.signed,
-            entries: jar_entries,
-        });
     }
+
+    #[cfg(test)]
+    LAST_PEAK_INFLIGHT.with(|c| {
+        c.set(
+            pipeline
+                .as_ref()
+                .map(|p| p.peak_inflight_bytes)
+                .unwrap_or(0),
+        );
+    });
 
     let bytes_unique_blobs: u64 = blobs.iter().map(|b| b.size).sum();
     let unique_blob_count = blobs.len() as u64;
@@ -410,11 +737,7 @@ fn write_sidecar(path: &Path, manifest: &Manifest, pretty: bool) -> Result<()> {
     })
 }
 
-fn entry_from_scan(
-    meta: &crate::scan::ScannedEntry,
-    blob: Option<String>,
-    sha256: Option<String>,
-) -> Entry {
+fn entry_from_scan(meta: &ScannedEntry, blob: Option<String>, sha256: Option<String>) -> Entry {
     Entry {
         name: meta.name.clone(),
         is_dir: meta.is_dir,
@@ -645,6 +968,64 @@ mod tests {
         let mut used = HashMap::new();
         let err = unique_basename(Path::new(".."), &mut used).unwrap_err();
         assert!(matches!(err, AyzenpackError::UnsafePath(_)));
+    }
+
+    #[test]
+    fn can_admit_inflight_allows_first_buffer_even_when_over_cap() {
+        // Guards refusing a single entry larger than the cap (would hang the pipeline).
+        assert!(can_admit_inflight(0, 100, 50));
+        assert!(can_admit_inflight(0, 1, 0));
+        assert!(can_admit_inflight(40, 10, 50));
+        assert!(!can_admit_inflight(40, 11, 50));
+        assert!(!can_admit_inflight(50, 1, 50));
+        assert!(!can_admit_inflight(1, 1, 0));
+    }
+
+    fn write_test_jar(path: &Path, files: &[(&str, &[u8])]) {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+        let mut z = ZipWriter::new(File::create(path).unwrap());
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, data) in files {
+            z.start_file(*name, opts).unwrap();
+            z.write_all(data).unwrap();
+        }
+        z.finish().unwrap();
+    }
+
+    #[test]
+    fn max_inflight_bytes_is_honored() {
+        // Logical cap: peak inflight never exceeds the budget except a lone oversized buffer.
+        let dir = tempfile::tempdir().unwrap();
+        let jar = dir.path().join("many.jar");
+        let payload = vec![0x5a; 1000];
+        let files: Vec<(String, Vec<u8>)> = (0..12)
+            .map(|i| (format!("e{i}.bin"), payload.clone()))
+            .collect();
+        let refs: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(n, d)| (n.as_str(), d.as_slice()))
+            .collect();
+        write_test_jar(&jar, &refs);
+
+        let out = dir.path().join("out.ayz");
+        let cap = 2500;
+        let opts = DehydrateOptions {
+            output: out,
+            inputs: vec![jar],
+            jobs: 4,
+            max_inflight_bytes: cap,
+            quiet: true,
+            ..DehydrateOptions::default()
+        };
+        dehydrate(&opts).unwrap();
+        let peak = last_peak_inflight_bytes();
+        assert!(peak > 0, "pipeline must track inflight bytes");
+        assert!(
+            peak <= cap,
+            "peak inflight {peak} exceeded --max-inflight-bytes {cap}"
+        );
     }
 
     #[test]

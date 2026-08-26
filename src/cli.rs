@@ -61,7 +61,12 @@ enum Cmd {
         follow_symlinks: bool,
         #[arg(long)]
         exclude: Vec<String>,
-        // PR-18: jobs, max_inflight_bytes — do not add until then
+        /// Hash worker threads. 1 = sequential (default). 0 = available parallelism
+        #[arg(long, default_value_t = 1)]
+        jobs: usize,
+        /// Cap on uncompressed entry buffers in the hash pipeline (default 64 MiB)
+        #[arg(long, default_value_t = 64 * 1024 * 1024)]
+        max_inflight_bytes: u64,
     },
     /// Restore JARs from a .ayz archive
     #[command(visible_alias = "unpack")]
@@ -195,6 +200,8 @@ pub fn run() -> std::result::Result<(), CliError> {
             pretty_manifest,
             follow_symlinks,
             exclude,
+            jobs,
+            max_inflight_bytes,
         } => {
             let opts = DehydrateOptions {
                 output,
@@ -213,6 +220,8 @@ pub fn run() -> std::result::Result<(), CliError> {
                 quiet,
                 verbose,
                 json_logs,
+                jobs,
+                max_inflight_bytes,
             };
             let summary = dehydrate(&opts)?;
             print_dehydrate_stats(&opts, &summary);
