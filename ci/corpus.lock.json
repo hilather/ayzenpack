@@ -145,6 +145,18 @@
       "url": "https://repo1.maven.org/maven2/com/google/guava/failureaccess/1.0.2/failureaccess-1.0.2.jar",
       "sha256": "8a8f81cf9b359e3f6dfa691a1e776985c061ef2f223c9b2c80753e1b458e8064",
       "size": 4740
+    },
+    {
+      "dest": "spring-cloud-dataflow-server-2.11.4.jar",
+      "url": "https://repo1.maven.org/maven2/org/springframework/cloud/spring-cloud-dataflow-server/2.11.4/spring-cloud-dataflow-server-2.11.4.jar",
+      "sha256": "2307db9c2fc2ff436c66b5a942e4bb55508b0c6c071d7032ccb68e3709e88a9b",
+      "size": 133498556
+    },
+    {
+      "dest": "spring-cloud-dataflow-server-2.11.5.jar",
+      "url": "https://repo1.maven.org/maven2/org/springframework/cloud/spring-cloud-dataflow-server/2.11.5/spring-cloud-dataflow-server-2.11.5.jar",
+      "sha256": "c425e748824ac3c62af1e4174919110777fc6d1a4ad1ffc4ac63b311b6780cad",
+      "size": 133561923
     }
   ],
   "copies": [
