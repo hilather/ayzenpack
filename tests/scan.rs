@@ -8,8 +8,10 @@ use std::path::Path;
 
 use ayzenpack::error::AyzenpackError;
 use ayzenpack::hashutil::hash_both;
-use ayzenpack::scan::{for_each_jar_entry, scan_jar, ScannedEntry};
-use fixtures::{write_jar, write_jar_entries_with_mtime, JarEntry};
+use ayzenpack::scan::{for_each_jar_entry, scan_jar, zip_prefix_len, ScannedEntry};
+use fixtures::{
+    write_jar, write_jar_entries_with_mtime, write_wrapped_jar, JarEntry, SPRING_LAUNCHER,
+};
 use zip::CompressionMethod;
 use zip::DateTime;
 
@@ -162,6 +164,69 @@ fn scan_max_entry_bytes_errors_with_path() {
         msg.contains("payload.bin"),
         "error must include name: {msg}"
     );
+}
+
+#[test]
+fn scan_prefix_len_on_script_plus_zip() {
+    let (_dir, path) = temp_jar("app.jar");
+    write_wrapped_jar(&path, SPRING_LAUNCHER, &[("App.class", b"class-bytes")]);
+    assert_eq!(zip_prefix_len(&path).unwrap(), SPRING_LAUNCHER.len() as u64);
+    let scanned = scan_jar(&path, MAX_ENTRY).unwrap();
+    assert_eq!(
+        scanned.prefix.as_deref(),
+        Some(SPRING_LAUNCHER),
+        "prefix must be the exact launcher bytes"
+    );
+    assert_eq!(scanned.entries.len(), 1);
+    assert_eq!(scanned.entries[0].name, "App.class");
+    let bytes = fs::read(&path).unwrap();
+    let (b3, sha) = hash_both(&bytes);
+    assert_eq!(scanned.source_blake3, b3);
+    assert_eq!(scanned.source_sha256, sha);
+    assert_eq!(scanned.source_size, bytes.len() as u64);
+}
+
+#[test]
+fn scan_shebang_without_zip_is_not_zip() {
+    let (_dir, path) = temp_jar("script.jar");
+    fs::write(&path, b"#!/bin/bash\necho no zip here\n").unwrap();
+    let err = scan_jar(&path, MAX_ENTRY).unwrap_err();
+    match err {
+        AyzenpackError::NotZip { path: err_path } => assert_eq!(err_path, path),
+        other => panic!("expected NotZip, got {other:?}"),
+    }
+}
+
+#[test]
+fn scan_normal_jar_has_no_prefix() {
+    let (_dir, path) = temp_jar("plain.jar");
+    write_jar(&path, &[("a.txt", b"hello")]);
+    assert_eq!(zip_prefix_len(&path).unwrap(), 0);
+    let scanned = scan_jar(&path, MAX_ENTRY).unwrap();
+    assert!(scanned.prefix.is_none());
+}
+
+#[test]
+fn scan_wrapped_nested_boot_inf_lib_is_one_entry() {
+    // Nested BOOT-INF/lib/*.jar stay opaque; only the file-level launcher is unwrapped.
+    let dir = tempfile::tempdir().unwrap();
+    let inner = dir.path().join("dep.jar");
+    write_jar(&inner, &[("com/Dep.class", b"dep-bytes")]);
+    let inner_bytes = fs::read(&inner).unwrap();
+    let outer = dir.path().join("app.jar");
+    write_wrapped_jar(
+        &outer,
+        SPRING_LAUNCHER,
+        &[
+            ("BOOT-INF/lib/dep.jar", inner_bytes.as_slice()),
+            ("App.class", b"app"),
+        ],
+    );
+    let scanned = scan_jar(&outer, MAX_ENTRY).unwrap();
+    let names: Vec<&str> = scanned.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["BOOT-INF/lib/dep.jar", "App.class"]);
+    assert!(!scanned.entries.iter().any(|e| e.name.contains("Dep.class")));
+    assert_eq!(scanned.prefix.as_deref(), Some(SPRING_LAUNCHER));
 }
 
 #[test]

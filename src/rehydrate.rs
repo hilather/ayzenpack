@@ -16,6 +16,7 @@ use crate::error::{AyzenpackError, Result};
 use crate::format::{read_header, read_record, read_trailer, Record};
 use crate::hashutil::{blake3_bytes, hex_lower, parse_blake3_hex};
 use crate::manifest::{Manifest, MANIFEST_FORMAT};
+use crate::scan::ZipView;
 
 const DEFAULT_DEFLATE_LEVEL: i32 = 6;
 const ZIP64_BYTES_THR: u64 = 0xFFFF_FFFF;
@@ -223,11 +224,12 @@ fn write_jar(
     cas_dir: &Path,
     dest: &Path,
 ) -> Result<()> {
-    let file = File::create(dest).map_err(|source| AyzenpackError::Io {
+    let mut file = File::create(dest).map_err(|source| AyzenpackError::Io {
         source,
         path: Some(dest.to_path_buf()),
     })?;
-    let mut writer = ZipWriter::new(file);
+    let prefix_len = write_prefix(jar, cas_dir, dest, &mut file)?;
+    let mut writer = ZipWriter::new(ZipView::new(file, prefix_len));
     if !jar.comment.is_empty() {
         writer.set_comment(jar.comment.clone());
     }
@@ -302,6 +304,67 @@ fn write_jar(
     }
 
     writer.finish().map_err(|err| zip_err(err, dest))?;
+    if prefix_len > 0 {
+        chmod_executable(dest)?;
+    }
+    Ok(())
+}
+
+fn write_prefix(
+    jar: &crate::manifest::Jar,
+    cas_dir: &Path,
+    dest: &Path,
+    file: &mut File,
+) -> Result<u64> {
+    match (&jar.prefix_blob, jar.prefix_size) {
+        (None, None) => Ok(0),
+        (Some(hex), Some(sz)) => {
+            let hash = parse_blake3_hex(hex)?;
+            let bytes = read_cas_blob(cas_dir, &hash)?;
+            if blake3_bytes(&bytes) != hash {
+                return Err(AyzenpackError::HashMismatch(format!(
+                    "{} prefix blake3",
+                    jar.name
+                )));
+            }
+            if bytes.len() as u64 != sz {
+                return Err(AyzenpackError::HashMismatch(format!(
+                    "{} prefix size: recorded {sz} computed {}",
+                    jar.name,
+                    bytes.len()
+                )));
+            }
+            file.write_all(&bytes)
+                .map_err(|source| AyzenpackError::Io {
+                    source,
+                    path: Some(dest.to_path_buf()),
+                })?;
+            Ok(sz)
+        }
+        _ => Err(AyzenpackError::FormatOwned(format!(
+            "prefix_blob and prefix_size must both be set on {}",
+            jar.name
+        ))),
+    }
+}
+
+fn chmod_executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(path)
+            .map_err(|source| AyzenpackError::Io {
+                source,
+                path: Some(path.to_path_buf()),
+            })?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).map_err(|source| AyzenpackError::Io {
+            source,
+            path: Some(path.to_path_buf()),
+        })?;
+    }
+    let _ = path;
     Ok(())
 }
 

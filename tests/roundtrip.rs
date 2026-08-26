@@ -12,9 +12,10 @@ use ayzenpack::error::AyzenpackError;
 use ayzenpack::format::{read_ayz_file, write_ayz_file, Record, BUF_WRITER_CAP, TRAILER_LEN};
 use ayzenpack::hashutil::blake3_bytes;
 use ayzenpack::manifest::Manifest;
-use ayzenpack::{dehydrate, rehydrate, DehydrateOptions, RehydrateOptions};
+use ayzenpack::{dehydrate, rehydrate, verify, DehydrateOptions, RehydrateOptions};
 use fixtures::{
-    write_jar, write_jar_entries, write_stored_jar_dos_zero, write_stored_zip, JarEntry,
+    write_jar, write_jar_entries, write_stored_jar_dos_zero, write_stored_zip, write_wrapped_jar,
+    JarEntry, SPRING_LAUNCHER,
 };
 use zip::{CompressionMethod, DateTime, ZipArchive};
 
@@ -883,4 +884,118 @@ fn first_seen_blob_order_matches_scan_order_with_jobs() {
         hexes, expected_hex,
         "manifest blobs[] must match first-seen"
     );
+}
+
+#[test]
+fn roundtrip_bash_prefixed_executable_jar() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("app.jar");
+    write_wrapped_jar(
+        &jar,
+        SPRING_LAUNCHER,
+        &[
+            ("App.class", b"class-bytes"),
+            ("application.properties", b"x=1"),
+        ],
+    );
+    let src_bytes = fs::read(&jar).unwrap();
+    assert!(src_bytes.starts_with(SPRING_LAUNCHER));
+
+    let out = dir.path().join("out.ayz");
+    let summary = dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    assert!(summary.unique_blob_count >= 3, "prefix + two file entries");
+
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert!(m.jars[0].prefix_blob.is_some());
+    assert_eq!(m.jars[0].prefix_size, Some(SPRING_LAUNCHER.len() as u64));
+    let prefix_hex = m.jars[0].prefix_blob.as_deref().unwrap();
+    let prefix_blob = m
+        .blobs
+        .iter()
+        .find(|b| b.blake3 == prefix_hex)
+        .expect("prefix blob in catalog");
+    assert_eq!(prefix_blob.size, SPRING_LAUNCHER.len() as u64);
+    assert_eq!(prefix_blob.ref_count, 1);
+
+    verify(&out).unwrap();
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("app.jar");
+    let got = fs::read(&restored).unwrap();
+    assert_eq!(
+        &got[..SPRING_LAUNCHER.len()],
+        SPRING_LAUNCHER,
+        "restored file must start with the exact prefix"
+    );
+    assert_functional_identity(&jar, &restored);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&restored).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "wrapped jar must be restored executable");
+    }
+}
+
+#[test]
+fn two_wrapped_jars_share_one_prefix_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.jar");
+    let b = dir.path().join("b.jar");
+    write_wrapped_jar(&a, SPRING_LAUNCHER, &[("A.class", b"AAA")]);
+    write_wrapped_jar(&b, SPRING_LAUNCHER, &[("B.class", b"BBB")]);
+    let out = dir.path().join("out.ayz");
+    let summary = dehydrate(&opts(&out, vec![a.clone(), b.clone()])).unwrap();
+    assert_eq!(
+        summary.unique_blob_count, 3,
+        "shared launcher + two unique entries"
+    );
+
+    let m = manifest_from_records(&read_archive(&out).2);
+    let pa = m.jars[0].prefix_blob.as_ref().expect("a.jar prefix");
+    let pb = m.jars[1].prefix_blob.as_ref().expect("b.jar prefix");
+    assert_eq!(pa, pb);
+    assert_eq!(m.jars[0].prefix_size, Some(SPRING_LAUNCHER.len() as u64));
+    assert_eq!(m.jars[1].prefix_size, Some(SPRING_LAUNCHER.len() as u64));
+    let matches: Vec<_> = m.blobs.iter().filter(|b| b.blake3 == *pa).collect();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].ref_count, 2);
+
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_functional_identity(&a, &dest.join("a.jar"));
+    assert_functional_identity(&b, &dest.join("b.jar"));
+    assert!(fs::read(dest.join("a.jar"))
+        .unwrap()
+        .starts_with(SPRING_LAUNCHER));
+    assert!(fs::read(dest.join("b.jar"))
+        .unwrap()
+        .starts_with(SPRING_LAUNCHER));
+}
+
+#[test]
+fn normal_jar_has_no_prefix_fields_and_roundtrips() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("plain.jar");
+    write_jar(&jar, &[("x.txt", b"hello")]);
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let (_h, _t, records) = read_archive(&out);
+    let json = records
+        .iter()
+        .find_map(|r| match r {
+            Record::Manifest { json } => Some(json.as_slice()),
+            _ => None,
+        })
+        .unwrap();
+    let s = std::str::from_utf8(json).unwrap();
+    assert!(!s.contains("prefix_blob"), "{s}");
+    assert!(!s.contains("prefix_size"), "{s}");
+    let m = manifest_from_records(&records);
+    assert!(m.jars[0].prefix_blob.is_none());
+    assert!(m.jars[0].prefix_size.is_none());
+
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_functional_identity(&jar, &dest.join("plain.jar"));
 }

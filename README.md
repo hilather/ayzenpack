@@ -172,6 +172,8 @@ Rehydrate restores **functional identity**, not ZIP bit-identity.
 
 `--verbatim` is **not** in v1. There is no flag to request bit-identical ZIP reconstruction.
 
+Spring Boot fully-executable JARs (a bash launcher prepended to a ZIP) are supported: the launcher is stored as a deduplicated blob and written back on rehydrate. The ZIP body still follows functional identity, not bit-identity. Nested `BOOT-INF/lib/*.jar` entries are not exploded.
+
 Rebuilt JARs use deflate for file entries and store for directories, unless `--store-all`.
 
 ---

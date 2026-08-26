@@ -129,6 +129,25 @@ pub fn verify(input: &Path) -> Result<()> {
     }
 
     for jar in &manifest.jars {
+        if let Some(hex) = &jar.prefix_blob {
+            let hash = parse_blake3_hex(hex)?;
+            let data = payloads.get(&hash).ok_or_else(|| {
+                AyzenpackError::HashMismatch(format!(
+                    "missing prefix blob {} for {}",
+                    hex_prefix(&hash),
+                    jar.name
+                ))
+            })?;
+            if let Some(sz) = jar.prefix_size {
+                if data.len() as u64 != sz {
+                    return Err(AyzenpackError::HashMismatch(format!(
+                        "prefix blob {} {} size",
+                        hex_prefix(&hash),
+                        jar.name
+                    )));
+                }
+            }
+        }
         for e in &jar.entries {
             if e.is_dir {
                 continue;

@@ -81,7 +81,7 @@ Unknown header keys are ignored. Version byte (offset 4) `> 1` is `unsupported v
   "zstd_level": 3,
   "created_unix": 1710000000,
   "tool": "ayzenpack",
-  "tool_version": "0.1.3"
+  "tool_version": "0.1.4"
 }
 ```
 
@@ -167,6 +167,28 @@ Invalid DOS pairs including `0,0` (common in JARs) fall back to 1980-01-01. Neve
 Not guaranteed: deflate bitstream, extra fields (dropped; zipalign is not preserved), data descriptors, GPBF bit 11, raw name encoding. `--verbatim` is not in v1.
 
 Nested `.jar` entries are opaque blobs. They are not exploded.
+
+---
+
+## Executable / prefixed JARs
+
+Spring Boot “fully executable” JARs (`spring-boot-maven-plugin` `executable: true` and similar) prepend a bash launcher before a normal ZIP. The file starts with `#!/bin/bash` (or similar), not `PK\x03\x04`.
+
+Detection uses EOCD-from-EOF extra-data math, not a scan for the first local-file magic:
+
+```
+prefix_len = (eocd_file_offset - cd_size) - recorded_cd_offset
+```
+
+Zip64 uses the locator / Zip64 EOCD when the 32-bit fields are sentinels. The byte at `prefix_len` must be `PK\x03\x04` (or empty-archive EOCD). Prefixes larger than 16 MiB are rejected (`NotZip`).
+
+The prefix is stored as a first-seen CAS BLOB (same `hash_both` path as entry payloads). Shared launchers across JARs dedup (`ref_count > 1`). Manifest `jars[]` may include optional `prefix_blob` (hex BLAKE3) and `prefix_size`. Omitted on normal ZIPs so old archives still list/rehydrate.
+
+Rehydrate writes the prefix bytes first, then `ZipWriter` on the same file (`[prefix][zip]`). ZIP offsets stay ZIP-relative. On Unix the restored file is `chmod 0755` so it stays executable.
+
+`source_blake3` / `source_sha256` / `source_size` remain hashes/size of the **whole** input (prefix + ZIP).
+
+v1 still does not promise ZIP bit-identity: prefix bytes are restored exactly; ZIP entries follow the existing functional-identity rules (names, order, CRC, uncompressed bytes). Nested `BOOT-INF/lib/*.jar` entries stay opaque blobs.
 
 ---
 

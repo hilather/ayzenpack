@@ -364,11 +364,20 @@ fn commit_blob(
     s256: [u8; 32],
     jar_entries: &mut Vec<Entry>,
 ) -> Result<()> {
+    remember_blob(sink, buf, b3, s256)?;
+    jar_entries.push(entry_from_scan(
+        meta,
+        Some(hex_lower(&b3)),
+        Some(hex_lower(&s256)),
+    ));
+    Ok(())
+}
+
+fn remember_blob(sink: &mut BlobSink<'_>, buf: &[u8], b3: [u8; 32], s256: [u8; 32]) -> Result<()> {
     if let Some(&i) = sink.seen.get(&b3) {
         sink.blobs[i].ref_count += 1;
     } else {
         if let Some(ref mut w) = sink.writer {
-            // Write from the scan/hash buffer; do not clone a second payload Vec.
             write_blob_record(&mut w.enc, &b3, buf)?;
         }
         sink.first_seen.update(&b3);
@@ -380,11 +389,6 @@ fn commit_blob(
             ref_count: 1,
         });
     }
-    jar_entries.push(entry_from_scan(
-        meta,
-        Some(hex_lower(&b3)),
-        Some(hex_lower(&s256)),
-    ));
     Ok(())
 }
 
@@ -543,6 +547,14 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
                 warn(opts, &msg);
             }
             bytes_in_jars += scanned.source_size;
+            let (prefix_blob, prefix_size) = match &scanned.prefix {
+                Some(prefix) if !prefix.is_empty() => {
+                    let (b3, s256) = hash_both(prefix);
+                    remember_blob(&mut sink, prefix, b3, s256)?;
+                    (Some(hex_lower(&b3)), Some(prefix.len() as u64))
+                }
+                _ => (None, None),
+            };
             jars.push(Jar {
                 name: jar_name,
                 source_path: path.to_string_lossy().into_owned(),
@@ -551,6 +563,8 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
                 source_sha256: hex_lower(&scanned.source_sha256),
                 comment: scanned.comment,
                 signed: scanned.signed,
+                prefix_blob,
+                prefix_size,
                 entries: jar_entries,
             });
         }

@@ -18,6 +18,28 @@ pub fn write_jar(path: &Path, files: &[(&str, &[u8])]) {
     z.finish().unwrap();
 }
 
+/// Realistic Spring Boot `executable: true` launcher (shebang + short comment).
+pub const SPRING_LAUNCHER: &[u8] = b"#!/bin/bash\n\
+#    .   ____          _            __ _ _\n\
+#   :: Spring Boot Startup Script ::\n\
+";
+
+/// Write `launcher` then a tiny JAR built with [`write_jar`].
+pub fn write_wrapped_jar(path: &Path, launcher: &[u8], files: &[(&str, &[u8])]) {
+    use std::io::Cursor;
+    let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    for (name, data) in files {
+        z.start_file(*name, opts).unwrap();
+        z.write_all(data).unwrap();
+    }
+    let zip = z.finish().unwrap().into_inner();
+    let mut out = Vec::with_capacity(launcher.len() + zip.len());
+    out.extend_from_slice(launcher);
+    out.extend_from_slice(&zip);
+    std::fs::write(path, out).unwrap();
+}
+
 pub enum JarEntry<'a> {
     File {
         name: &'a str,
