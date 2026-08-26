@@ -19,9 +19,20 @@ fn lib_forbids_unsafe_code() {
 
 #[test]
 fn cargo_toml_has_no_deferred_deps() {
-    // Guards pulling indicatif/rayon/proptest before their PRs.
+    // Guards pulling indicatif/rayon before their PRs. proptest is PR-19, dev-only.
     let toml = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
-    for dep in ["indicatif", "rayon", "proptest"] {
-        assert!(!toml.contains(dep), "PR-0 Cargo.toml must not pull {dep}");
+    for dep in ["indicatif", "rayon"] {
+        assert!(!toml.contains(dep), "Cargo.toml must not pull {dep} yet");
     }
+    let (runtime, dev) = toml
+        .split_once("[dev-dependencies]")
+        .expect("Cargo.toml has [dev-dependencies]");
+    assert!(
+        !runtime.contains("proptest"),
+        "proptest must not be a runtime dependency"
+    );
+    assert!(
+        dev.contains("proptest"),
+        "proptest must be a [dev-dependencies] crate"
+    );
 }

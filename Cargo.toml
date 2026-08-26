@@ -37,6 +37,8 @@ zstd = "0.13"
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "3.1"
+# Ecosystem standard for property tests (highly used); random ZIP trees only.
+proptest = "1"
 
 [profile.release]
 lto = true
