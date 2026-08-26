@@ -4,8 +4,8 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use super::record::{blob_record_len, write_record};
 use super::toc::{write_toc, Toc, TocEntry};
 use super::{
-    io_error, write_header, write_trailer, FileHeader, Record, Trailer, BUF_WRITER_CAP, TRAILER_LEN,
-    TRAILER_MAGIC,
+    io_error, write_header, write_trailer, FileHeader, Record, Trailer, BUF_WRITER_CAP,
+    TRAILER_LEN, TRAILER_MAGIC,
 };
 use crate::error::{AyzenpackError, Result};
 

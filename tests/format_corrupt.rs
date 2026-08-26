@@ -431,7 +431,10 @@ fn v1_pack_still_rehydrates() {
     drop(w);
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&v1, &dest)).unwrap();
-    assert_eq!(fs::read(dest.join("a.jar")).unwrap(), fs::read(&jar).unwrap());
+    assert_eq!(
+        fs::read(dest.join("a.jar")).unwrap(),
+        fs::read(&jar).unwrap()
+    );
     list(&v1).unwrap();
     verify(&v1).unwrap();
 }

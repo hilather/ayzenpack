@@ -718,14 +718,8 @@ mod tests {
         let h1 = blake3_bytes(&d1);
         let json = br#"{"format":"ayzenpack-manifest","two_frames":true}"#.to_vec();
         let records = vec![
-            Record::Blob {
-                hash: h0,
-                data: d0,
-            },
-            Record::Blob {
-                hash: h1,
-                data: d1,
-            },
+            Record::Blob { hash: h0, data: d0 },
+            Record::Blob { hash: h1, data: d1 },
             Record::Manifest { json },
             Record::End {
                 digest: order_digest(&[h0, h1]),
