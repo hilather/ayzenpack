@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Seek, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -17,7 +17,7 @@ use crate::error::{AyzenpackError, Result};
 use crate::exact::{capture_zip_exact, ExactLocal, ZipExact};
 use crate::format::{
     write_header, write_record, write_trailer, FileHeader, Record, Trailer, BUF_WRITER_CAP,
-    REC_BLOB, TRAILER_LEN,
+    REC_BLOB, TRAILER_LEN, TRAILER_MAGIC,
 };
 use crate::hashutil::{hash_both, hex_lower};
 use crate::manifest::{Blob, Entry, Jar, Manifest, Stats, MANIFEST_FORMAT};
@@ -409,10 +409,14 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
     let created_unix = if opts.sort_inputs { 0 } else { unix_now() };
     let header = FileHeader::new(opts.level, created_unix);
 
-    let mut writer = if opts.dry_run {
+    let pending = if opts.dry_run {
         None
     } else {
-        Some(start_ayz_file(&opts.output, &header)?)
+        Some(PendingAyz::prepare(&opts.output)?)
+    };
+    let mut writer = match pending.as_ref() {
+        Some(p) => Some(start_ayz_file(&p.tmp, &header)?),
+        None => None,
     };
 
     let jobs = resolve_jobs(opts.jobs);
@@ -637,6 +641,11 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
         0
     };
 
+    if let Some(pending) = pending {
+        maybe_inject_commit_failure()?;
+        pending.commit()?;
+    }
+
     if !opts.dry_run {
         if let Some(side) = &opts.write_sidecar_manifest {
             write_sidecar(side, &manifest, opts.pretty_manifest)?;
@@ -657,19 +666,103 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
     })
 }
 
-fn start_ayz_file(output: &Path, header: &FileHeader) -> Result<AyzWriter> {
-    if let Some(parent) = output.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|source| AyzenpackError::Io {
-                source,
-                path: Some(output.to_path_buf()),
-            })?;
+/// Sibling of `dest` (`all.ayz` → `all.ayz.tmp`) so `rename` stays on one filesystem.
+fn sibling_tmp_path(dest: &Path) -> PathBuf {
+    let mut name = dest
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| "ayzenpack.ayz".into());
+    name.push(".tmp");
+    dest.with_file_name(name)
+}
+
+/// Write the `.ayz` to a sibling temp and `rename` over `dest` only after the trailer is valid.
+/// Drop deletes the temp so a failed or aborted dehydrate cannot replace `dest` with a
+/// header-and-no-trailer file.
+struct PendingAyz {
+    tmp: PathBuf,
+    dest: PathBuf,
+    committed: bool,
+}
+
+impl PendingAyz {
+    fn prepare(dest: &Path) -> Result<Self> {
+        if let Some(parent) = dest.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|source| AyzenpackError::Io {
+                    source,
+                    path: Some(dest.to_path_buf()),
+                })?;
+            }
+        }
+        Ok(Self {
+            tmp: sibling_tmp_path(dest),
+            dest: dest.to_path_buf(),
+            committed: false,
+        })
+    }
+
+    fn commit(mut self) -> Result<()> {
+        replace_file(&self.tmp, &self.dest)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for PendingAyz {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.tmp);
         }
     }
-    let mut file = File::create(output).map_err(|source| AyzenpackError::Io {
+}
+
+fn replace_file(from: &Path, to: &Path) -> Result<()> {
+    let map_err = |source| AyzenpackError::Io {
         source,
-        path: Some(output.to_path_buf()),
-    })?;
+        path: Some(to.to_path_buf()),
+    };
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Windows cannot replace an existing dest with rename.
+            if to.exists() {
+                fs::remove_file(to).map_err(map_err)?;
+                fs::rename(from, to).map_err(map_err)
+            } else {
+                Err(map_err(e))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_BEFORE_AYZ_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn maybe_inject_commit_failure() -> Result<()> {
+    #[cfg(test)]
+    {
+        if FAIL_BEFORE_AYZ_COMMIT.with(std::cell::Cell::get) {
+            FAIL_BEFORE_AYZ_COMMIT.with(|c| c.set(false));
+            return Err(AyzenpackError::Format("injected commit failure"));
+        }
+    }
+    Ok(())
+}
+
+fn start_ayz_file(output: &Path, header: &FileHeader) -> Result<AyzWriter> {
+    let mut file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(output)
+        .map_err(|source| AyzenpackError::Io {
+            source,
+            path: Some(output.to_path_buf()),
+        })?;
     let header_len = write_header(&mut file, header)?;
     let header_total = file.stream_position().map_err(crate::format::io_error)?;
 
@@ -685,6 +778,35 @@ fn start_ayz_file(output: &Path, header: &FileHeader) -> Result<AyzWriter> {
         header_total,
         header_len,
     })
+}
+
+/// After flush: `stream_position` must match `metadata().len()`, and the last 64 bytes
+/// must be a real `AYZPTLR1` trailer. Do not trust length alone.
+fn verify_finished_ayz(file: &mut File, expected_len: u64) -> Result<()> {
+    let file_len = file.metadata().map_err(crate::format::io_error)?.len();
+    let pos = file.stream_position().map_err(crate::format::io_error)?;
+    if pos != file_len {
+        return Err(AyzenpackError::Format(
+            "stream position != written file length",
+        ));
+    }
+    if file_len != expected_len {
+        return Err(AyzenpackError::Format(
+            "file length != header_total + payload_bytes + 64",
+        ));
+    }
+    if file_len < TRAILER_LEN {
+        return Err(AyzenpackError::Format("truncated trailer"));
+    }
+    file.seek(SeekFrom::Start(file_len - TRAILER_LEN))
+        .map_err(crate::format::io_error)?;
+    let mut tail = [0u8; 64];
+    file.read_exact(&mut tail)
+        .map_err(crate::format::io_error)?;
+    if tail[0..8] != TRAILER_MAGIC {
+        return Err(AyzenpackError::Format("trailer magic missing after write"));
+    }
+    Ok(())
 }
 
 /// Finish the zstd frame, measure `payload_bytes`, then write the trailer on the same BufWriter.
@@ -725,17 +847,9 @@ fn finish_ayz_file(
     };
     write_trailer(&mut w, &trailer)?;
     w.flush().map_err(crate::format::io_error)?;
-    let file_len = w
-        .get_ref()
-        .metadata()
-        .map_err(crate::format::io_error)?
-        .len();
-    if file_len != header_total + payload_bytes + TRAILER_LEN {
-        return Err(AyzenpackError::Format(
-            "file length != header_total + payload_bytes + 64",
-        ));
-    }
-    Ok(file_len)
+    let expected_len = header_total + payload_bytes + TRAILER_LEN;
+    verify_finished_ayz(w.get_mut(), expected_len)?;
+    Ok(expected_len)
 }
 
 fn write_blob_record<W: Write>(w: &mut W, hash: &[u8; 32], data: &[u8]) -> Result<()> {
@@ -1171,5 +1285,144 @@ mod tests {
                 "{glob_s} vs {path}"
             );
         }
+    }
+
+    fn last64_is_trailer_magic(path: &Path) -> bool {
+        let bytes = fs::read(path).unwrap();
+        bytes.len() >= 64 && bytes[bytes.len() - 64..bytes.len() - 56] == TRAILER_MAGIC
+    }
+
+    #[test]
+    fn sibling_tmp_path_is_dest_plus_tmp() {
+        assert_eq!(
+            sibling_tmp_path(Path::new("all.ayz")),
+            PathBuf::from("all.ayz.tmp")
+        );
+        assert_eq!(
+            sibling_tmp_path(Path::new("/out/all.ayz")),
+            PathBuf::from("/out/all.ayz.tmp")
+        );
+    }
+
+    #[test]
+    fn pending_ayz_drop_does_not_leave_dest_with_bad_trailer() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("all.ayz");
+        let pending = PendingAyz::prepare(&dest).unwrap();
+        let tmp = pending.tmp.clone();
+        let mut incomplete = b"AYZP\x01\x00\x00\x00".to_vec();
+        incomplete.extend_from_slice(&[0u8; 64]);
+        fs::write(&tmp, &incomplete).unwrap();
+        assert!(!last64_is_trailer_magic(&tmp));
+        drop(pending);
+        assert!(!dest.exists(), "aborted finish must not create dest");
+        assert!(!tmp.exists(), "aborted finish must delete the temp file");
+    }
+
+    #[test]
+    fn pending_ayz_drop_preserves_existing_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("all.ayz");
+        fs::write(&dest, b"old-dest-bytes").unwrap();
+        let pending = PendingAyz::prepare(&dest).unwrap();
+        let tmp = pending.tmp.clone();
+        let mut incomplete = b"AYZP\x01\x00\x00\x00".to_vec();
+        incomplete.extend_from_slice(&[0u8; 64]);
+        fs::write(&tmp, &incomplete).unwrap();
+        drop(pending);
+        assert_eq!(fs::read(&dest).unwrap(), b"old-dest-bytes");
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn dehydrate_commit_failure_does_not_leave_bad_dest_trailer() {
+        let dir = tempfile::tempdir().unwrap();
+        let jar = dir.path().join("a.jar");
+        write_test_jar(&jar, &[("x.txt", b"hello")]);
+        let dest = dir.path().join("all.ayz");
+        fs::write(&dest, b"pre-existing").unwrap();
+        FAIL_BEFORE_AYZ_COMMIT.with(|c| c.set(true));
+        let opts = DehydrateOptions {
+            output: dest.clone(),
+            inputs: vec![jar],
+            quiet: true,
+            ..DehydrateOptions::default()
+        };
+        let err = dehydrate(&opts).unwrap_err();
+        assert!(
+            matches!(err, AyzenpackError::Format("injected commit failure")),
+            "inject hook must fire, got {err:?}"
+        );
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            b"pre-existing",
+            "failed commit must not replace dest with a header-only pack"
+        );
+        assert!(
+            !sibling_tmp_path(&dest).exists(),
+            "temp must be deleted after commit failure"
+        );
+        if dest.metadata().map(|m| m.len()).unwrap_or(0) >= 64 {
+            assert!(
+                last64_is_trailer_magic(&dest),
+                "dest last 64 must not fail trailer magic after aborted finish"
+            );
+        }
+    }
+
+    #[test]
+    fn dehydrate_success_leaves_no_tmp_and_valid_trailer() {
+        let dir = tempfile::tempdir().unwrap();
+        let jar = dir.path().join("a.jar");
+        write_test_jar(&jar, &[("x.txt", b"hello")]);
+        let dest = dir.path().join("all.ayz");
+        let opts = DehydrateOptions {
+            output: dest.clone(),
+            inputs: vec![jar],
+            quiet: true,
+            ..DehydrateOptions::default()
+        };
+        dehydrate(&opts).unwrap();
+        assert!(dest.is_file());
+        assert!(!sibling_tmp_path(&dest).exists());
+        assert!(
+            last64_is_trailer_magic(&dest),
+            "successful dehydrate must write AYZPTLR1"
+        );
+    }
+
+    #[test]
+    fn verify_finished_ayz_requires_position_len_and_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.ayz");
+        let mut body = vec![0u8; 8];
+        body.extend_from_slice(&TRAILER_MAGIC);
+        body.extend_from_slice(&[0u8; 56]);
+        fs::write(&path, &body).unwrap();
+        let mut f = File::options().read(true).write(true).open(&path).unwrap();
+        f.seek(SeekFrom::End(0)).unwrap();
+        verify_finished_ayz(&mut f, body.len() as u64).unwrap();
+
+        f.seek(SeekFrom::Start(0)).unwrap();
+        let err = verify_finished_ayz(&mut f, body.len() as u64).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AyzenpackError::Format("stream position != written file length")
+            ),
+            "pos != len must error, got {err:?}"
+        );
+
+        fs::write(&path, vec![0u8; body.len()]).unwrap();
+        let mut f = File::options().read(true).write(true).open(&path).unwrap();
+        f.seek(SeekFrom::End(0)).unwrap();
+        let err = verify_finished_ayz(&mut f, body.len() as u64).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AyzenpackError::Format("trailer magic missing after write")
+            ),
+            "garbage tail must error, got {err:?}"
+        );
     }
 }

@@ -9,8 +9,8 @@ use std::path::Path;
 use assert_cmd::Command;
 use ayzenpack::error::AyzenpackError;
 use ayzenpack::format::{read_ayz_file, write_ayz_file, Record};
-use ayzenpack::{dehydrate, list, verify, DehydrateOptions};
-use fixtures::{write_jar, write_stored_zip};
+use ayzenpack::{dehydrate, list, rehydrate, verify, DehydrateOptions, RehydrateOptions};
+use fixtures::{write_jar, write_stored_zip, write_wrapped_jar, SPRING_LAUNCHER};
 use predicates::prelude::*;
 
 fn opts(output: &Path, inputs: Vec<std::path::PathBuf>) -> DehydrateOptions {
@@ -121,6 +121,72 @@ fn truncated_trailer_errors() {
     assert!(
         matches!(err, AyzenpackError::Format("truncated trailer")),
         "truncated finished archive must not verify, got {err:?}"
+    );
+}
+
+fn rehydrate_opts(input: &Path, dir: &Path) -> RehydrateOptions {
+    RehydrateOptions {
+        input: input.to_path_buf(),
+        dir: dir.to_path_buf(),
+        ..RehydrateOptions::default()
+    }
+}
+
+#[test]
+fn jar_input_names_jar_zip_not_generic_magic() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("a.jar");
+    write_jar(&jar, &[("x.txt", b"hello")]);
+    let dest = dir.path().join("out");
+
+    let r = rehydrate(&rehydrate_opts(&jar, &dest)).unwrap_err();
+    assert!(
+        r.to_string().contains("JAR/ZIP"),
+        "rehydrate jar must name JAR/ZIP, got {r}"
+    );
+    let l = list(&jar).unwrap_err();
+    assert!(
+        l.to_string().contains("JAR/ZIP"),
+        "list jar must name JAR/ZIP, got {l}"
+    );
+    let v = verify(&jar).unwrap_err();
+    assert!(
+        v.to_string().contains("JAR/ZIP"),
+        "verify jar must name JAR/ZIP, got {v}"
+    );
+}
+
+#[test]
+fn shebang_jar_input_names_executable_script() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("app.jar");
+    write_wrapped_jar(&jar, SPRING_LAUNCHER, &[("A.class", b"AAA")]);
+
+    let err = verify(&jar).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("executable") || msg.contains("script"),
+        "shebang+zip must mention executable/script, got {msg}"
+    );
+    assert!(
+        !msg.contains("saw "),
+        "shebang+zip must not be generic magic only, got {msg}"
+    );
+}
+
+#[test]
+fn ayzp_header_garbage_trailer_names_missing_truncated() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("trunc.ayz");
+    let mut bytes = b"AYZP\x01\x00\x00\x00".to_vec();
+    bytes.extend_from_slice(&[0u8; 64]);
+    fs::write(&p, bytes).unwrap();
+
+    let err = verify(&p).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("missing") || msg.contains("truncated"),
+        "AYZP + garbage trailer must mention missing/truncated, got {msg}"
     );
 }
 
