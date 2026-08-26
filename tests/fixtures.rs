@@ -620,6 +620,31 @@ pub fn write_deflate_miss_plus_empty_deflate_dir(path: &Path, name: &str, data: 
     );
 }
 
+/// STORE file plus a method-0 directory with leftover local cdata (uncomp 0, csize 4).
+pub fn write_store_file_plus_leftover_csize_dir(path: &Path, name: &str, data: &[u8]) {
+    write_locals_and_cd(
+        path,
+        &[
+            BuiltLocal {
+                name: name.as_bytes().to_vec(),
+                method: 0,
+                crc: crc32fast::hash(data),
+                uncomp: data.len() as u32,
+                cdata: data.to_vec(),
+                extra: Vec::new(),
+            },
+            BuiltLocal {
+                name: b"marked/".to_vec(),
+                method: 0,
+                crc: 0,
+                uncomp: 0,
+                cdata: b"DIRC".to_vec(),
+                extra: Vec::new(),
+            },
+        ],
+    );
+}
+
 /// STORE file plus a method-0 directory whose local record has non-empty cdata.
 /// No DEFLATE miss — today's ExactWithExotic arm (codec-hit/STORE + class-4 dir).
 pub fn write_store_file_plus_dir_cdata(path: &Path, name: &str, data: &[u8]) {

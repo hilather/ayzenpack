@@ -18,10 +18,10 @@ use fixtures::{
     write_deflate_miss_plus_empty_deflate_dir, write_jar, write_jar_entries,
     write_jar_with_comment, write_non_utf8_name_zip, write_padded_locals_zip,
     write_signed_looking_jar, write_store_file_plus_dir_cdata,
-    write_store_file_plus_empty_deflate_dir, write_stored_block_deflate_wrapped,
-    write_stored_block_deflate_zip, write_stored_jar_dos_zero, write_stored_zip, write_wrapped_jar,
-    write_wrapped_jar_adjusted, write_wrapped_zip64_jar, zip64_jar_bytes, JarEntry,
-    SPRING_LAUNCHER,
+    write_store_file_plus_empty_deflate_dir, write_store_file_plus_leftover_csize_dir,
+    write_stored_block_deflate_wrapped, write_stored_block_deflate_zip, write_stored_jar_dos_zero,
+    write_stored_zip, write_wrapped_jar, write_wrapped_jar_adjusted, write_wrapped_zip64_jar,
+    zip64_jar_bytes, JarEntry, SPRING_LAUNCHER,
 };
 use zip::{CompressionMethod, DateTime, ZipArchive};
 
@@ -1994,6 +1994,31 @@ fn exact_with_exotic_store_plus_dir_cdata_rebuilds() {
         fs::read(&restored).unwrap(),
         "ExactWithExotic rebuild must not be bit-identical"
     );
+    assert_empty_store_dir(&restored, "marked/");
+}
+
+#[test]
+fn leftover_csize_dir_rebuilds_empty_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("leftover-csize.jar");
+    write_store_file_plus_leftover_csize_dir(&jar, "a.txt", b"hello-store");
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    for e in &m.jars[0].entries {
+        assert!(
+            e.cdata_blob.is_none(),
+            "{} must not write cdata_blob",
+            e.name
+        );
+    }
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    assert!(m.jars[0].metadata_rebuild());
+    assert!(!m.jars[0].bit_identical_restore());
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("leftover-csize.jar");
+    assert_functional_identity(&jar, &restored);
     assert_empty_store_dir(&restored, "marked/");
 }
 

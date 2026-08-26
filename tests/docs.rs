@@ -124,7 +124,7 @@ fn agents_md_locks_single_cas_and_zstd_blocks() {
         "AGENTS.md must say never write legacy dual-copy again"
     );
     assert!(
-        AGENTS.contains("**never writes** `cdata_blob` on STORE/DEFLATE"),
+        AGENTS.contains("**never writes** `cdata_blob` on STORE/DEFLATE (file or dir, any method)"),
         "AGENTS.md must say 0.2.1 never writes leftover cdata_blob"
     );
     assert!(

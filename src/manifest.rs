@@ -84,7 +84,9 @@ impl Entry {
             // A method-8 empty DEFLATE dir (`03 00`) needs `cdata_codec` or rebuild.
             return self.uncompressed_size == 0 && self.compressed_size == 0;
         }
-        self.method_code == 0
+        // STORE splice only when local cdata length is the payload.
+        // An Unreproducible STORE file (csize != uncomp) is not exact.
+        self.method_code == 0 && self.compressed_size == self.uncompressed_size
     }
 }
 
@@ -556,6 +558,18 @@ mod tests {
         assert!(
             !leftover_csize.can_exact_cdata(),
             "method-0 dir with leftover local cdata is not exact"
+        );
+
+        let mut store_file = sample_file_entry();
+        store_file.method = "stored".into();
+        store_file.method_code = 0;
+        store_file.uncompressed_size = 4;
+        store_file.compressed_size = 4;
+        assert!(store_file.can_exact_cdata());
+        store_file.compressed_size = 8;
+        assert!(
+            !store_file.can_exact_cdata(),
+            "STORE file with csize != uncomp is not exact"
         );
 
         let maven = dir_entry(0, 2, 8);
