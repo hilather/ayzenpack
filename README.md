@@ -176,9 +176,9 @@ Agent rules: [`AGENTS.md`](https://github.com/hilather/ayzenpack/blob/main/AGENT
 
 ## Signed JARs
 
-STORE / codec-hit / legacy-`cdata_blob` splice keeps `META-INF/*.SF` / `*.RSA` / `*.DSA` / `*.EC` bytes, so those signatures can still verify. Rebuild changes compressed sizes and will break them. That is acceptable — do not store a second payload copy to keep a signature. ayzenpack does not re-sign.
+`META-INF/*.SF` / `MANIFEST.MF` digest uncompressed entry bytes, not the deflate stream. Rebuild keeps those bytes, so jarsigner should still verify. Whole-file `source_*` may change. Do not store a second payload copy to keep a file hash. ayzenpack does not re-sign.
 
-`dehydrate` notes signed JARs and still packs. Pass `--fail-on-signed` to abort instead. `--strict` does not promote the signed notice by itself. Content-mode rebuild of an old archive can still break a signature.
+`dehydrate` warns `signed JAR <name>` for exact and rebuild, and still packs. Pass `--fail-on-signed` to abort instead. `--strict` does not promote the signed notice by itself.
 
 ---
 

@@ -208,7 +208,7 @@ Paths, in order:
 - **STORE:** splice the content `blob` at the recorded local offset. No `cdata_blob`.
 - **DEFLATE codec hit:** optional `cdata_codec` when a pack-time trial matched original cdata: `deflate-raw:zlib:{1,6,9}` (in-process zlib-rs, raw/nowrap), `deflate-raw:flate2:{1,3,6,9}` (existing miniz), or `deflate-raw:stored` (BTYPE 00). Rehydrate encodes and splices. A hit is luck, not a goal. A miss must not drop sibling codecs.
 - **Child `zip_index`:** reconstruct the nested ZIP from `jars[].nestedindexes[i]` + CAS (`reconstruct_child_zip`), then splice or rebuild that outer slot. Depth 1. `blob` is null. Never a second whole-ZIP CAS.
-- **Otherwise rebuild:** neither `cdata_blob` nor `cdata_codec`. Patch local header / data descriptor / CD / EOCD (and Zip64 extras that already exist). Same names, CD order, timestamps, extras, uncompressed bytes. New compressed sizes. **`source_*` may change. That is acceptable.** Signed JARs on this path use the existing “rebuild will break the signature” warning.
+- **Otherwise rebuild:** neither `cdata_blob` nor `cdata_codec`. Patch local header / data descriptor / CD / EOCD (and Zip64 extras that already exist). Same names, CD order, timestamps, extras, uncompressed bytes. New compressed sizes. **`source_*` may change. That is acceptable.**
 - **Skip-exact** (no `tail_blob`, no `raw_zip`; remaining homemade-`None`, overlap, prefix+hole, slice `Err`): `zip::ZipWriter`. Payload is always uncompressed (`read_entry_content` / `reconstruct_child_zip`). STORE when `is_dir`, `--store-all`, `method_code == 0`, or `zip_index`. Method-8 misses DEFLATE at `deflate_level` (zip crate, not `deflate_raw` 6). Never `resolve_cdata` / `encode_codec`. Never seek `offsetheader`. Never `verify_source_identity`. Nested STORE `zip_index` members stay STORE (reassembled from shared class blobs; never late-CAS `blake3(inner zip)`). Dest size stays in the same league (`restored * 2 >= source`). **`source_*` may change.**
 - **Legacy `cdata_blob`:** read 0.1.6–0.1.8 dual-copy packs and 0.2.0 MixedExact leftovers. **Never write this shape again.** Maven/Java empty DEFLATE directories (`03 00`, usize 0) are codec/empty, not exotic.
 
@@ -293,9 +293,9 @@ Old packs still read (opaque nested blob, flate2-only `cdata_codec`, zip-rel `lo
 
 ## Signed JARs
 
-`META-INF/*.SF` plus `*.RSA` / `*.DSA` / `*.EC` digest compressed or stored bytes. Splice restore (STORE / codec-hit / legacy `cdata_blob` / `raw_zip`) keeps those bytes, so file-level signatures can survive. Rebuild changes compressed sizes, so those signatures will not verify. That is acceptable. ayzenpack does not re-sign. Do not store `cdata_blob` or `raw_zip` a healthy jar just to keep a signature.
+`META-INF/*.SF` / `MANIFEST.MF` digest uncompressed entry bytes, not the deflate stream. `*.RSA` / `*.DSA` / `*.EC` sign that `.SF`. Rebuild keeps names, CD order, and those uncompressed bytes, so jarsigner should still verify. Whole-file `source_*` may change. That is expected. ayzenpack does not re-sign. Do not store `cdata_blob` or `raw_zip` a healthy jar just to keep a file hash.
 
-Dehydrate still notes signed JARs and packs. `--fail-on-signed` aborts. `--strict` does not promote the signed notice. The “rebuild will break the signature” warning is for rebuild jars and the content/`ZipWriter` fallback.
+Dehydrate still warns `signed JAR <name>` for exact and rebuild, and still packs. `--fail-on-signed` aborts. `--strict` does not promote the signed notice.
 
 ---
 
@@ -343,7 +343,7 @@ Rehydrate spills blobs to a CAS directory. Peak is the largest blob being copied
 | Zip-slip (`../` in entry or `jar.name`) | Reject `jar.name` with `/`, `\`, `..`. Skip entry components `..`. |
 | Zip bomb | `--max-entry-bytes` |
 | Encrypted ZIP | Fail with path; do not decrypt |
-| Signed JAR silently broken | Detect; warn; splice may keep bytes; rebuild will not; `--fail-on-signed` |
+| Signed JAR silently broken | Detect; warn `signed JAR <name>`; jarsigner should still verify after rebuild; `--fail-on-signed` |
 | Traversal via `--cas-dir` / output | `--clean` only deletes names we write. CAS paths are hex |
 | `unsafe` | `forbid(unsafe_code)` |
 | SSRF | No network in the crate |

@@ -133,7 +133,7 @@ Do not add jarsigner / JDK verification. Do not require whole-file hash match on
 
 - Sweep 1: ACCEPT, no blockers. Folded five SHOULD items (README fact + wording lock, security-table cell, exact-path extra-clause reject, keep `!exact_restore()`).
 - Sweep 2: ACCEPT, no blockers. Folded three SHOULD items (replace whole DESIGN Signed JARs section; docs.rs forbids `those signatures will not verify`; README positive MANIFEST lock; `--strict` extra-clause reject).
-- Sweep 3: pending.
+- Sweep 3: ACCEPT, no blockers. Plan locked. Implement.
 
 ---
 

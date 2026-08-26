@@ -12,7 +12,9 @@ use ayzenpack::format::{
     open_ayz_layout, read_ayz_file, read_toc_at, write_ayz_file, write_ayz_file_v1, Record,
 };
 use ayzenpack::{dehydrate, list, rehydrate, verify, DehydrateOptions, RehydrateOptions};
-use fixtures::{write_jar, write_stored_zip, write_wrapped_jar, SPRING_LAUNCHER};
+use fixtures::{
+    write_jar, write_stored_zip, write_unknown_deflate_zip, write_wrapped_jar, SPRING_LAUNCHER,
+};
 use predicates::prelude::*;
 
 fn opts(output: &Path, inputs: Vec<std::path::PathBuf>) -> DehydrateOptions {
@@ -241,7 +243,8 @@ fn fail_on_signed_exits_error() {
         .arg(&jar)
         .assert()
         .success()
-        .stderr(predicate::str::contains("signed"));
+        .stderr(predicate::str::contains("signed JAR signed.jar"))
+        .stderr(predicate::str::contains("rebuild will break the signature").not());
 
     ayzenpack()
         .arg("dehydrate")
@@ -252,7 +255,52 @@ fn fail_on_signed_exits_error() {
         .assert()
         .failure()
         .code(1)
-        .stderr(predicate::str::contains("signed"));
+        .stderr(predicate::str::contains("signed JAR signed.jar"))
+        .stderr(predicate::str::contains("rebuild will break the signature").not());
+}
+
+#[test]
+fn signed_rebuild_warns_without_claiming_broken_signature() {
+    // Unknown DEFLATE + .SF is the rebuild path that used to print
+    // "(rebuild will break the signature)". Stored-block DEFLATE is a
+    // `deflate-raw:stored` hit after 0.2.4. jarsigner digests uncompressed
+    // bytes; keep the signed notice, drop the extra clause.
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("signed-miss.jar");
+    write_unknown_deflate_zip(&jar, "META-INF/FOO.SF", &vec![b'a'; 256]);
+
+    ayzenpack()
+        .arg("dehydrate")
+        .arg("-o")
+        .arg(dir.path().join("rebuild.ayz"))
+        .arg(&jar)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("signed JAR signed-miss.jar"))
+        .stderr(predicate::str::contains("rebuild will break the signature").not());
+
+    ayzenpack()
+        .arg("dehydrate")
+        .arg("--fail-on-signed")
+        .arg("-o")
+        .arg(dir.path().join("fail.ayz"))
+        .arg(&jar)
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("signed JAR signed-miss.jar"))
+        .stderr(predicate::str::contains("rebuild will break the signature").not());
+
+    ayzenpack()
+        .arg("dehydrate")
+        .arg("--strict")
+        .arg("-o")
+        .arg(dir.path().join("strict.ayz"))
+        .arg(&jar)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("signed JAR signed-miss.jar"))
+        .stderr(predicate::str::contains("rebuild will break the signature").not());
 }
 
 #[test]
