@@ -1,0 +1,18 @@
+# Filled by packaging/build-native-packages.sh
+name: "@NAME@"
+arch: "@ARCH@"
+platform: linux
+version: "@VERSION@"
+section: utils
+priority: optional
+maintainer: "@MAINTAINER@"
+description: |
+  Dehydrate many JARs into one zstd content-addressed archive and rehydrate them.
+vendor: ayzenpack
+homepage: https://github.com/hilather/ayzenpack
+license: MIT
+contents:
+  - src: target/release/ayzenpack
+    dst: /usr/bin/ayzenpack
+    file_info:
+      mode: 0755

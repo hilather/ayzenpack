@@ -52,6 +52,10 @@ fn readme_contains_ayzenpack_dehydrate_example() {
     );
     assert!(!README.contains("jded"), "README must not say jded");
     assert!(!README.contains(".jded"), "README must not say .jded");
+    assert!(
+        README.contains("Rocky Linux 8") && README.contains("Rocky Linux 9"),
+        "README must document Rocky 8 and 9 packages"
+    );
 }
 
 #[test]

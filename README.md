@@ -14,6 +14,23 @@ cargo install --path .
 
 Requires Rust 1.80 or later.
 
+### Rocky Linux packages
+
+Release tags `v*` run [Packages](.github/workflows/packages.yml) and attach **Rocky Linux 8 and Rocky Linux 9** RPMs plus tarballs to the GitHub Release (cosign keyless signatures included).
+
+```text
+sudo dnf install ./ayzenpack-*.x86_64.rpm
+# or
+tar -xzf ayzenpack-*-rocky-8-x86_64.tar.gz
+sudo install -m 755 ayzenpack /usr/local/bin/
+```
+
+Local RPM (on a Rocky/RHEL host with gcc + rustc):
+
+```text
+PACKAGE_FAMILY=rpm DISTRO_LABEL=rocky-8 ./packaging/build-native-packages.sh
+```
+
 ## Usage
 
 ```text
