@@ -28,7 +28,24 @@ pub struct Jar {
     pub prefix_blob: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_size: Option<u64>,
+    /// BLAKE3 of bytes from the central directory through zip EOF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail_blob: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail_size: Option<u64>,
+    /// Whole zip portion after `prefix` when locals cannot be sliced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_zip_blob: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_zip_size: Option<u64>,
     pub entries: Vec<Entry>,
+}
+
+impl Jar {
+    /// New packs set `tail_*` or `raw_zip_*`. Old 0.1.x archives have neither.
+    pub fn exact_restore(&self) -> bool {
+        self.raw_zip_blob.is_some() || self.tail_blob.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -68,6 +85,21 @@ pub struct Entry {
     pub utf8_flag: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name_raw_hex: Option<String>,
+    /// BLAKE3 of the original compressed payload. Same CAS object as `blob` when stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdata_blob: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_header_offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_header_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_header_blob: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_descriptor_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pad_zeros: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pad_blob: Option<String>,
 }
 
 #[cfg(test)]
@@ -102,6 +134,13 @@ mod tests {
             unix_mode: None,
             utf8_flag: true,
             name_raw_hex: None,
+            cdata_blob: None,
+            local_header_offset: None,
+            local_header_hex: None,
+            local_header_blob: None,
+            data_descriptor_hex: None,
+            pad_zeros: None,
+            pad_blob: None,
         }
     }
 
@@ -123,6 +162,10 @@ mod tests {
                 signed: false,
                 prefix_blob: None,
                 prefix_size: None,
+                tail_blob: None,
+                tail_size: None,
+                raw_zip_blob: None,
+                raw_zip_size: None,
                 entries: vec![sample_file_entry()],
             }],
             blobs: vec![Blob {
@@ -187,6 +230,11 @@ mod tests {
         assert!(SCHEMA_JSON.contains("name_raw_hex"));
         assert!(SCHEMA_JSON.contains("prefix_blob"));
         assert!(SCHEMA_JSON.contains("prefix_size"));
+        assert!(SCHEMA_JSON.contains("tail_blob"));
+        assert!(SCHEMA_JSON.contains("raw_zip_blob"));
+        assert!(SCHEMA_JSON.contains("cdata_blob"));
+        assert!(SCHEMA_JSON.contains("local_header_hex"));
+        assert!(SCHEMA_JSON.contains("local_header_offset"));
         assert!(!SCHEMA_JSON.contains("jded"));
         assert_eq!(m.version, 1);
         assert_eq!(m.hash_algo, "blake3");
@@ -247,6 +295,22 @@ mod tests {
             &serde_json::to_string(&with_prefix).unwrap(),
             &["signed", "prefix_blob", "prefix_size", "entries"],
         );
+        let mut with_exact = m.jars[0].clone();
+        with_exact.tail_blob = Some(EMPTY_BLAKE3.into());
+        with_exact.tail_size = Some(80);
+        with_exact.raw_zip_blob = Some(EMPTY_BLAKE3.into());
+        with_exact.raw_zip_size = Some(100);
+        assert_key_order(
+            &serde_json::to_string(&with_exact).unwrap(),
+            &[
+                "signed",
+                "tail_blob",
+                "tail_size",
+                "raw_zip_blob",
+                "raw_zip_size",
+                "entries",
+            ],
+        );
         assert_key_order(
             &serde_json::to_string(&m.blobs[0]).unwrap(),
             &["blake3", "sha256", "size", "ref_count"],
@@ -282,6 +346,23 @@ mod tests {
                 "utf8_flag",
             ],
         );
+        let mut exact_ent = m.jars[0].entries[0].clone();
+        exact_ent.cdata_blob = Some(EMPTY_BLAKE3.into());
+        exact_ent.local_header_offset = Some(0);
+        exact_ent.local_header_hex = Some("504b0304".into());
+        exact_ent.data_descriptor_hex = Some("504b0708".into());
+        exact_ent.pad_zeros = Some(3);
+        assert_key_order(
+            &serde_json::to_string(&exact_ent).unwrap(),
+            &[
+                "utf8_flag",
+                "cdata_blob",
+                "local_header_offset",
+                "local_header_hex",
+                "data_descriptor_hex",
+                "pad_zeros",
+            ],
+        );
     }
 
     #[test]
@@ -301,6 +382,13 @@ mod tests {
             unix_mode: None,
             utf8_flag: true,
             name_raw_hex: None,
+            cdata_blob: None,
+            local_header_offset: None,
+            local_header_hex: None,
+            local_header_blob: None,
+            data_descriptor_hex: None,
+            pad_zeros: None,
+            pad_blob: None,
         };
         let s = serde_json::to_string(&e).unwrap();
         assert_compact(&s);
@@ -382,5 +470,39 @@ mod tests {
         let jar2: Jar = serde_json::from_str(&s).unwrap();
         assert_eq!(jar2.prefix_blob, None);
         assert_eq!(jar2.prefix_size, None);
+    }
+
+    #[test]
+    fn exact_fields_omitted_when_none() {
+        let jar = sample_manifest().jars[0].clone();
+        let s = serde_json::to_string(&jar).unwrap();
+        assert_compact(&s);
+        for key in [
+            "tail_blob",
+            "tail_size",
+            "raw_zip_blob",
+            "raw_zip_size",
+            "cdata_blob",
+            "local_header_offset",
+            "local_header_hex",
+            "local_header_blob",
+            "data_descriptor_hex",
+            "pad_zeros",
+            "pad_blob",
+        ] {
+            assert!(!s.contains(key), "None {key} must be omitted: {s}");
+        }
+        let e = serde_json::to_string(&jar.entries[0]).unwrap();
+        for key in [
+            "cdata_blob",
+            "local_header_offset",
+            "local_header_hex",
+            "local_header_blob",
+            "data_descriptor_hex",
+            "pad_zeros",
+            "pad_blob",
+        ] {
+            assert!(!e.contains(key), "None {key} must be omitted: {e}");
+        }
     }
 }

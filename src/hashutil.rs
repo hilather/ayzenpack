@@ -1,3 +1,5 @@
+use std::io::Read;
+
 use sha2::{Digest, Sha256};
 
 use crate::error::{AyzenpackError, Result};
@@ -26,6 +28,30 @@ pub fn hash_both(data: &[u8]) -> ([u8; 32], [u8; 32]) {
 
 pub fn hex_lower(bytes: &[u8]) -> String {
     hex::encode(bytes)
+}
+
+/// Decode mixed-case hex of any even length (local headers, descriptors).
+pub fn parse_hex(s: &str) -> Result<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return Err(AyzenpackError::Format("hex length must be even"));
+    }
+    hex::decode(s).map_err(|_| AyzenpackError::Format("invalid hex"))
+}
+
+/// Stream both digests from a reader (restored-file identity checks).
+pub fn hash_reader<R: Read>(mut reader: R) -> std::io::Result<([u8; 32], [u8; 32])> {
+    let mut b3 = blake3::Hasher::new();
+    let mut sha = Sha256::new();
+    let mut buf = [0u8; HASH_CHUNK];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        b3.update(&buf[..n]);
+        sha.update(&buf[..n]);
+    }
+    Ok((*b3.finalize().as_bytes(), sha.finalize().into()))
 }
 
 pub fn parse_blake3_hex(s: &str) -> Result<[u8; 32]> {
@@ -132,6 +158,13 @@ mod tests {
             parse_blake3_hex(&EMPTY_BLAKE3.to_ascii_uppercase()).unwrap(),
             parse_hex32(EMPTY_BLAKE3)
         );
+    }
+
+    #[test]
+    fn parse_hex_accepts_mixed_case_and_rejects_odd() {
+        assert_eq!(parse_hex("504B0304").unwrap(), b"PK\x03\x04");
+        assert_eq!(parse_hex("504b0304").unwrap(), b"PK\x03\x04");
+        assert!(parse_hex("abc").is_err());
     }
 
     #[test]

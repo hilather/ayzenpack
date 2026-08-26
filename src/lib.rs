@@ -3,6 +3,7 @@
 pub mod cas;
 pub mod dehydrate;
 pub mod error;
+mod exact;
 pub mod format;
 pub mod hashutil;
 pub mod manifest;
@@ -148,6 +149,30 @@ pub fn verify(input: &Path) -> Result<()> {
                 }
             }
         }
+        for (hex, sz, label) in [
+            (jar.tail_blob.as_deref(), jar.tail_size, "tail"),
+            (jar.raw_zip_blob.as_deref(), jar.raw_zip_size, "raw_zip"),
+        ] {
+            if let Some(hex) = hex {
+                let hash = parse_blake3_hex(hex)?;
+                let data = payloads.get(&hash).ok_or_else(|| {
+                    AyzenpackError::HashMismatch(format!(
+                        "missing {label} blob {} for {}",
+                        hex_prefix(&hash),
+                        jar.name
+                    ))
+                })?;
+                if let Some(sz) = sz {
+                    if data.len() as u64 != sz {
+                        return Err(AyzenpackError::HashMismatch(format!(
+                            "{label} blob {} {} size",
+                            hex_prefix(&hash),
+                            jar.name
+                        )));
+                    }
+                }
+            }
+        }
         for e in &jar.entries {
             if e.is_dir {
                 continue;
@@ -172,6 +197,24 @@ pub fn verify(input: &Path) -> Result<()> {
                     jar.name,
                     e.name
                 )));
+            }
+            for hex in [
+                e.cdata_blob.as_deref(),
+                e.local_header_blob.as_deref(),
+                e.pad_blob.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let h = parse_blake3_hex(hex)?;
+                if !payloads.contains_key(&h) {
+                    return Err(AyzenpackError::HashMismatch(format!(
+                        "missing blob {} for {}!{}",
+                        hex_prefix(&h),
+                        jar.name,
+                        e.name
+                    )));
+                }
             }
         }
     }

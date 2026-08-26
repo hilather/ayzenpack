@@ -155,34 +155,23 @@ See [docs/library.md](docs/library.md#load-a-yaml-job-file) for the loader.
 
 ## Reconstruction guarantee
 
-Rehydrate restores **functional identity**, not ZIP bit-identity.
+New packs restore **bit-identical** files: blake3, sha256, and size match `jars[].source_*`, and `cmp` is equal. Spring Boot fully-executable JARs stay `[official launch.script][zip]`. File-level signatures survive because the bytes do.
 
-**Guaranteed**
+Uncompressed entry blobs are still stored (listing, CRC, cross-jar dedup). Exact restore copies original local headers, compressed payloads (`cdata_blob`), data descriptors, alignment padding, and the ZIP tail (central directory through EOCD). If a zip cannot be sliced, the zip portion after the prefix is stored as `raw_zip_blob` and copied.
 
-- Uncompressed bytes of every file entry match the source
-- Entry names and central-directory order match (Unicode names from the ZIP)
-- CRC-32 of uncompressed bytes matches the source header CRC
-- Valid DOS last-modified times are preserved. Invalid pairs, including the common JAR `0,0`, fall back to 1980-01-01 rather than aborting
+**Old archives** (0.1.4 / 0.1.5, no `cdata` / `tail` / `raw_zip` fields) still rehydrate via `ZipWriter`: uncompressed bytes, names, CD order, and CRC match; the deflate bitstream and extras do not. `--verbatim` is **not** a CLI flag.
 
-**Not guaranteed** (rebuilt JAR bytes need not equal source JAR bytes)
+Spring Boot launchers (including after `zip -A` and Zip64) keep the existing prefix detection. Nested `BOOT-INF/lib/*.jar` entries are not exploded.
 
-- Deflate bitstream
-- Extra fields (dropped in v1; Android zipalign / alignment is not preserved)
-- Data descriptors, GPBF bit 11, raw name encoding
-
-`--verbatim` is **not** in v1. There is no flag to request bit-identical ZIP reconstruction.
-
-Spring Boot fully-executable JARs (a bash launcher prepended to a ZIP, including after `zip -A`) are supported: the launcher is stored as a deduplicated blob and written back on rehydrate. The ZIP body still follows functional identity, not bit-identity. Nested `BOOT-INF/lib/*.jar` entries are not exploded.
-
-Rebuilt JARs use deflate for file entries and store for directories, unless `--store-all`.
+The content-mode `ZipWriter` path still uses deflate for file entries and store for directories, unless `--store-all`.
 
 ---
 
 ## Signed JARs
 
-Rebuild **will not verify signatures**. `META-INF/*.SF` plus `*.RSA` / `*.DSA` / `*.EC` digest compressed or stored bytes; rewriting DEFLATE invalidates those signatures. ayzenpack does not re-sign.
+Exact restore keeps `META-INF/*.SF` / `*.RSA` / `*.DSA` / `*.EC` bytes, so those signatures still verify. ayzenpack does not re-sign.
 
-`dehydrate` warns (listing jar names) and still packs. Pass `--fail-on-signed` to abort instead. `--strict` does not promote the signed notice by itself.
+`dehydrate` notes signed JARs and still packs. Pass `--fail-on-signed` to abort instead. `--strict` does not promote the signed notice by itself. Content-mode rebuild of an old archive can still break a signature.
 
 ---
 

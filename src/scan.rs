@@ -261,12 +261,12 @@ pub fn zip_prefix_len(path: &Path) -> Result<u64> {
 
 /// How a prepended launcher maps onto ZIP offsets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ZipLayout {
+pub(crate) struct ZipLayout {
     /// Prefix bytes are `[0, prefix_len)`. Zero for a normal ZIP.
-    prefix_len: u64,
+    pub(crate) prefix_len: u64,
     /// `ZipView` shift. Equal to `prefix_len` when offsets are ZIP-relative
     /// (Spring default); `0` when `zip -A` made offsets file-absolute.
-    view_shift: u64,
+    pub(crate) view_shift: u64,
 }
 
 fn looks_signed(name: &str) -> bool {
@@ -304,7 +304,7 @@ fn method_label_and_code(method: CompressionMethod) -> (String, u16) {
 ///
 /// A file with no `PK\x03\x04` is `NotZip`, except an empty prefixed archive
 /// (EOCD-only) which still uses extra-data math.
-fn detect_zip_layout(path: &Path, file: &mut (impl Read + Seek)) -> Result<ZipLayout> {
+pub(crate) fn detect_zip_layout(path: &Path, file: &mut (impl Read + Seek)) -> Result<ZipLayout> {
     let file_len = file
         .seek(SeekFrom::End(0))
         .map_err(|source| io_at(source, path))?;
@@ -441,7 +441,7 @@ fn not_zip(path: &Path) -> AyzenpackError {
 
 /// `(eocd_or_zip64_eocd_file_offset, cd_size, recorded_cd_offset, entry_count)`.
 /// The first offset is the structure that immediately follows the central directory.
-fn find_cd_bounds(
+pub(crate) fn find_cd_bounds(
     path: &Path,
     file: &mut (impl Read + Seek),
     file_len: u64,
@@ -459,7 +459,7 @@ fn find_cd_bounds(
     find_zip64_cd_bounds(path, file, eocd_off)
 }
 
-fn find_eocd(
+pub(crate) fn find_eocd(
     path: &Path,
     file: &mut (impl Read + Seek),
     file_len: u64,
@@ -584,7 +584,7 @@ fn hash_source(file: &mut File) -> io::Result<([u8; 32], [u8; 32])> {
     Ok((*b3.finalize().as_bytes(), sha.finalize().into()))
 }
 
-fn io_at(source: io::Error, path: &Path) -> AyzenpackError {
+pub(crate) fn io_at(source: io::Error, path: &Path) -> AyzenpackError {
     AyzenpackError::Io {
         source,
         path: Some(path.to_path_buf()),
