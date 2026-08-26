@@ -1,9 +1,13 @@
-use std::path::PathBuf;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::anyhow;
 use clap::{Parser, Subcommand};
 
-use ayzenpack::{dehydrate, rehydrate, DehydrateOptions, DehydrateSummary, RehydrateOptions};
+use ayzenpack::{
+    dehydrate, list, rehydrate, verify, AyzenpackError, DehydrateOptions, DehydrateSummary,
+    Manifest, RehydrateOptions, Trailer,
+};
 
 #[derive(Parser)]
 #[command(
@@ -91,7 +95,81 @@ enum Cmd {
     },
 }
 
-pub fn run() -> Result<()> {
+/// Binary-boundary error: `verify` integrity failures are exit 3; everything else is 1.
+pub struct CliError {
+    pub code: i32,
+    err: anyhow::Error,
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.err)
+    }
+}
+
+impl From<AyzenpackError> for CliError {
+    fn from(err: AyzenpackError) -> Self {
+        Self {
+            code: 1,
+            err: err.into(),
+        }
+    }
+}
+
+fn verify_err(err: AyzenpackError) -> CliError {
+    CliError {
+        code: verify_exit_code(&err),
+        err: err.into(),
+    }
+}
+
+fn verify_exit_code(err: &AyzenpackError) -> i32 {
+    if is_integrity_error(err) {
+        3
+    } else {
+        1
+    }
+}
+
+/// `HashMismatch` and integrity `Format` → 3. I/O, `NotAyzenpack`, truncated trailer, JSON → 1.
+fn is_integrity_error(err: &AyzenpackError) -> bool {
+    match err {
+        AyzenpackError::HashMismatch(_) => true,
+        AyzenpackError::Format(msg) => format_is_integrity(msg),
+        AyzenpackError::FormatOwned(msg) => format_is_integrity(msg),
+        _ => false,
+    }
+}
+
+fn format_is_integrity(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("truncated")
+        || m.contains("trailer")
+        || m.contains("missing end")
+        || m.contains("missing manifest")
+        || m.contains("unknown record")
+        || m.contains("reserved record")
+        || m.contains("blob after")
+        || m.contains("multiple manifest")
+        || m.contains("records after end")
+        || m.contains("header format")
+        || m.contains("invalid format version")
+        || m.contains("record payload too large")
+        || m.contains("manifest format")
+        || m.contains("hex")
+    {
+        return false;
+    }
+    m.contains("hash")
+        || m.contains("crc")
+        || m.contains("digest")
+        || m.contains("mismatch")
+        || m.contains("sha256")
+        || m.contains("blake3")
+        || m.contains("missing blob")
+}
+
+pub fn run() -> std::result::Result<(), CliError> {
     let Cli {
         quiet,
         verbose,
@@ -164,9 +242,59 @@ pub fn run() -> Result<()> {
             rehydrate(&opts)?;
             Ok(())
         }
-        Cmd::List { .. } => bail!("list is not implemented yet"),
-        Cmd::Verify { .. } => bail!("verify is not implemented yet"),
+        Cmd::List { input, json } => {
+            let manifest = list(&input)?;
+            if json {
+                print_list_json(&manifest)?;
+            } else {
+                let trailer = read_trailer_file(&input)?;
+                print_human_list(&manifest, &trailer);
+            }
+            Ok(())
+        }
+        Cmd::Verify { input } => verify(&input).map_err(verify_err),
     }
+}
+
+fn print_list_json(manifest: &Manifest) -> std::result::Result<(), CliError> {
+    let s = serde_json::to_string_pretty(manifest).map_err(|e| CliError {
+        code: 1,
+        err: anyhow!(e),
+    })?;
+    println!("{s}");
+    Ok(())
+}
+
+fn read_trailer_file(path: &Path) -> std::result::Result<Trailer, CliError> {
+    let mut file = File::open(path).map_err(|source| AyzenpackError::Io {
+        source,
+        path: Some(path.to_path_buf()),
+    })?;
+    ayzenpack::format::read_trailer(&mut file).map_err(CliError::from)
+}
+
+/// Human table (name, entries, signed, source_size) plus footer from trailer + manifest.
+fn print_human_list(manifest: &Manifest, trailer: &Trailer) {
+    println!(
+        "{:<32} {:>7} {:>6} {:>12}",
+        "NAME", "ENTRIES", "SIGNED", "SIZE"
+    );
+    for jar in &manifest.jars {
+        println!(
+            "{:<32} {:>7} {:>6} {:>12}",
+            jar.name,
+            jar.entries.len(),
+            jar.signed,
+            jar.source_size
+        );
+    }
+    println!();
+    println!(
+        "{} jars, {} unique blobs, {} unique",
+        trailer.jar_count,
+        trailer.blob_count,
+        fmt_bytes(manifest.stats.bytes_unique_blobs)
+    );
 }
 
 fn print_dehydrate_stats(opts: &DehydrateOptions, summary: &DehydrateSummary) {
