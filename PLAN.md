@@ -1,12 +1,12 @@
-# PLAN: no raw_zip dual-copy on listed jars (crate 0.2.2)
+# PLAN: do not latch ZipArchive onto nested STORE jars (crate 0.2.3)
 
-Base: `main` at crate **0.2.1** / format **v2** (`0751510`). Branch `cursor/fix-raw-zip-dual-copy-5024`. Do not merge. Do not tag. Do not bump the on-disk format.
+Base: `main` / tag `v0.2.2` at crate **0.2.2** / format **v2** (`87ebeff`). Branch `cursor/fix-rehydrate-fat-jar-8517`. Do not merge. Do not tag. Do not bump the on-disk format.
 
-This file is the **0.2.2 bugfix plan**. Crate 0.2.1 single-CAS / no-`cdata_blob` is **shipped and locked**. Do not reopen MixedExact, ExactWithExotic, `store_cdata`, Java-zlib, grouping vs per-blob frames, or format v3.
+This file is the **0.2.3 bugfix plan**. Crate 0.2.2 no-`raw_zip`-on-listed-jars and crate 0.2.1 single-CAS / no-`cdata_blob` are **shipped and locked**. Do not reopen MixedExact, ExactWithExotic, `store_cdata`, Java-zlib, grouping vs per-blob frames, format v3, or `raw_zip` of a listed jar.
 
-Origin `matt-brewer/agent-skills` is not reachable (`gh` 404; no `~/git/agent-skills`). Skeptic loops use fresh adversarial Task subagents. Never skip sweep 1. Fresh skeptic each sweep. Cap 3, then BLOCKED.
+Origin `matt-brewer/agent-skills` is not reachable (`origin repo clone` cannot auth). Skeptic loops use fresh adversarial Task subagents. Never skip sweep 1. Fresh skeptic each sweep. Cap 3, then BLOCKED.
 
-Constraints: MSRV 1.80, `forbid(unsafe_code)`, no edition-2024 deps, no zstd-framed crate. Manifest JSON field names stay. Format stays **v2**. No new `cdata_blob` puts. No Java/zlib deflater.
+Constraints: MSRV 1.80, `forbid(unsafe_code)`, no edition-2024 deps, no zstd-framed crate. Manifest JSON field names stay. Format stays **v2**. No new `cdata_blob` puts. No Java/zlib deflater. No `raw_zip` of a listed jar.
 
 ---
 
@@ -16,120 +16,131 @@ Storage efficiency is of the utmost importance. Do **not** chase Java-zlib bit-i
 
 1. One CAS blob per unique **uncompressed** entry (BLAKE3 of those bytes).
 2. Manifest is a ZIP-slot index (ratarmount-style pointers), not a second copy of file bytes.
-3. **Never** store a second encoding of the same entry. No default `cdata_blob`. **`raw_zip` is not a fallback for a slice/count mismatch.** `ZipArchive` count ≠ homemade CD count is a **second bug**, not a `raw_zip` case.
+3. **Never** store a second encoding of the same entry. No default `cdata_blob`. `ZipArchive` count ≠ homemade CD count is a **second bug**, not a `raw_zip` case. Crate 0.2.2 never writes `raw_zip` of a listed jar. Skip-exact (index + CAS / `write_jar`) when counts disagree.
 4. Zstd in 4 MiB record-aligned BLOB groups (already v2). Do not switch to per-blob frames.
 5. Restore rebuilds a valid ZIP from index + blobs. `source_*` may change.
-6. Read old packs (v1, leftover `cdata_blob`, leftover `raw_zip`) but **never write** the 0.2.1 whole-zip-plus-CAS shape.
+6. Read old packs (v1, leftover `cdata_blob`, leftover `raw_zip`) but **never write** dual-copy.
 
 ---
 
-## Why 2.8 GB still happens on 0.2.1 (verified)
+## Repro (required; measured on 87ebeff, this VM)
 
-`src/dehydrate.rs` `attach_exact` (0.2.1):
+Matt's flags, not a generic `-d` restore:
 
 ```
-ZipExact::Sliced(slice) if slice.locals.len() == jar.entries.len() => { tail + index; OK }
-ZipExact::Raw(zip) => remember_blob(entire zip) + raw_zip_blob
-ZipExact::Sliced(_) => read_zip_after_prefix + remember_blob(entire zip) + raw_zip_blob
+ayzenpack dehydrate --recursive --sort-inputs --restore-paths -o pack.ayz <dir-of-jars>
+ayzenpack rehydrate --restore-paths -i pack.ayz
 ```
 
-Scan already stored **uncompressed** entry CAS blobs via `zip::ZipArchive::by_index`. Slice walks a **second** CD parser (`exact.rs` `parse_central_directory`). Same file, same `detect_zip_layout`.
+`--recursive` is only the input walk. `--sort-inputs` zeros `created_unix` and sorts/dedupes. `--overwrite` is **not** used and is not required: `--restore-paths` skips the overwrite guard, `prepare_restore_dest` unlinks an existing file, then `write_jar` / splice `File::create`.
 
-zip 2.4.2 then collapses CD rows by name (`IndexMap` last-wins). `archive.len()` can be **less** than the number of `PK\x01\x02` records. In-tree proof: `tests/roundtrip.rs` `duplicate_entry_names_in_one_jar_all_restored` (`dup.txt` twice). Homemade `slice_zip` still emits two locals. 0.2.1 takes the third arm and stores the **whole JAR** again.
+| Input | Source size | Restored size | Zip listing | tail / raw_zip | Notes |
+|---|---|---|---|---|---|
+| Maven `spring-cloud-dataflow-server-2.11.5.jar` (sha1 `85236bf366869ea300bbc3bf198b7895090755ac`, starts `PK`, **no** prefix) | 133561923 | 133561757 | 418 → 418 | tail yes, raw no | Names + uncompressed bytes match. Whole-file hash changes. **Not the collapse.** |
+| Same + official `launch.script` prepended, **no** `zip -A` | 133571151 | 133570985 | 418 → 418 | tail yes, raw no | Prefix 9228. **Not the collapse.** |
+| Same + official `launch.script` + Info-ZIP **`zip -A`** | 133571151 | **1737752** | **scan 919** (outer is 418) | **tail no**, raw no | **≥10× collapse (77×).** Unique uncompressed ~3.9 MiB. Listing is `reactor-core-3.4.41.jar` (first STORE `BOOT-INF/lib`). |
+| lucene-core 9.11.1 / groovy 4.0.24 (classic, no prefix) | 4.2 / 7.6 MiB | 4.2 / 7.6 MiB | counts match | tail yes | Small deflate-rebuild delta. **Do not treat as the bug.** |
 
-Any `slice_zip` `Err` (except Encrypted) becomes `ZipExact::Raw` and does the same.
+Matt's 134 MB → 5.5 MB is this class: in-place overwrite of a short rebuild after scan latched onto a **STORE nested** member. 5.5 vs 1.7 depends on which inner jar rust zip binds. Do not require bit-identical 5.5.
 
-Uncompressed CAS + full already-deflated jars ≈ 2.8 GB. zstd cannot shrink those streams.
-
-0.2.1 `PLAN.md` / `DESIGN.md` / `AGENTS.md` / `README.md` **bless** `ZipArchive` count ≠ CD count as a `raw_zip` case. That is papering over the IndexMap / dual-parser bug.
+In-tree `write_fat_spring_zip64_zipa_jar` **DEFLATEs** nested libs so `ZipView(prefix)` cannot latch onto an inner CD (comment in `tests/fixtures.rs`). That fixture stays green while real Spring STORE nested + `zip -A` collapses. Do not keep DEFLATE-nested as the only fat gate.
 
 ---
 
-## Goal (crate 0.2.2)
+## Why (verified)
 
-Stay on **format v2**. Crate **0.2.2**.
+`src/scan.rs` `layout_from_first_pk`:
 
-### 1. One listing for entries + locals
+1. `find_cd_first_local` finds the outer CD's first local (prefix length). **Same `first` for unadjusted and `zip -A`.**
+2. `zip_archive_opens(view_shift = first)` — if `ZipArchive::new` returns `Ok`, that layout wins.
+3. Else `zip_archive_opens(view_shift = 0)` (`zip -A` file-absolute).
 
-On a jar we successfully scanned, the entry list **is** `jar.entries` (ZipArchive `by_index` order, including last-wins collapse).
+`zip_archive_opens` treats **any** `ZipArchive::new` success as the outer zip. It does not compare `archive.len()` to the homemade outer CD count (`find_cd_bounds`).
+
+zip 2.4.2 `find_central_directory`: if the recorded CD offset is not valid in the view (zip -A file-absolute offset vs a prefix-shifted view), it **keeps scanning earlier `PK\x05\x06`**. A STORE `BOOT-INF/lib/*.jar` is a complete zip. The next EOCD is that inner jar. `ZipArchive::new` succeeds with the **inner** listing.
+
+Probe on the zip -A dataflow file:
+
+| view_shift | `ZipArchive::len()` | first name | `header_start` | `BOOT-INF/lib` |
+|---|---|---|---|---|
+| 0 | 418 | `META-INF/` | 9228 (== prefix) | 318 |
+| 9228 | **919** | `META-INF/` | 123115 | **0** |
+
+Unadjusted prefix is the opposite (shift=prefix is correct, shift=0 latches). Today's try-order therefore **accepts the latch** on zip -A + STORE nested.
+
+Consequences on 0.2.2 (working as specified, still wrong output):
+
+- Scan stores 919 reactor-core entries, not 418 outer slots. Nested libs are not CAS blobs.
+- `slice_from_archive`: homemade outer CD 418 ≠ 919 → skip-exact. No `tail_blob`, no `raw_zip` (0.2.2 policy).
+- Restore is `write_jar` (`ZipWriter`) of the **inner** listing. Prefix is only the 9 KiB script. File size ≈ one nested jar.
+- `--restore-paths` unlinks the 134 MB original and `File::create`s the short archive. That is why in-place looks like “truncate then a stub zip.” `File::create` is not the root cause; the listing is.
+
+`write_jar` / Zip64 `large_file` / dropping outer members is **not** the bug on this repro. Do not “fix” ZipWriter unless a second repro shows it after scan lists the outer zip.
+
+---
+
+## Goal (crate 0.2.3)
+
+Stay on **format v2**. Crate **0.2.3**.
+
+### 1. `zip_archive_opens` must accept only the outer listing
 
 **Do this:**
 
-- Build exact locals from that **same ZipArchive listing**: same `detect_zip_layout` + `ZipView`, `by_index` in order.
-- `ZipFile::header_start` (zip 2.4.2; also `data_start` / `central_header_start`) is the **offset source only**. Local **extent** is still today’s `read_local` rule: header + cdata + data-descriptor + pad through the **next** `header_start` or the CD start. Do not drop descriptor/pad; CleanExact splice would fail `verify_source_identity`.
-- Convert coordinates the same way as `cd_offset_to_zip_rel`: when `view_shift == 0` and `prefix_len > 0` (`zip -A`), crate `header_start` is file-absolute; manifest `local_header_offset` stays zip-relative. Mix includes `spring-zipa-slf4j.jar`.
-- Then `locals.len() == jar.entries.len()` by construction whenever both opens succeed. `attach_exact` zips by index. **Do not** call `ZipArchive::len() == locals.len()` a regression gate (tautology).
-- `ZipFile::central_header_start` is the CD row, not the local. Do not store it as `local_header_offset`.
-- **Do not call `capture_zip_exact` / `slice_zip` from `attach_exact`.** Those helpers’ `Err(_) => Raw` path is how whole-zip CAS comes back. Collect `header_start` from the ZipArchive walk, convert zip-A coordinates, then use today’s `read_local` with `next = next header_start or CD start`. Tail from `find_cd_bounds` only.
+- After `ZipArchive::new` succeeds, accept the view only if `archive.len()` equals the **homemade outer** CD count from `find_cd_bounds` on the **raw file** (already Zip64-aware; EOCD comment-to-EOF so it cannot return a nested 919). This is **not** the `slice_from_archive` gate (that compares parse length to `archive.len()` after layout is chosen).
+- Parse `None` / count mismatch → that view **fails** (try the other shift). Do not `raw_zip`. Do not skip-exact a healthy Spring zip -A jar just because the first try latched.
+- Also reject when the first listed local is not at the prefix: `header_start + view_shift == prefix_len` (pass `prefix_len` into `zip_archive_opens`; `view_shift` alone cannot evaluate the `view_shift == 0` try). Do **both** count and `header_start` so a coincidental inner `len() == outer count` cannot pass.
+- Apply this reject **only** inside `zip_archive_opens` (prefixed layout). Unprefixed scan returns on `PK` magic and never calls it (`dup.txt` last-wins stays skip-exact).
+- Empty prefixed zip stays on today's empty / EOCD-extra path (`find_cd_first_local` is `None` when `entries == 0`). Do not require a dummy `by_index(0)`.
+- Both views failing stays `None` → empty-EOCD / `NotZip`. No `raw_zip` fallback.
 
-`parse_central_directory` is the store-tail **count gate** (and Zip64 offset resolve). Rebuild **patching** is `patch_central_directory` / `patch_eocd_cd_start` — do not conflate them. Parse must **not** trigger `raw_zip`. Treat `parse_central_directory` returning `None` the same as a count mismatch (next section).
+`find_cd_first_local` already knows file-absolute vs zip-relative (`local_name_eq(min_off)` vs `find_local_named`). Optionally try the matching shift first. **Not sufficient alone:** `zip_archive_opens` must still reject a latch, because today's order tries unadjusted first and that `Ok` is the bug.
 
-### 2. Tail is stored only when homemade CD count == entries
+Do **not** call `capture_zip_exact` / store `raw_zip` when the first try latches.
 
-After building ZipArchive locals, read the tail (CD through EOF) via `find_cd_bounds` as today.
+### 2. Restore stays index + CAS
 
-**Store `tail_blob` and fill the index if and only if** `parse_central_directory(tail)` is `Some(records)` **and** `records.len() == jar.entries.len()`.
+After (1), zip -A + STORE nested Spring must:
 
-Otherwise (homemade CD count ≠ ZipArchive listing, or parse `None`):
+- Scan `entries.len() ==` outer `ZipArchive::len()` (418 on dataflow).
+- `tail_blob.is_some() && raw_zip_blob.is_none()` (homemade CD count agrees; attach_exact stores tail).
+- Every entry `cdata_blob` absent.
+- `--restore-paths` in-place (no `--overwrite`, no `-d`): restored **file size** in the same league as the source (not 134→5.5 / 133.6→1.7). `ZipArchive` names, CD order, and uncompressed file bytes match the source. Whole-file hash **may** change (rebuild / deflate).
 
-- That leftover disagreement is the **second bug** (IndexMap last-wins is the proven case).
-- **Do not** `raw_zip`.
-- **Do not** store that tail (`write_rebuilt_jar` patches the first `N` CD records, leaves extras, does not rewrite EOCD entry count → desync).
-- Skip exact attach (`tail_blob` / `raw_zip_blob` unset). Restore = existing no-tail `write_jar` (ZipWriter). `duplicate_entry_names_in_one_jar_all_restored` already accepts last-wins.
+Do not add a Java deflater, `cdata_blob`, or `raw_zip` to keep `source_*`.
 
-**Mix / Spring / Maven / Zip64 fat / `zip -A` are not allowed to take this skip-exact path.** Those jars must still get a tail whose homemade CD count equals `jar.entries.len()`, and `spring-zip64-nested.jar` must still splice (`bit_identical_restore()` via tail + STORE/`cdata_codec`, **not** via `raw_zip`). If 0.2.1 hid a walker disagreement behind `raw_zip` on that fat, **fix `find_cd_bounds` / Zip64 / prefix** in this PR so the counts agree. Walker fix is mandatory for those fixtures, not optional. Keep `tests/corpus.rs` `spring-zip64-nested` `bit_identical_restore` + whole-file hash asserts. Add `raw_zip_blob.is_none()` on every mix member. Do **not** loosen mix asserts to “skip-exact / write_jar is fine” for those members — that is how `raw_zip` sneaks back.
+Do not change `write_jar` / `File::create` / `prepare_restore_dest` unless a post-fix repro still truncates. In-place unlink+create of the **correct** listing is enough.
 
-Skip-exact is reserved for last-wins / extra CD rows (`dup.txt`) and for listed jars whose locals cannot be read as a consistent slice (overlapping distinct-name locals — Test 2). It is **not** for healthy Spring / Zip64 / `zip -A` jars.
-
-### 3. Never write `raw_zip` when `jar.entries` is populated
-
-`attach_exact`:
-
-- **Tail stored (counts agree):** `fill_exact_entry` + `remember_blob` the **tail only**. No whole-zip blob.
-- **Skip-exact (counts disagree or parse `None`):** no tail, no `raw_zip`. Content blobs already in CAS.
-- **Cannot read locals after scan** (including overlapping `header_start`s / `next <= current`, first local not zip-rel 0, `read_local` failure): skip exact the same way. No `raw_zip`. Do not map this to `ZipExact::Raw`. Detect overlap on the ZipArchive `header_start` list — do not rely on leftover `slice_zip` for that.
-- **`ZipExact::Raw` / `remember_blob(entire zip)`:** delete these arms for listed jars.
-- Encrypted: still error. No `raw_zip`.
-
-True multi-disk spanning (`disk_number != disk_with_central_directory`) fails `ZipArchive::new` (`UnsupportedArchive`) **before** `entries[]` exists. Keep that as a dehydrate error. Do not add an unlistable success path that packs garbage as `raw_zip`. Empty zip (`len()==0`) is **listable**: tail-only, no `raw_zip` (today’s `empty_zip_is_tail_only`).
-
-`attach_exact` must not call `capture_zip_exact`. If `capture_zip_exact` remains for unit tests, dehydrate must not consume `ZipExact::Raw`. Do not “ignore Raw after calling it” as the design — that still reads the whole zip into RAM.
-
-New packs of normal / Spring / Maven / Zip64 members: `raw_zip_blob == None`. Readers still accept legacy `raw_zip`. Schema fields stay.
-
-### 4. Docs / contract (same PR)
+### 3. Docs / contract (same PR)
 
 | File | Change |
-|------|--------|
-| `Cargo.toml` / lock | Crate **0.2.2** |
-| `AGENTS.md` | Policy 3: drop “ZipArchive count ≠ CD count” as a `raw_zip` exception. Say that mismatch is a parser bug. `raw_zip` only if `ZipArchive` never populated `entries[]` (`UnsupportedArchive` spanning / `NotZip`). Homemade parse `None` / `read_local` failure / `slice_zip` `Err` on a **listed** jar = skip-exact, never whole-zip CAS. Crate 0.2.2 never writes `raw_zip` of a listed jar. **Keep** the exact `tests/docs.rs` strings that still apply, including `No default \`cdata_blob\` next to the content blob`, `**never writes** \`cdata_blob\` on STORE/DEFLATE (file or dir, any method)`, `Do not add new \`cdata_blob\` puts`, `569539 * 115 / 100`, `\`cdata_blob == 0\` on every mix entry`, `MSRV is **1.80**`, `forbid(unsafe_code)`. |
-| `DESIGN.md` | **Delete** “unlistable = spanning / parse failure / ZipArchive count ≠ CD count”. Count mismatch **and** homemade parse failure on a listed jar are parser/skip-exact bugs, not `raw_zip`. `raw_zip` only when listing never produced `entries[]`. Keep north-star sentence `North star: **one CAS blob + ZIP index + zstd blocks**`. |
-| `README.md` | **Delete** the sentence “If a zip cannot be sliced (spanning / parse failure / count mismatch) … `raw_zip_blob`”. Do not leave “parse failure” in any `raw_zip` exception list. Listed jars: index + CAS, or skip-exact `write_jar`. **Keep** `Crate **0.2.1** never writes \`cdata_blob\` (file or dir, any method)` (docs.rs locks it). Keep `--verbatim`, dehydrate examples, Rocky, license. |
-| `tests/docs.rs` | **Replace the 3-way PLAN AND**, not just the title. Today it requires `# PLAN: single-CAS + ZIP index (crate 0.2.1)` **and** `Writers never emit \`cdata_blob\`` **and** `Delete \`store_cdata\``. This 0.2.2 file does not contain the last two. New conjuncts must be copied **byte-for-byte** from this file: `# PLAN: no raw_zip dual-copy on listed jars (crate 0.2.2)` **and** `Never write \`raw_zip\` when \`jar.entries\` is populated` **and** `` `ZipArchive` count ≠ homemade CD count is a **second bug** `` (backticks around `ZipArchive` — a bare `ZipArchive count ≠` string is **not** in this file). |
-| `src/exact.rs` module docs | Stop saying CD/entry-count mismatch yields `Raw`. |
+|---|---|
+| `Cargo.toml` / lock | Crate **0.2.3** |
+| `AGENTS.md` | Current-tree line: crate **0.2.3** / format **v2**. Keep every `tests/docs.rs` locked phrase (no default `cdata_blob`, never writes `cdata_blob` on STORE/DEFLATE, mix `569539 * 115 / 100`, `cdata_blob == 0` on every mix entry, MSRV **1.80**, `forbid(unsafe_code)`). |
+| `DESIGN.md` | Executable JAR section: `ZipArchive::new` success is **not** enough. Unadjusted / zip -A open must match homemade outer CD count **and** first `header_start` (0 vs prefix). rust zip may latch onto a STORE nested EOCD when the view's CD offset is wrong. Nested `BOOT-INF/lib/*.jar` stay opaque. Keep `North star: **one CAS blob + ZIP index + zstd blocks**`. |
+| `README.md` | Do not tell agents to store `cdata_blob` or chase bit-identical hashes. Keep `Crate **0.2.1** never writes \`cdata_blob\` (file or dir, any method)` (docs.rs). Mention crate 0.2.3 only if a version sentence already exists to update. |
+| `tests/docs.rs` | **Replace the 3-way PLAN AND.** New conjuncts, copied **byte-for-byte** from this file: `# PLAN: do not latch ZipArchive onto nested STORE jars (crate 0.2.3)` **and** `zip_archive_opens` must accept only the outer listing **and** `` rust zip may latch onto a STORE nested EOCD ``. |
+| `tests/fixtures.rs` | Keep DEFLATE-nested Zip64 fixture. **Add** STORE-nested + launch.script + `zip -A` (classic u32 CD, like dataflow). Comment must say DEFLATE-nested hides the latch. |
 
 ---
 
 ## Tests (must fail, not log)
 
-1. **Former 0.2.1 mismatch arm = `dup.txt`.** Fixture already has two CD records named `dup.txt`; ZipArchive last-wins so `scan`/`entries.len()` is 1 and homemade `parse_central_directory` / 0.2.1 `slice_zip` locals is 2. Prove that inequality in-test (call the homemade parse / 0.2.1-style slice count). After the fix: `raw_zip_blob.is_none()`, every `cdata_blob` absent, `bytes_unique_blobs` / `output_len` must **not** include a second copy of the zip portion (compare to `source_size` — unique blobs stay on the order of one payload + small index, not `source_size` + payload). Restore still matches scanner-visible entries (existing last-wins assert).
+1. **STORE-nested complete inner zip + official launch.script + `zip -A` (always-on).** New **classic-u32** helper (do not change `write_fat_spring_zip64_zipa_jar` to STORE; fix its docstring — it claims STORE but DEFLATEs). Outer method **0** members must be a **complete inner zip** (own `PK\x05\x06`), not a random blob named `*.jar`. **0.2.2 latch proof (must be true on the fixture before the detector change):** `ZipArchive::new(ZipView(file, prefix_len))` is `Ok` and `len() ≠` homemade outer CD count (names omit outer `App.class` / `BOOT-INF/lib`). After the fix: `prefix_len ==` script length, **`view_shift == 0`**, `ZipArchive::len() ==` homemade outer count, names include every `BOOT-INF/lib/` member. `raw_zip_blob.is_none()`, `tail_blob.is_some()`, every `cdata_blob` absent.
 
-2. **Always-on `ZipExact::Raw` kill.** Tests 1/`dup.txt` only hit today’s **third** arm (`Sliced` count mismatch). `Raw` is `slice_zip` `Err` (overlap, first local ≠ 0, parse `None`, descriptor fail, EOCD vs parse count). An implementer can delete only the third arm, keep `ZipExact::Raw` + `remember_blob(entire zip)`, and Test 1 stays green. **Required always-on fixture:** a jar ZipArchive **lists** (`entries[]` populated) that **today** `capture_zip_exact` returns `ZipExact::Raw` — overlapping local offsets with **distinct names** (not `dup.txt`). After the fix: `raw_zip_blob.is_none()`, `tail_blob.is_none()` (do not store a broken tail), no whole-zip blob, restore via `write_jar`. Overlapping-local is mandatory, not optional. Do **not** use spanning (`ZipArchive::new` fails before listing).
+2. **Matt's flags, in-place.** Directory of jars (Test 1 fixture with **≥2** STORE `BOOT-INF/lib/` complete inner zips + one classic ZipWriter jar). `dehydrate --recursive --sort-inputs --restore-paths`. `rehydrate --restore-paths` onto copies of the original paths (no `--overwrite`, no `-d`). Restored fat: `ZipArchive::len()` equal, names + order + uncompressed file bytes equal; file size not &lt; 50% of source (a 1-lib latch can stay inside 15%). Classic: counts/bytes equal; small size delta OK. `raw_zip` still absent.
 
-3. **In-tree Zip64 / `zip -A` / Spring / descriptor / zipalign (always-on, no corpus).** `bit_identical_restore()` is **true for `raw_zip`** — that flag is not a dual-copy gate. These fixtures (`write_wrapped_zip64_jar`, `write_wrapped_jar_adjusted`, official launch.script, data-descriptor, zipalign pad) **must** assert `tail_blob.is_some() && raw_zip_blob.is_none()`. Tighten existing `tail_blob || raw_zip` and `pad_zeros || raw_zip` accepts in `tests/roundtrip.rs`. Corpus skip without `AYZENPACK_CORPUS_DIR` is OK for the 569539 Maven-mix size gate only.
+3. **Unadjusted prefix + same complete STORE inner zip** (no zip -A): `view_shift == prefix_len`, outer listing, tail, no `raw_zip`. An inverted `header_start` gate must not make this `NotZip`.
 
-4. **Mix / corpus** (`tests/corpus.rs`, when corpus is present): `raw_zip_blob` absent on **every** mix member. Keep `cdata_blob == 0`. Keep `output_len <= 569539 * 115/100`. **Keep** `spring-zip64-nested.jar` `bit_identical_restore()` + whole-file hash **and** `raw_zip_blob.is_none()` (the flag alone is not enough). Hash-mismatch members must still be `metadata_rebuild()` (they have a tail). Do not loosen those asserts. If a mix member would skip-exact, that is a walker bug — fix it, do not change the assert.
+4. **Existing** `write_fat_spring_zip64_zipa_jar` (DEFLATE nested, Zip64): still `tail_blob.is_some() && raw_zip_blob.is_none()`, functional identity. Do not loosen.
 
-5. **Overlap:** `unique_overlap_content_blobs_not_dual_copy` / HELLO+A+B=3 still holds. `unique_blob_count` is unique contents plus index blobs, **not** jars+contents.
+5. **Mix / corpus** when present: keep `cdata_blob == 0`, `output_len <= 569539 * 115/100`, `raw_zip_blob` absent, `spring-zip64-nested` bit-identical + no `raw_zip`. Do not require whole-file hash on Maven codec-miss jars.
 
-6. **Second-bug gate (not tautological).** Expose homemade parse via `pub(crate)` (or a thin helper). On named fixtures, assert `parse_central_directory(tail).len()` (and EOCD `entry_count` when parse succeeds) **versus** `ZipArchive::len()` / `jar.entries.len()`:
-   - plain ZipWriter, Maven empty DEFLATE dir, class-4 dir, Spring prefix, `zip -A`, Zip64 fat: **must be equal** (walker must agree) **and** `tail_blob.is_some() && raw_zip_blob.is_none()`.
-   - `dup.txt` last-wins: **must be 2 vs 1** (documents IndexMap). Must **not** `raw_zip` or store `tail_blob`.
-   Treat parse `None` as mismatch (fail the “must be equal” fixtures).
+6. **Overlap / last-wins** unchanged: `unique_overlap_content_blobs_not_dual_copy`; `dup.txt` still skip-exact (2 vs 1), no `raw_zip`. Prefixed last-wins is out of scope (no fixture).
 
-Fill `fill_exact_entry` **only after** the store-tail count gate passes. Last-wins: one local = last `dup.txt`; zipping `entries[i]` with `locals[i]` is correct on the store-tail path. On skip-exact, do not fill from a disagreeing homemade slice.
+Do **not** require whole-file hash match on rebuild / Maven codec-miss. Do **not** add `cdata_blob`.
 
-Do **not** require whole-file hash match on Maven codec-miss jars. Do **not** add `cdata_blob` to keep hashes.
+Further Matt CLI coverage (Zip64 fixture + few-MiB classic in one `--restore-paths` pack, two nearby zip-A fats sharing nested lib bytes, listed-pack manifest shape) lives in `PLAN-coverage.md`. STORE-nested in-place is fat-only (`in_place_restore_paths_store_nested_zipa_must_not_collapse`); do not restage the tiny `a.jar` overwrite-without-`--overwrite` test.
 
 ---
 
@@ -138,9 +149,9 @@ Do **not** require whole-file hash match on Maven codec-miss jars. Do **not** ad
 - Format v3 / renaming JSON fields / per-blob zstd frames.
 - Java zlib / `Deflater` bitstream matching.
 - `--verbatim` / `--exact-cdata`.
-- Exploding nested JARs.
-- Reopening 0.2.1 CleanExact / CleanMiss.
-- Adding a `raw_zip` success path for `NotZip` / `UnsupportedArchive`.
+- Exploding nested JARs (they stay opaque).
+- Rewriting `write_jar` / adding a restore tempfile “just in case” without a post-scan-fix repro.
+- Adding a `raw_zip` success path for listed jars.
 - Merging, tagging, publish.
 
 ---
@@ -149,25 +160,25 @@ Do **not** require whole-file hash match on Maven codec-miss jars. Do **not** ad
 
 Origin `skeptic-plan-review` was not reachable. Fresh adversarial Task subagents. Never skip sweep 1. Cap 3, then BLOCKED.
 
-### Sweep 1 — REVISE (2 blockers, applied)
+### Sweep 1 — REVISE (1 blocker, applied)
 
-1. **Test 5 was tautological.** `ZipArchive::len() == slice.locals.len()` after building locals from ZipArchive cannot fail. zip 2.4.2 `IndexMap` last-wins vs homemade CD is the real second bug (`dup.txt`). Gate is now homemade `parse_central_directory(tail).len()` vs `entries.len()`, including parse `None`. Do not store a disagreeing tail (`write_rebuilt_jar` leaves extra CD rows).
-2. **Skip-exact vs mix asserts.** Skip-exact leaves neither `bit_identical_restore` nor `metadata_rebuild`. `spring-zip64-nested` hard-requires `bit_identical_restore()`. Plan now **keeps** those corpus asserts and **forbids** skip-exact on mix/Spring/Zip64/`zip -A`; walker must make homemade CD count match. Skip-exact is only last-wins / extra CD rows (`dup.txt`).
+1. **Tests 1–2 can stay green on 0.2.2.** `inner zip bytes, not exploded` still allows incompressible non-zip payloads named `*.jar`. Then today's first try returns `Err`, falls through to `view_shift == 0`, and the 0.2.3 gates never see a latch. Dataflow still collapses. **Required:** new **classic-u32** helper (do not flip `write_fat_spring_zip64_zipa_jar` to STORE; fix that helper's docstring — it says STORE but DEFLATEs). Outer method 0 must wrap a **complete inner zip** (own `PK\x05\x06`). Tests 1–2 must use that helper. Assert the 0.2.2 latch: `ZipArchive::new(ZipView(file, prefix_len))` is `Ok` and `len() ≠` homemade outer CD count (or names omit outer `App.class` / `BOOT-INF/lib`).
 
-Should-fix folded in: `header_start` is offset-only (extent still header+cdata+descriptor+pad to next local/CD); `zip -A` file-abs → zip-rel; Test 2 is not spanning; `tests/docs.rs` 3-way PLAN AND is replaced in full, AGENTS/README locked phrases kept.
+Should-fix folded in: pass `prefix_len` into `zip_archive_opens` (or check `header_start + view_shift == prefix_len`); homemade count from `find_cd_bounds` on the raw file, not described as the `slice_from_archive` gate; do not apply the reject to unprefixed scan (`dup.txt`); both views failing stays `None` → empty-EOCD / `NotZip`, no `raw_zip`; Test 3 uses the same complete STORE inner zip without `zip -A`.
 
-### Sweep 2 — REVISE (3 blockers, applied)
+### Sweep 2 — ACCEPT (fresh skeptic; NO BLOCKING FINDINGS)
 
-1. **Tests 1/`dup.txt` only kill the third arm.** `ZipExact::Raw` (`slice_zip` `Err`) could remain and every always-on test stay green. Added mandatory overlapping-local (distinct names) fixture that is `Raw` on 0.2.1; in-tree Zip64/`zip -A`/Spring/descriptor/zipalign must assert `tail_blob.is_some() && raw_zip_blob.is_none()` (`bit_identical_restore` is true for `raw_zip`).
-2. **DESIGN/README still blessed “parse failure ⇒ `raw_zip`”.** Table now deletes that exception. Listed-jar parse/`read_local`/`slice_zip` `Err` = skip-exact. `raw_zip` only when listing never produced `entries[]`.
-3. **docs.rs conjunct was not a substring.** Lock `` `ZipArchive` count ≠ homemade CD count is a **second bug** `` (backticks around `ZipArchive`), not a bare `ZipArchive count ≠` string.
+Should-fix for implement (not blockers):
 
-Should-fix folded in: do not call `capture_zip_exact` from `attach_exact`; parse is count gate not patcher; `central_header_start` is not a local offset; keep `No default cdata_blob…`; tighten `|| raw_zip` accepts; expose parse `pub(crate)`.
+- Homemade count is `find_cd_bounds(...).3` only. After `zip -A`, `recorded_cd_offset` is file-absolute — do not treat it as prefix/`header_start`.
+- Latch proof lives in `src/scan.rs` (or tests duplicate `ZipView`). `ZipArchive::new(File)` is `view_shift == 0` and lists the **outer** zip on `zip -A` — that does not prove the latch.
+- Test 2 size-within-15% cannot catch a 1-lib latch (inner ≈ source). Require ≥2 `BOOT-INF/lib/` STORE members; listing/uncompressed-bytes are the latch catch. Optional lower bound: restored size not &lt; 50% of source.
+- `tests/docs.rs` `PLAN.contains` must use the exact substrings already in this file (not the table’s double-backtick padding).
+- Compute homemade count in `layout_from_first_pk` (has `file_len`) and pass it into `zip_archive_opens`. `ZipArchive<ZipView<&mut File>>` holds `file`; a second `find_cd_bounds` will not compile.
+- Do not add a sentinel-EOCD Zip64+STORE helper using only in-tree `adjust_self_extracting_offsets` (does not patch Zip64 EOCD/locator → both views latch → `NotZip`). Keep Test 4 on the existing DEFLATE Zip64 fixture.
 
 ### Sweep 3 — ACCEPT (fresh skeptic; NO BLOCKING FINDINGS)
 
-Should-fix for implement (not blockers): Test 6 lives in `src/` or a thin `pub` helper — do not clone a second CD walker in `tests/`. Build `CdRecord` from the ZipArchive walk (`header_start` after zip-A convert + crc/sizes), not homemade CD rows. Parse the **source** tail from `find_cd_bounds` for Test 6. Do not add a new unlistable `raw_zip` success path.
+Should-fix for implement (not blockers): homemade count is `.3` only; latch proof is `ZipArchive::new(ZipView(file, prefix_len))` not `ZipArchive::new(File)`; after-fix `len()` is the **chosen** view; do not use `archive.offset()` in place of `header_start` (`offset()` is 0 on a correct zip -A open); docs.rs exact substrings; Test 2 ≥2 STORE libs (50% size is backup); no Zip64+STORE helper on `adjust_self_extracting_offsets`.
 
-**Plan locked.** Three sweeps (REVISE, REVISE, ACCEPT). Implement from this file.
-
----
+**Plan locked.** Three sweeps (REVISE, ACCEPT, ACCEPT). Implement from this file.

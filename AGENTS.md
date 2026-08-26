@@ -28,7 +28,7 @@ The manifest is a ZIP-slot index (ratarmount-style pointers), not a second copy 
 
 ## Current tree vs this contract
 
-Crate **0.2.1** / format **v2** groups uncompressed blobs in 4 MiB record-aligned zstd frames and **never writes** `cdata_blob` on STORE/DEFLATE (file or dir, any method). Crate **0.2.2** never writes `raw_zip` of a listed jar. CleanMiss rebuilds class-4 / mixed-exotic. Crate 0.2.0 leftover MixedExact / ExactWithExotic dual copies still read. Do not add new `cdata_blob` puts. Do not “fix” mix size by storing more cdata.
+Crate **0.2.3** / format **v2** groups uncompressed blobs in 4 MiB record-aligned zstd frames and **never writes** `cdata_blob` on STORE/DEFLATE (file or dir, any method). Crate **0.2.2** never writes `raw_zip` of a listed jar. `zip_archive_opens` must accept only the outer listing (rust zip may latch onto a STORE nested EOCD). CleanMiss rebuilds class-4 / mixed-exotic. Crate 0.2.0 leftover MixedExact / ExactWithExotic dual copies still read. Do not add new `cdata_blob` puts. Do not “fix” mix size by storing more cdata.
 
 ## Tests that must fail
 

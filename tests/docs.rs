@@ -149,10 +149,10 @@ fn agents_md_locks_single_cas_and_zstd_blocks() {
         "DESIGN.md must not treat metadata-only exact as the north star"
     );
     assert!(
-        PLAN.contains("# PLAN: no raw_zip dual-copy on listed jars (crate 0.2.2)")
-            && PLAN.contains("Never write `raw_zip` when `jar.entries` is populated")
-            && PLAN.contains("`ZipArchive` count ≠ homemade CD count is a **second bug**"),
-        "PLAN.md must be the 0.2.2 no-raw_zip-on-listed-jars plan"
+        PLAN.contains("# PLAN: do not latch ZipArchive onto nested STORE jars (crate 0.2.3)")
+            && PLAN.contains("`zip_archive_opens` must accept only the outer listing")
+            && PLAN.contains("rust zip may latch onto a STORE nested EOCD"),
+        "PLAN.md must be the 0.2.3 no-nested-STORE-latch plan"
     );
     assert!(
         !README.contains("## Reconstruction guarantee")

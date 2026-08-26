@@ -3,14 +3,21 @@
 #[path = "fixtures.rs"]
 mod fixtures;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
+use ayzenpack::hashutil::{blake3_bytes, hex_lower};
 use ayzenpack::Manifest;
-use fixtures::write_jar;
+use fixtures::{
+    inner_incompressible_jar, write_classic_nested_store_jar,
+    write_fat_spring_store_nested_zipa_jar, write_fat_spring_store_nested_zipa_with,
+    write_fat_spring_zip64_zipa_jar, write_jar,
+};
 use predicates::prelude::*;
+use zip::ZipArchive;
 
 fn ayzenpack() -> Command {
     Command::cargo_bin("ayzenpack").expect("binary must be named ayzenpack")
@@ -23,6 +30,98 @@ fn write_sample(path: &Path) {
 fn sidecar_manifest(pack: &Path) -> Manifest {
     let json = pack.with_extension("ayz.manifest.json");
     serde_json::from_slice(&fs::read(json).unwrap()).unwrap()
+}
+
+fn file_entry_map(path: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut z = ZipArchive::new(File::open(path).unwrap()).unwrap();
+    let mut map = BTreeMap::new();
+    for i in 0..z.len() {
+        let mut e = z.by_index(i).unwrap();
+        if e.is_dir() {
+            continue;
+        }
+        let mut buf = Vec::new();
+        e.read_to_end(&mut buf).unwrap();
+        map.insert(e.name().to_string(), buf);
+    }
+    map
+}
+
+fn file_entry_crcs(path: &Path) -> BTreeMap<String, u32> {
+    let mut z = ZipArchive::new(File::open(path).unwrap()).unwrap();
+    let mut map = BTreeMap::new();
+    for i in 0..z.len() {
+        let e = z.by_index(i).unwrap();
+        if e.is_dir() {
+            continue;
+        }
+        map.insert(e.name().to_string(), e.crc32());
+    }
+    map
+}
+
+fn file_content_blobs(m: &Manifest) -> BTreeSet<String> {
+    m.jars
+        .iter()
+        .flat_map(|j| {
+            j.entries
+                .iter()
+                .filter(|e| !e.is_dir)
+                .filter_map(|e| e.blob.clone())
+        })
+        .collect()
+}
+
+fn assert_not_10x_smaller(restored: u64, source: u64) {
+    assert!(
+        restored * 10 >= source,
+        "restored {restored} is ≥10× smaller than source {source}"
+    );
+}
+
+fn assert_listed_no_dual(jar: &ayzenpack::manifest::Jar) {
+    assert!(
+        jar.raw_zip_blob.is_none(),
+        "{} must not store raw_zip",
+        jar.name
+    );
+    assert_eq!(jar.raw_zip_size.unwrap_or(0), 0);
+    for e in &jar.entries {
+        assert!(e.cdata_blob.is_none(), "{}!{} cdata_blob", jar.name, e.name);
+        if !e.is_dir {
+            assert!(
+                e.blob.is_some(),
+                "{}!{} file entry must have a content blob",
+                jar.name,
+                e.name
+            );
+        }
+    }
+}
+
+fn dehydrate_matt_dir(jars: &Path, pack: &Path, sidecar: &Path) {
+    ayzenpack()
+        .args([
+            "dehydrate",
+            "--recursive",
+            "--sort-inputs",
+            "--restore-paths",
+            "--write-sidecar-manifest",
+        ])
+        .arg(sidecar)
+        .arg("-o")
+        .arg(pack)
+        .arg(jars)
+        .assert()
+        .success();
+}
+
+fn rehydrate_restore_paths_only(pack: &Path) {
+    ayzenpack()
+        .args(["rehydrate", "--restore-paths", "-i"])
+        .arg(pack)
+        .assert()
+        .success();
 }
 
 fn pack_restore(dir: &Path, jar: &Path, out_name: &str) -> PathBuf {
@@ -298,6 +397,140 @@ fn restore_paths_recorded_mode_wins_over_prefix_0755() {
         .success();
     let mode = fs::metadata(&jar).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o644, "recorded mode must win over prefix 0755");
+}
+
+#[test]
+fn in_place_restore_paths_zip64_fat_and_classic() {
+    // Matt CLI identity on the 0.2.2 Zip64 fixture (DEFLATE nested — does not
+    // latch) plus a few-MiB classic. Same rule as tiny a.jar: --restore-paths
+    // does not need --overwrite. On this tree every in-tree fat splices
+    // (tail_blob); there is no skip-exact fat dest-dir rebuild to add.
+    let dir = tempfile::tempdir().unwrap();
+    let jars = dir.path().join("jars");
+    fs::create_dir_all(&jars).unwrap();
+    let fat = jars.join("app.jar");
+    let classic = jars.join("plain.jar");
+    write_fat_spring_zip64_zipa_jar(&fat);
+    write_classic_nested_store_jar(&classic);
+    let fat_src_len = fs::metadata(&fat).unwrap().len();
+    let classic_src_len = fs::metadata(&classic).unwrap().len();
+    let fat_src = file_entry_map(&fat);
+    let classic_src = file_entry_map(&classic);
+    let classic_crc = file_entry_crcs(&classic);
+    assert!(fat_src.keys().any(|n| n.starts_with("BOOT-INF/lib/")));
+    assert!(classic_src.contains_key("lib/payload.jar"));
+
+    let pack = dir.path().join("pack.ayz");
+    let sidecar = dir.path().join("pack.ayz.manifest.json");
+    dehydrate_matt_dir(&jars, &pack, &sidecar);
+    let m: Manifest = serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+    assert_eq!(m.jars.len(), 2);
+    let mut raw_zip_size_sum = 0u64;
+    for jar in &m.jars {
+        assert_listed_no_dual(jar);
+        raw_zip_size_sum += jar.raw_zip_size.unwrap_or(0);
+    }
+    assert_eq!(raw_zip_size_sum, 0);
+
+    rehydrate_restore_paths_only(&pack);
+
+    let fat_got_len = fs::metadata(&fat).unwrap().len();
+    let classic_got_len = fs::metadata(&classic).unwrap().len();
+    assert_not_10x_smaller(fat_got_len, fat_src_len);
+    assert_not_10x_smaller(classic_got_len, classic_src_len);
+    assert_eq!(file_entry_map(&fat), fat_src);
+    assert_eq!(file_entry_map(&classic), classic_src);
+    assert_eq!(file_entry_crcs(&classic), classic_crc);
+}
+
+#[test]
+fn in_place_restore_paths_store_nested_zipa_must_not_collapse() {
+    // 134→5.5 class: STORE nested + zip-A + --restore-paths (no --overwrite).
+    // ZipArchive::new(File) is the outer view on zip-A. Snapshot before restore.
+    let dir = tempfile::tempdir().unwrap();
+    let jars = dir.path().join("jars");
+    fs::create_dir_all(&jars).unwrap();
+    let fat = jars.join("app.jar");
+    write_fat_spring_store_nested_zipa_jar(&fat);
+    let src_len = fs::metadata(&fat).unwrap().len();
+    let src = file_entry_map(&fat);
+    assert!(
+        src.keys().any(|n| n.starts_with("BOOT-INF/lib/")),
+        "source must be the outer listing, got {:?}",
+        src.keys()
+    );
+    assert!(src.contains_key("App.class"));
+
+    let pack = dir.path().join("pack.ayz");
+    let sidecar = dir.path().join("pack.ayz.manifest.json");
+    dehydrate_matt_dir(&jars, &pack, &sidecar);
+    let m: Manifest = serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+    assert_listed_no_dual(&m.jars[0]);
+
+    rehydrate_restore_paths_only(&pack);
+
+    assert_not_10x_smaller(fs::metadata(&fat).unwrap().len(), src_len);
+    assert_eq!(file_entry_map(&fat), src);
+}
+
+#[test]
+fn in_place_restore_paths_two_fats_share_nested_lib_blobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let jars = dir.path().join("jars");
+    fs::create_dir_all(&jars).unwrap();
+    let shared = inner_incompressible_jar(3, 64 * 1024);
+    let extra_a = inner_incompressible_jar(4, 32 * 1024);
+    let extra_b = inner_incompressible_jar(5, 32 * 1024);
+    let a = jars.join("a.jar");
+    let b = jars.join("b.jar");
+    write_fat_spring_store_nested_zipa_with(&a, b"app-A", &[shared.clone(), extra_a]);
+    write_fat_spring_store_nested_zipa_with(&b, b"app-B", &[shared.clone(), extra_b]);
+    let a_len = fs::metadata(&a).unwrap().len();
+    let b_len = fs::metadata(&b).unwrap().len();
+    let a_src = file_entry_map(&a);
+    let b_src = file_entry_map(&b);
+    assert!(a_src.contains_key("BOOT-INF/lib/lib0.jar"));
+    assert!(b_src.contains_key("BOOT-INF/lib/lib0.jar"));
+    assert_eq!(
+        a_src.get("BOOT-INF/lib/lib0.jar"),
+        Some(&shared),
+        "source map must be the outer planted lib, not an inner listing"
+    );
+    assert_eq!(b_src.get("BOOT-INF/lib/lib0.jar"), Some(&shared));
+
+    let pack = dir.path().join("pack.ayz");
+    let sidecar = dir.path().join("pack.ayz.manifest.json");
+    dehydrate_matt_dir(&jars, &pack, &sidecar);
+    let m: Manifest = serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+    let file_entries = m
+        .jars
+        .iter()
+        .flat_map(|j| j.entries.iter())
+        .filter(|e| !e.is_dir)
+        .count();
+    let blobs = file_content_blobs(&m);
+    assert!(
+        blobs.len() < file_entries,
+        "unique file content blobs {} must be < file entries {}",
+        blobs.len(),
+        file_entries
+    );
+    let want = hex_lower(&blake3_bytes(&shared));
+    for jar in &m.jars {
+        assert_listed_no_dual(jar);
+        let e = jar
+            .entries
+            .iter()
+            .find(|e| e.name == "BOOT-INF/lib/lib0.jar")
+            .expect("planted lib0");
+        assert_eq!(e.blob.as_deref(), Some(want.as_str()));
+    }
+
+    rehydrate_restore_paths_only(&pack);
+    assert_not_10x_smaller(fs::metadata(&a).unwrap().len(), a_len);
+    assert_not_10x_smaller(fs::metadata(&b).unwrap().len(), b_len);
+    assert_eq!(file_entry_map(&a), a_src);
+    assert_eq!(file_entry_map(&b), b_src);
 }
 
 #[test]

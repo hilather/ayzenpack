@@ -356,13 +356,20 @@ fn layout_from_first_pk(
     if first == 0 || first > MAX_PREFIX {
         return Ok(None);
     }
-    if zip_archive_opens(path, file, first)? {
+    // Homemade outer count is find_cd_bounds(...).3 only. After zip -A the
+    // recorded CD offset is file-absolute — do not treat it as prefix.
+    let outer_entries = match find_cd_bounds(path, file, file_len) {
+        Ok((_, _, _, n)) => n,
+        Err(AyzenpackError::NotZip { .. }) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if zip_archive_opens(path, file, first, first, outer_entries)? {
         return Ok(Some(ZipLayout {
             prefix_len: first,
             view_shift: first,
         }));
     }
-    if zip_archive_opens(path, file, 0)? {
+    if zip_archive_opens(path, file, 0, first, outer_entries)? {
         return Ok(Some(ZipLayout {
             prefix_len: first,
             view_shift: 0,
@@ -371,15 +378,36 @@ fn layout_from_first_pk(
     Ok(None)
 }
 
-fn zip_archive_opens(path: &Path, file: &mut (impl Read + Seek), view_shift: u64) -> Result<bool> {
+/// `ZipArchive::new` success is not enough: rust zip may latch onto a STORE
+/// nested EOCD when the view's CD offset is wrong (`zip -A` + prefix shift).
+fn zip_archive_opens(
+    path: &Path,
+    file: &mut (impl Read + Seek),
+    view_shift: u64,
+    prefix_len: u64,
+    outer_entries: u64,
+) -> Result<bool> {
     file.seek(SeekFrom::Start(0))
         .map_err(|source| io_at(source, path))?;
-    match ZipArchive::new(ZipView::new(file, view_shift)) {
-        Ok(_) => Ok(true),
-        Err(zip::result::ZipError::InvalidArchive(_)) => Ok(false),
-        Err(zip::result::ZipError::Io(source)) => Err(io_at(source, path)),
-        Err(_) => Ok(false),
+    let mut archive = match ZipArchive::new(ZipView::new(file, view_shift)) {
+        Ok(archive) => archive,
+        Err(zip::result::ZipError::InvalidArchive(_)) => return Ok(false),
+        Err(zip::result::ZipError::Io(source)) => return Err(io_at(source, path)),
+        Err(_) => return Ok(false),
+    };
+    if archive.len() as u64 != outer_entries {
+        return Ok(false);
     }
+    if archive.is_empty() {
+        return Ok(true);
+    }
+    let header_start = match archive.by_index(0) {
+        Ok(zf) => zf.header_start(),
+        Err(_) => return Ok(false),
+    };
+    // Do not use archive.offset(): on a correct zip -A open it is 0, which
+    // would reject the good view. header_start + view_shift == prefix_len.
+    Ok(header_start.checked_add(view_shift) == Some(prefix_len))
 }
 
 /// Empty prefixed ZIP (no local header): EOCD extra-data math, or the
@@ -1175,5 +1203,108 @@ mod tests {
         view.read_exact(&mut got).unwrap();
         assert_eq!(&got, b"payload");
         assert_eq!(view.seek(SeekFrom::Start(3)).unwrap(), 3);
+    }
+
+    /// Complete inner zip (own EOCD) stored as an opaque outer member.
+    fn complete_inner_zip(i: u8) -> Vec<u8> {
+        let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        z.start_file(format!("com/Lib{i}.class"), opts).unwrap();
+        z.write_all(&[i; 2048]).unwrap();
+        let bytes = z.finish().unwrap().into_inner();
+        assert!(
+            bytes.windows(4).any(|w| w == EOCD_MAGIC),
+            "inner must be a complete zip"
+        );
+        bytes
+    }
+
+    fn store_nested_fat(zip_a: bool) -> (Vec<u8>, u64) {
+        let launcher = spring_boot_launch_script();
+        let lib0 = complete_inner_zip(0);
+        let lib1 = complete_inner_zip(1);
+        let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        z.start_file("App.class", opts).unwrap();
+        z.write_all(b"class-bytes-outer").unwrap();
+        z.start_file("BOOT-INF/lib/lib0.jar", opts).unwrap();
+        z.write_all(&lib0).unwrap();
+        z.start_file("BOOT-INF/lib/lib1.jar", opts).unwrap();
+        z.write_all(&lib1).unwrap();
+        let zip = z.finish().unwrap().into_inner();
+        assert!(
+            !zip.windows(4).any(|w| w == ZIP64_EOCD_MAGIC),
+            "classic u32 CD only"
+        );
+        let mut out = launcher.to_vec();
+        out.extend_from_slice(&zip);
+        if zip_a {
+            adjust_self_extracting_offsets(&mut out, launcher.len() as u32);
+        }
+        (out, launcher.len() as u64)
+    }
+
+    #[test]
+    fn zip_a_store_nested_latches_on_prefix_shift_then_layout_uses_zero() {
+        // Latch proof: ZipArchive::new(ZipView(prefix)) — not ZipArchive::new(File).
+        let (bytes, prefix) = store_nested_fat(true);
+        let file_len = bytes.len() as u64;
+        let mut cur = Cursor::new(bytes.clone());
+        let (_, _, _, outer) =
+            find_cd_bounds(Path::new("fat-zipa.jar"), &mut cur, file_len).unwrap();
+        assert_eq!(outer, 3, "App + 2 STORE BOOT-INF/lib");
+        cur.seek(SeekFrom::Start(0)).unwrap();
+        let mut latched = ZipArchive::new(ZipView::new(&mut cur, prefix)).expect("0.2.2 latch Ok");
+        assert_ne!(
+            latched.len() as u64,
+            outer,
+            "prefix shift must bind an inner EOCD, not the outer CD"
+        );
+        let names: Vec<String> = (0..latched.len())
+            .map(|i| latched.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(
+            !names
+                .iter()
+                .any(|n| n == "App.class" || n.starts_with("BOOT-INF/lib/")),
+            "latched names must omit the outer listing, got {names:?}"
+        );
+
+        let mut cur = Cursor::new(bytes);
+        let layout = detect_zip_layout(Path::new("fat-zipa.jar"), &mut cur).unwrap();
+        assert_eq!(layout.prefix_len, prefix);
+        assert_eq!(layout.view_shift, 0, "zip -A must use file-absolute view");
+        cur.seek(SeekFrom::Start(0)).unwrap();
+        let mut chosen = ZipArchive::new(ZipView::new(&mut cur, layout.view_shift)).unwrap();
+        assert_eq!(chosen.len() as u64, outer);
+        let chosen_names: Vec<String> = (0..chosen.len())
+            .map(|i| chosen.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(chosen_names.iter().any(|n| n == "App.class"));
+        assert_eq!(
+            chosen_names
+                .iter()
+                .filter(|n| n.starts_with("BOOT-INF/lib/"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn unadjusted_store_nested_keeps_prefix_shift() {
+        let (bytes, prefix) = store_nested_fat(false);
+        let file_len = bytes.len() as u64;
+        let mut cur = Cursor::new(bytes.clone());
+        let (_, _, _, outer) = find_cd_bounds(Path::new("fat.jar"), &mut cur, file_len).unwrap();
+        let mut cur = Cursor::new(bytes);
+        let layout = detect_zip_layout(Path::new("fat.jar"), &mut cur).unwrap();
+        assert_eq!(layout.prefix_len, prefix);
+        assert_eq!(
+            layout.view_shift, prefix,
+            "unadjusted Spring default must not invert to view_shift=0"
+        );
+        cur.seek(SeekFrom::Start(0)).unwrap();
+        let chosen = ZipArchive::new(ZipView::new(&mut cur, layout.view_shift)).unwrap();
+        assert_eq!(chosen.len() as u64, outer);
     }
 }
