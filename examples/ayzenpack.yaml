@@ -25,11 +25,13 @@ dehydrate:
     - "*.javadoc.jar"
   write_sidecar_manifest: dist/libs.ayz.manifest.json
   pretty_manifest: true
+  restore_paths: false
 
 rehydrate:
   input: dist/libs.ayz
   dir: restored
   overwrite: true
+  restore_paths: false
   store_all: false
   deflate_level: 6
   keep_cas: false

@@ -81,7 +81,7 @@ Unknown header keys are ignored. Version byte (offset 4) `> 1` is `unsupported v
   "zstd_level": 3,
   "created_unix": 1710000000,
   "tool": "ayzenpack",
-  "tool_version": "0.1.7"
+  "tool_version": "0.1.8"
 }
 ```
 
@@ -149,6 +149,8 @@ Root: `format`, `version`, `hash_algo`, `mode`, `jars[]`, `blobs[]`, `stats`.
 v1 **content** rebuild (old archives) uses `name` (Unicode from `ZipFile::name()`), `is_dir`, `blob`, `crc32`, `dos_*` via `DateTime::try_from_msdos` with `DateTime::default()` fallback, and `unix_mode`. `utf8_flag` is recorded only. `name_raw_hex` is not used on write. `method` is advisory: rebuilt files deflate, directories store, unless `--store-all`.
 
 New packs also store optional exact-reconstruction fields (omitted when absent, same style as `prefix_blob`). Unknown keys stay ignored on read.
+
+`--restore-paths` dehydrate adds optional `jars[].restore_path` (canonical absolute path), `restore_mode`, and on Unix `restore_uid` / `restore_gid`. Omitted when the flag is off. Default rehydrate still writes `dir/name`. `--restore-paths` rehydrate writes `restore_path` (overwrites; dest symlink is replaced, not followed).
 
 ---
 

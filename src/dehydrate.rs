@@ -54,6 +54,8 @@ pub struct DehydrateOptions {
     pub jobs: usize,
     /// Cap on uncompressed entry buffers in the hash pipeline (default 64 MiB).
     pub max_inflight_bytes: u64,
+    /// Record absolute restore path + mode (+ uid/gid on Unix) on each jar.
+    pub restore_paths: bool,
 }
 
 impl Default for DehydrateOptions {
@@ -77,6 +79,7 @@ impl Default for DehydrateOptions {
             json_logs: false,
             jobs: DEFAULT_JOBS,
             max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
+            restore_paths: false,
         }
     }
 }
@@ -561,6 +564,11 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
                 }
                 _ => (None, None),
             };
+            let (restore_path, restore_mode, restore_uid, restore_gid) = if opts.restore_paths {
+                collect_restore_meta(path)
+            } else {
+                (None, None, None, None)
+            };
             let mut jar = Jar {
                 name: jar_name,
                 source_path: path.to_string_lossy().into_owned(),
@@ -569,6 +577,10 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
                 source_sha256: hex_lower(&scanned.source_sha256),
                 comment: scanned.comment,
                 signed: scanned.signed,
+                restore_path,
+                restore_mode,
+                restore_uid,
+                restore_gid,
                 prefix_blob,
                 prefix_size,
                 tail_blob: None,
@@ -1159,6 +1171,37 @@ fn verbose(opts: &DehydrateOptions, msg: &str) {
         return;
     }
     eprintln!("ayzenpack: {msg}");
+}
+
+/// Filesystem metadata for `--restore-paths`. Canonical path when possible.
+fn collect_restore_meta(path: &Path) -> (Option<String>, Option<u32>, Option<u32>, Option<u32>) {
+    let restore_path = Some(match path.canonicalize() {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(_) => path.to_string_lossy().into_owned(),
+    });
+    let meta = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return (restore_path, None, None, None),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (
+            restore_path,
+            Some(meta.mode()),
+            Some(meta.uid()),
+            Some(meta.gid()),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let mode = if meta.permissions().readonly() {
+            0o444
+        } else {
+            0o644
+        };
+        (restore_path, Some(mode), None, None)
+    }
 }
 
 fn unix_now() -> u64 {

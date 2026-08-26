@@ -22,6 +22,9 @@ ayzenpack **dehydrates** a set of JAR/ZIP/WAR/EAR files into one `.ayz`: each un
 ```text
 ayzenpack dehydrate -o libs.ayz app.jar lib/*.jar
 ayzenpack rehydrate -i libs.ayz -d restored/
+
+ayzenpack dehydrate --restore-paths -o all.ayz /abs/a.jar /abs/b.jar
+ayzenpack rehydrate --restore-paths -i all.ayz
 ```
 
 Aliases: `pack` = `dehydrate`, `unpack` = `rehydrate`. Also `list` and `verify`.
@@ -221,6 +224,7 @@ ayzenpack dehydrate -o <OUT> [OPTIONS] <INPUTS>...
 | `--jobs <N>` | hash workers; default **1**. `0` = available parallelism |
 | `--max-inflight-bytes` | cap on uncompressed entry buffers in the hash pipeline, default **64 MiB** |
 | `--write-sidecar-manifest <PATH>` | extra JSON file (compact unless `--pretty-manifest`) |
+| `--restore-paths` | record absolute path + mode (+ uid/gid on Unix) on each jar |
 
 `--jobs` hashes in parallel; BLOB records stay in first-seen (scan) order so `--sort-inputs` archives are byte-identical at any `--jobs`.
 
@@ -230,14 +234,16 @@ Shell-expanded globs are the caller’s job.
 
 ```text
 ayzenpack rehydrate -i <ARCHIVE> -d <DIR> [OPTIONS]
+ayzenpack rehydrate --restore-paths -i <ARCHIVE>
 ```
 
 | Flag | Meaning |
 |------|---------|
 | `-i, --input` | required `.ayz` |
-| `-d, --dir` | required output directory (created) |
+| `-d, --dir` | output directory (created). Required unless `--restore-paths` |
+| `--restore-paths` | write each jar to its recorded path (overwrites; `--dir` unused) |
 | `--store-all` | write ZIP entries stored (no deflate) |
-| `--overwrite` | default: fail if the target JAR exists |
+| `--overwrite` | default: fail if the target JAR exists (ignored with `--restore-paths`) |
 | `--only <NAME>` | repeatable; only those jar `name`s |
 | `--cas-dir <PATH>` | blob spill directory; default is a tempdir deleted on success |
 | `--keep-cas` | keep the CAS directory |

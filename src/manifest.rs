@@ -25,6 +25,14 @@ pub struct Jar {
     pub comment: String,
     pub signed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_mode: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_gid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_blob: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_size: Option<u64>,
@@ -160,6 +168,10 @@ mod tests {
                     .into(),
                 comment: String::new(),
                 signed: false,
+                restore_path: None,
+                restore_mode: None,
+                restore_uid: None,
+                restore_gid: None,
                 prefix_blob: None,
                 prefix_size: None,
                 tail_blob: None,
@@ -230,6 +242,10 @@ mod tests {
         assert!(SCHEMA_JSON.contains("name_raw_hex"));
         assert!(SCHEMA_JSON.contains("prefix_blob"));
         assert!(SCHEMA_JSON.contains("prefix_size"));
+        assert!(SCHEMA_JSON.contains("restore_path"));
+        assert!(SCHEMA_JSON.contains("restore_mode"));
+        assert!(SCHEMA_JSON.contains("restore_uid"));
+        assert!(SCHEMA_JSON.contains("restore_gid"));
         assert!(SCHEMA_JSON.contains("tail_blob"));
         assert!(SCHEMA_JSON.contains("raw_zip_blob"));
         assert!(SCHEMA_JSON.contains("cdata_blob"));
@@ -291,6 +307,22 @@ mod tests {
         let mut with_prefix = m.jars[0].clone();
         with_prefix.prefix_blob = Some(EMPTY_BLAKE3.into());
         with_prefix.prefix_size = Some(42);
+        let mut with_restore = m.jars[0].clone();
+        with_restore.restore_path = Some("/abs/a.jar".into());
+        with_restore.restore_mode = Some(0o644);
+        with_restore.restore_uid = Some(1000);
+        with_restore.restore_gid = Some(1000);
+        assert_key_order(
+            &serde_json::to_string(&with_restore).unwrap(),
+            &[
+                "signed",
+                "restore_path",
+                "restore_mode",
+                "restore_uid",
+                "restore_gid",
+                "entries",
+            ],
+        );
         assert_key_order(
             &serde_json::to_string(&with_prefix).unwrap(),
             &["signed", "prefix_blob", "prefix_size", "entries"],
@@ -470,6 +502,25 @@ mod tests {
         let jar2: Jar = serde_json::from_str(&s).unwrap();
         assert_eq!(jar2.prefix_blob, None);
         assert_eq!(jar2.prefix_size, None);
+    }
+
+    #[test]
+    fn restore_fields_omitted_when_none() {
+        let jar = sample_manifest().jars[0].clone();
+        assert_eq!(jar.restore_path, None);
+        assert_eq!(jar.restore_mode, None);
+        assert_eq!(jar.restore_uid, None);
+        assert_eq!(jar.restore_gid, None);
+        let s = serde_json::to_string(&jar).unwrap();
+        assert_compact(&s);
+        for key in ["restore_path", "restore_mode", "restore_uid", "restore_gid"] {
+            assert!(!s.contains(key), "None {key} must be omitted: {s}");
+        }
+        let jar2: Jar = serde_json::from_str(&s).unwrap();
+        assert_eq!(jar2.restore_path, None);
+        assert_eq!(jar2.restore_mode, None);
+        assert_eq!(jar2.restore_uid, None);
+        assert_eq!(jar2.restore_gid, None);
     }
 
     #[test]
