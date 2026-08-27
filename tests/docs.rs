@@ -200,6 +200,10 @@ fn docs_lock_leftover_junk_hash_policy_and_class_dedup() {
             && DESIGN.contains(
                 "Equal-offset last-wins with matching homemade count is exact splice"
             )
+            && DESIGN.contains("unique content 1")
+            && AGENTS.contains("unique content 1")
+            && README.contains("unique content 1")
+            && LIBRARY.contains("unique content 1")
             && !DESIGN.contains(
                 "Remaining homemade-`None` (true parse failure, truncated/malformed CD, overlap, prefix+hole)"
             )
@@ -351,8 +355,28 @@ fn docs_lock_synthetic_cd_hash_policy_fileabs_and_corpus() {
             && AGENTS.contains(
                 "Prefix+hole **(B)** `prefix_len > 0 && min(zip_rel) != 0` after convert is a dead defensive `Err` at first-local-not-at-0; keep it; do not call (B) absorbed"
             )
-            && !AGENTS.contains("prefix+hole stays skip-exact arm 3"),
-        "DESIGN/AGENTS must split prefix+hole (A) absorbed prefix_blob vs (B) kept dead Err"
+            && !AGENTS.contains("prefix+hole stays skip-exact arm 3")
+            && README.contains(
+                "Prefix+hole **(A)** `[non-PK prefix][hole][first CD local]` is already `prefix_blob` covering bash+hole (`find_cd_first_local`); not skip-exact"
+            )
+            && README.contains("do not call (B) absorbed")
+            && README.contains("PK-start hole is `leading_pad_blob` + arm 1")
+            && README.contains("A codec miss rebuilds that slot only")
+            && README.contains(
+                "Prefixed arm 3 dest is FileAbs `ZipArchive::new(File)` vs source `scan_jar`"
+            )
+            && !README.contains("count mismatch / prefix+hole")
+            && !README.contains("prefix+hole stays skip-exact")
+            && LIBRARY.contains(
+                "Prefix+hole **(A)** `[non-PK prefix][hole][first CD local]` is already `prefix_blob` covering bash+hole (`find_cd_first_local`); not skip-exact"
+            )
+            && LIBRARY.contains("do not call (B) absorbed")
+            && LIBRARY.contains("PK-start hole is `leading_pad_blob` + arm 1")
+            && LIBRARY.contains(
+                "prefixed arm 3 dest is FileAbs `ZipArchive::new(File)` vs source `scan_jar`"
+            )
+            && !LIBRARY.contains("prefix+hole stays skip-exact"),
+        "DESIGN/AGENTS/README/library must split prefix+hole (A) absorbed prefix_blob vs (B) kept dead Err; PK-start hole is leading_pad + arm 1; prefixed arm 3 is FileAbs dest vs scan_jar source"
     );
     assert!(
         README.contains("locals-region identity")

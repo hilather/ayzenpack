@@ -512,7 +512,7 @@ enum SkipExactArm {
     StencilSeekSyntheticCd,
     /// Headers, but at least one slot would change csize.
     RebuildConcatSyntheticCd,
-    /// No captured headers (range overlap / count mismatch / prefix+hole / slice Err).
+    /// No captured headers (range overlap / ZipArchive count mismatch / slice Err).
     ZipWriterStore,
 }
 
