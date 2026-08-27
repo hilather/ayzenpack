@@ -27,10 +27,9 @@ use fixtures::{
     write_store_file_plus_empty_deflate_dir, write_store_file_plus_leftover_csize_dir,
     write_stored_block_deflate_zip, write_stored_jar_dos_zero, write_stored_zip,
     write_truncated_cd_listed_zip, write_truncated_cd_plus_store_nested_unadjusted,
-    write_truncated_cd_listed_zip, write_truncated_cd_zip64_listed_zip,
-    write_unknown_deflate_wrapped, write_unknown_deflate_zip, write_wrapped_jar,
-    write_wrapped_jar_adjusted, write_wrapped_zip64_jar, write_zlib_deflate_zip, zip64_jar_bytes,
-    JarEntry, SPRING_LAUNCHER,
+    write_truncated_cd_zip64_listed_zip, write_unknown_deflate_wrapped, write_unknown_deflate_zip,
+    write_wrapped_jar, write_wrapped_jar_adjusted, write_wrapped_zip64_jar, write_zlib_deflate_zip,
+    zip64_jar_bytes, JarEntry, SPRING_LAUNCHER,
 };
 use zip::{CompressionMethod, DateTime, ZipArchive};
 
@@ -2881,6 +2880,7 @@ fn first_cd_local_header_offset(buf: &[u8]) -> u64 {
         assert!(i > 0, "EOCD");
         i -= 1;
     }
+}
 
 fn first_cd_local_offset(buf: &[u8]) -> u64 {
     let cd = classic_eocd_cd_offset(buf) as usize;
@@ -2912,7 +2912,6 @@ fn local_cdata(buf: &[u8], name: &str) -> Vec<u8> {
         i = data_off + csize;
     }
     panic!("local header missing {name}");
- (Headers-present csize-changing skip-exact concatenates locals and synthesizes CD)
 }
 
 fn splice_truncated_cd_stub(path: &Path) {
@@ -3819,7 +3818,6 @@ fn v023_tiny_pack_still_reads() {
         assert!(dir.path().join(&jar.name).is_file());
     }
 }
-
 
 #[test]
 fn leading_pad_pk_decoy_truncated_cd_restores_hole() {

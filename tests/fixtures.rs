@@ -938,6 +938,8 @@ pub fn write_truncated_cd_plus_store_nested_unadjusted(path: &Path) -> Vec<u8> {
     splice_trailing_cd_junk(&mut buf, &magic_but_short_cd_header());
     std::fs::write(path, prepend_launcher(&buf, SPRING_LAUNCHER, false)).unwrap();
     inner
+}
+
 /// Zip64 EOCD whose record (`12 + rec_size` at +4) ends at locator `loc`.
 /// Same walk as `src/exact.rs` `patch_eocd_cd_start`.
 fn zip64_eocd_off_ending_at_locator(buf: &[u8], loc: usize) -> usize {
@@ -1307,7 +1309,6 @@ pub fn write_deflate_miss_plus_dir_cdata(path: &Path, name: &str, data: &[u8]) {
         ],
     );
 }
-
 
 /// PK-start leading pad plus truncated/malformed CD (homemade-`None`).
 /// `prefix_size` stays 0 (do not swallow the hole); never leftover-junk.
