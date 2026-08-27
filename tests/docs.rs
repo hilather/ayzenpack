@@ -116,8 +116,11 @@ fn agents_md_locks_single_cas_and_zstd_blocks() {
         "AGENTS.md must say the manifest is a ZIP-slot index, not a second copy"
     );
     assert!(
-        AGENTS.contains("Do **not** add a Java/zlib deflater, `cdata_blob` for misses, or `raw_zip` of healthy jars"),
-        "AGENTS.md must forbid Java-zlib, cdata_blob-for-misses, and raw_zip of healthy jars"
+        AGENTS.contains("Do not add a Java subprocess / vendor `Deflater`")
+            && AGENTS.contains("do not add `cdata_blob` for misses")
+            && AGENTS.contains("do not `raw_zip` a listed jar")
+            && AGENTS.contains("In-process zlib-rs raw-deflate hits are the 0.2.4 path"),
+        "AGENTS.md must forbid Java subprocess / cdata_blob-for-misses / raw_zip of a listed jar; zlib-rs is the 0.2.4 path"
     );
     assert!(
         AGENTS.contains("but **never write** that shape again"),

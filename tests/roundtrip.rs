@@ -14,16 +14,18 @@ use ayzenpack::hashutil::blake3_bytes;
 use ayzenpack::manifest::Manifest;
 use ayzenpack::{dehydrate, rehydrate, verify, DehydrateOptions, RehydrateOptions};
 use fixtures::{
-    spring_boot_launch_script, write_data_descriptor_zip, write_deflate_miss_plus_dir_cdata,
+    matt_dehydrate, matt_rehydrate, spring_boot_launch_script, write_codec_hit_plus_unknown_deflate,
+    write_data_descriptor_zip, write_deflate_miss_plus_dir_cdata,
     write_deflate_miss_plus_empty_deflate_dir, write_fat_spring_store_nested_jar,
     write_fat_spring_store_nested_zipa_jar, write_fat_spring_zip64_zipa_jar, write_jar,
-    write_jar_entries, write_jar_with_comment, write_non_utf8_name_zip,
-    write_overlapping_local_zip, write_padded_locals_zip, write_signed_looking_jar,
-    write_store_file_plus_dir_cdata, write_store_file_plus_empty_deflate_dir,
-    write_store_file_plus_leftover_csize_dir, write_stored_block_deflate_wrapped,
-    write_stored_block_deflate_zip, write_stored_jar_dos_zero, write_stored_zip, write_wrapped_jar,
-    write_wrapped_jar_adjusted, write_wrapped_zip64_jar, zip64_jar_bytes, JarEntry,
-    SPRING_LAUNCHER,
+    write_jar_entries, write_jar_with_comment, write_leading_pad_pk_decoy_zip,
+    write_non_utf8_name_zip, write_overlapping_local_plus_store_nested, write_overlapping_local_zip,
+    write_padded_locals_zip, write_signed_looking_jar, write_store_file_plus_dir_cdata,
+    write_store_file_plus_empty_deflate_dir, write_store_file_plus_leftover_csize_dir,
+    write_stored_block_deflate_zip, write_stored_jar_dos_zero, write_stored_zip,
+    write_unknown_deflate_wrapped, write_unknown_deflate_zip, write_wrapped_jar,
+    write_wrapped_jar_adjusted, write_wrapped_zip64_jar, write_zlib_deflate_zip, zip64_jar_bytes,
+    JarEntry, SPRING_LAUNCHER,
 };
 use zip::{CompressionMethod, DateTime, ZipArchive};
 
@@ -394,10 +396,26 @@ fn cd_entries(path: &Path) -> Vec<(String, bool)> {
         .collect()
 }
 
+fn blob_payloads(records: &[Record]) -> std::collections::HashMap<[u8; 32], Vec<u8>> {
+    records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Blob { hash, data } => Some((*hash, data.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
 fn content_blob_ids(m: &Manifest) -> BTreeSet<String> {
     m.jars
         .iter()
-        .flat_map(|j| j.entries.iter().filter_map(|e| e.blob.clone()))
+        .flat_map(|j| {
+            j.entries.iter().filter_map(|e| e.blob.clone()).chain(
+                j.nestedindexes
+                    .iter()
+                    .flat_map(|n| n.entries.iter().filter_map(|e| e.blob.clone())),
+            )
+        })
         .collect()
 }
 
@@ -1074,19 +1092,53 @@ fn store_nested_zipa_fat_is_outer_listing_tail_no_raw_zip() {
         m.jars[0].entries.iter().any(|e| e.name == "App.class"),
         "outer listing must include App.class"
     );
-    assert_eq!(
-        m.jars[0]
-            .entries
-            .iter()
-            .filter(|e| e.name.starts_with("BOOT-INF/lib/"))
-            .count(),
-        2,
-        "outer listing must keep both nested libs opaque"
-    );
+    let libs: Vec<_> = m.jars[0]
+        .entries
+        .iter()
+        .filter(|e| e.name.starts_with("BOOT-INF/lib/"))
+        .collect();
+    assert_eq!(libs.len(), 2, "outer listing must keep both nested libs");
+    for e in &libs {
+        assert!(e.blob.is_none(), "{} must be zip_index not opaque CAS", e.name);
+        assert!(e.zip_index.is_some());
+        assert!(e.cdata_blob.is_none());
+    }
+    assert_eq!(m.jars[0].nestedindexes.len(), 2);
+    for nested in &m.jars[0].nestedindexes {
+        assert!(nested.tail_blob.is_some(), "child stencil must have tail_blob");
+    }
+    assert!(m.jars[0].bit_identical_restore());
+    let records = read_archive(&out).2;
+    let payloads = blob_payloads(&records);
+    for e in &libs {
+        let inner = {
+            let mut z = ZipArchive::new(File::open(&jar).unwrap()).unwrap();
+            let mut buf = Vec::new();
+            z.by_name(&e.name).unwrap().read_to_end(&mut buf).unwrap();
+            buf
+        };
+        let inner_hex = ayzenpack::hashutil::hex_lower(&blake3_bytes(&inner));
+        assert!(
+            !m.blobs.iter().any(|b| b.blake3 == inner_hex),
+            "blake3(inner zip) must not be in blobs[]"
+        );
+        let idx = e.zip_index.expect("zip_index");
+        let got = ayzenpack::reconstruct_child_zip(
+            &m.jars[0].nestedindexes[idx],
+            e.uncompressed_size,
+            |hex| {
+                let h = ayzenpack::hashutil::parse_blake3_hex(hex).unwrap();
+                Ok(payloads.get(&h).cloned().expect(hex))
+            },
+        )
+        .unwrap();
+        assert_eq!(got, inner, "reconstruct_child_zip must equal original inner ZIP");
+    }
+    verify(&out).unwrap();
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
     let restored = dest.join("app.jar");
-    assert_functional_identity(&jar, &restored);
+    assert_bit_identical(&jar, &restored);
     let got = fs::metadata(&restored).unwrap().len();
     assert!(
         got * 2 >= src_len,
@@ -1113,6 +1165,14 @@ fn store_nested_unadjusted_fat_uses_prefix_shift() {
             .count(),
         2
     );
+    for e in m.jars[0]
+        .entries
+        .iter()
+        .filter(|e| e.name.starts_with("BOOT-INF/lib/"))
+    {
+        assert!(e.blob.is_none());
+        assert!(e.zip_index.is_some());
+    }
     assert!(m.jars[0].raw_zip_blob.is_none());
     assert!(m.jars[0].tail_blob.is_some());
     for e in &m.jars[0].entries {
@@ -1914,6 +1974,9 @@ fn two_jars_share_nested_lib_content_blob() {
         .find(|e| e.name == "BOOT-INF/lib/dep.jar")
         .expect("b dep");
     assert_eq!(ea.blob, eb.blob);
+    assert!(ea.blob.is_some(), "write_jar DEFLATE nested stays opaque");
+    assert!(ea.zip_index.is_none());
+    assert!(eb.zip_index.is_none());
     assert_eq!(ea.cdata_codec, eb.cdata_codec);
     assert!(ea.cdata_blob.is_none());
     assert!(eb.cdata_blob.is_none());
@@ -2076,11 +2139,29 @@ fn codec_hit_deflated_jar_is_bit_identical_without_cdata_blob() {
 }
 
 #[test]
+fn stored_block_deflate_is_stored_codec_hit() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("stored-hit.jar");
+    let payload = vec![b'a'; 256];
+    write_stored_block_deflate_zip(&jar, "a.txt", &payload);
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    let e = &m.jars[0].entries[0];
+    assert!(e.cdata_blob.is_none());
+    assert_eq!(e.cdata_codec.as_deref(), Some("deflate-raw:stored"));
+    assert!(m.jars[0].exact_restore());
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_bit_identical(&jar, &dest.join("stored-hit.jar"));
+}
+
+#[test]
 fn codec_miss_rebuilds_valid_zip_keeping_extras() {
     let dir = tempfile::tempdir().unwrap();
     let jar = dir.path().join("miss.jar");
     let payload = vec![b'a'; 256];
-    write_stored_block_deflate_zip(&jar, "a.txt", &payload);
+    write_unknown_deflate_zip(&jar, "a.txt", &payload);
     let src = fs::read(&jar).unwrap();
     let out = dir.path().join("out.ayz");
     let summary = dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
@@ -2113,7 +2194,7 @@ fn codec_miss_with_prefix_rebuilds() {
     let dir = tempfile::tempdir().unwrap();
     let jar = dir.path().join("prefixed-miss.jar");
     let payload = vec![b'a'; 256];
-    write_stored_block_deflate_wrapped(&jar, SPRING_LAUNCHER, "a.txt", &payload);
+    write_unknown_deflate_wrapped(&jar, SPRING_LAUNCHER, "a.txt", &payload);
     let out = dir.path().join("out.ayz");
     dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
     let m = manifest_from_records(&read_archive(&out).2);
@@ -2126,6 +2207,41 @@ fn codec_miss_with_prefix_rebuilds() {
     let got = fs::read(&restored).unwrap();
     assert_eq!(&got[..SPRING_LAUNCHER.len()], SPRING_LAUNCHER);
     assert_ne!(fs::read(&jar).unwrap(), got);
+}
+
+#[test]
+fn per_entry_miss_keeps_sibling_codec() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("mixed-codec.jar");
+    let hit = vec![b'h'; 128];
+    let miss = vec![b'm'; 256];
+    write_codec_hit_plus_unknown_deflate(&jar, "hit.txt", &hit, "miss.txt", &miss);
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    let hit_e = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.name == "hit.txt")
+        .expect("hit");
+    let miss_e = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.name == "miss.txt")
+        .expect("miss");
+    assert_eq!(hit_e.cdata_codec.as_deref(), Some("deflate-raw:flate2:6"));
+    assert!(hit_e.cdata_blob.is_none());
+    assert!(miss_e.cdata_codec.is_none());
+    assert!(miss_e.cdata_blob.is_none());
+    assert!(m.jars[0].metadata_rebuild());
+    assert!(!m.jars[0].exact_restore());
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_functional_identity(&jar, &dest.join("mixed-codec.jar"));
+    assert_ne!(
+        fs::read(&jar).unwrap(),
+        fs::read(dest.join("mixed-codec.jar")).unwrap()
+    );
 }
 
 #[test]
@@ -2207,22 +2323,33 @@ fn maven_empty_deflate_dir_does_not_force_cdata_blob() {
     let out = dir.path().join("out.ayz");
     let summary = dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
     let m = manifest_from_records(&read_archive(&out).2);
+    let file = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.name == "a.txt")
+        .expect("file");
+    let dir_ent = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.is_dir || e.name.ends_with('/'))
+        .expect("dir");
     for e in &m.jars[0].entries {
         assert!(
             e.cdata_blob.is_none(),
             "{} must not store cdata_blob just because dirs are empty DEFLATE",
             e.name
         );
-        assert!(e.cdata_codec.is_none());
     }
-    assert!(m.jars[0].metadata_rebuild());
+    assert_eq!(file.cdata_codec.as_deref(), Some("deflate-raw:stored"));
+    assert_eq!(dir_ent.cdata_codec.as_deref(), Some("deflate-raw:flate2:6"));
+    assert!(m.jars[0].bit_identical_restore());
     assert!(
         summary.bytes_unique_blobs < summary.bytes_in_jars + 4096,
         "empty-deflate dirs must not store a second copy of every file payload"
     );
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
-    assert_functional_identity(&jar, &dest.join("maven-dirs.jar"));
+    assert_bit_identical(&jar, &dest.join("maven-dirs.jar"));
 }
 
 #[test]
@@ -2253,7 +2380,7 @@ fn class4_miss_plus_dir_cdata_rebuilds_empty_store_dir() {
         dir_ent.cdata_blob.is_none(),
         "class 4 dir-with-cdata must not store cdata_blob"
     );
-    assert!(file.cdata_codec.is_none());
+    assert_eq!(file.cdata_codec.as_deref(), Some("deflate-raw:stored"));
     assert!(dir_ent.cdata_codec.is_none());
     assert!(m.jars[0].raw_zip_blob.is_none());
     assert!(m.jars[0].metadata_rebuild());
@@ -2330,7 +2457,7 @@ fn signed_rebuild_is_not_exact_restore() {
     let dir = tempfile::tempdir().unwrap();
     let jar = dir.path().join("signed-miss.jar");
     let payload = vec![b'a'; 256];
-    write_stored_block_deflate_zip(&jar, "META-INF/FOO.SF", &payload);
+    write_unknown_deflate_zip(&jar, "META-INF/FOO.SF", &payload);
     let out = dir.path().join("out.ayz");
     let summary = dehydrate(&opts(&out, vec![jar])).unwrap();
     assert_eq!(summary.signed_jars, vec!["signed-miss.jar".to_string()]);
@@ -2353,4 +2480,168 @@ fn shebang_without_zip_is_still_not_zip_on_dehydrate() {
         matches!(err, AyzenpackError::NotZip { .. }),
         "#! without a zip must be NotZip, got {err:?}"
     );
+}
+
+#[test]
+fn zlib_rs_classic_matt_cli_source_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let jars = dir.path().join("jars");
+    fs::create_dir_all(&jars).unwrap();
+    let jar = jars.join("zlib.jar");
+    let payload = b"zlib-rs classic fixture payload for 0.2.4".repeat(8);
+    write_zlib_deflate_zip(&jar, "a.txt", &payload);
+    let src = fs::read(&jar).unwrap();
+    let pack = dir.path().join("out.ayz");
+    matt_dehydrate(&pack, &jars);
+    let m = ayzenpack::list(&pack).unwrap();
+    let e = &m.jars[0].entries[0];
+    assert!(e.cdata_blob.is_none());
+    assert_eq!(e.cdata_codec.as_deref(), Some("deflate-raw:zlib:6"));
+    assert!(m.jars[0].bit_identical_restore());
+    verify(&pack).unwrap();
+    matt_rehydrate(&pack);
+    assert_eq!(fs::read(&jar).unwrap(), src);
+    assert_eq!(m.jars[0].source_size, src.len() as u64);
+}
+
+#[test]
+fn leading_pad_pk_decoy_matt_cli_source_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let jars = dir.path().join("jars");
+    fs::create_dir_all(&jars).unwrap();
+    let jar = jars.join("lead.jar");
+    write_leading_pad_pk_decoy_zip(&jar, "a.txt", b"leading-pad-plain");
+    let src = fs::read(&jar).unwrap();
+    assert_eq!(&src[..4], b"PK\x03\x04");
+    let pack = dir.path().join("out.ayz");
+    matt_dehydrate(&pack, &jars);
+    let m = ayzenpack::list(&pack).unwrap();
+    assert_eq!(m.jars[0].prefix_size.unwrap_or(0), 0);
+    assert!(m.jars[0].leading_pad_blob.is_some());
+    assert!(m.jars[0].leading_pad_size.unwrap_or(0) > 0);
+    assert!(m.jars[0].tail_blob.is_some());
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    for e in &m.jars[0].entries {
+        assert!(e.cdata_blob.is_none());
+    }
+    let first_oh = m.jars[0].entries[0].offsetheader.expect("offsetheader");
+    assert_eq!(m.jars[0].leading_pad_size, Some(first_oh));
+    assert!(m.jars[0].bit_identical_restore());
+    verify(&pack).unwrap();
+    matt_rehydrate(&pack);
+    assert_eq!(fs::read(&jar).unwrap(), src);
+}
+
+#[test]
+fn store_nested_zipa_matt_cli_zip_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let jars = dir.path().join("jars");
+    fs::create_dir_all(&jars).unwrap();
+    let jar = jars.join("app.jar");
+    write_fat_spring_store_nested_zipa_jar(&jar);
+    let src = fs::read(&jar).unwrap();
+    let pack = dir.path().join("out.ayz");
+    matt_dehydrate(&pack, &jars);
+    let m = ayzenpack::list(&pack).unwrap();
+    for e in m.jars[0]
+        .entries
+        .iter()
+        .filter(|e| e.name.starts_with("BOOT-INF/lib/"))
+    {
+        assert!(e.blob.is_none());
+        assert!(e.zip_index.is_some());
+        assert!(e.cdata_blob.is_none());
+    }
+    assert!(m.jars[0].bit_identical_restore());
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    verify(&pack).unwrap();
+    matt_rehydrate(&pack);
+    assert_eq!(fs::read(&jar).unwrap(), src);
+}
+
+#[test]
+fn skip_exact_outer_explodes_store_inner() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("overlap-nested.jar");
+    write_overlapping_local_plus_store_nested(&jar);
+    let mut z = ZipArchive::new(File::open(&jar).unwrap()).unwrap();
+    let mut inner = Vec::new();
+    z.by_name("lib/inner.jar")
+        .unwrap()
+        .read_to_end(&mut inner)
+        .unwrap();
+    drop(z);
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let records = read_archive(&out).2;
+    let m = manifest_from_records(&records);
+    assert!(m.jars[0].tail_blob.is_none());
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    let e = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.name == "lib/inner.jar")
+        .expect("inner");
+    assert!(e.blob.is_none());
+    assert!(e.zip_index.is_some());
+    let inner_hex = ayzenpack::hashutil::hex_lower(&blake3_bytes(&inner));
+    assert!(!m.blobs.iter().any(|b| b.blake3 == inner_hex));
+    let payloads = blob_payloads(&records);
+    let idx = e.zip_index.expect("zip_index");
+    let got = ayzenpack::reconstruct_child_zip(
+        &m.jars[0].nestedindexes[idx],
+        e.uncompressed_size,
+        |hex| {
+            let h = ayzenpack::hashutil::parse_blake3_hex(hex).unwrap();
+            Ok(payloads.get(&h).cloned().expect(hex))
+        },
+    )
+    .unwrap();
+    assert_eq!(got, inner);
+    verify(&out).unwrap();
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert!(dest.join("overlap-nested.jar").is_file());
+}
+
+#[test]
+fn sort_inputs_jobs_1_eq_jobs_n_store_nested_fat() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("app.jar");
+    write_fat_spring_store_nested_zipa_jar(&jar);
+    let out1 = dir.path().join("j1.ayz");
+    let outn = dir.path().join("jn.ayz");
+    let mut o1 = opts(&out1, vec![jar.clone()]);
+    o1.sort_inputs = true;
+    o1.jobs = 1;
+    o1.quiet = true;
+    let mut on = opts(&outn, vec![jar]);
+    on.sort_inputs = true;
+    on.jobs = 4;
+    on.quiet = true;
+    dehydrate(&o1).unwrap();
+    dehydrate(&on).unwrap();
+    assert_eq!(
+        fs::read(&out1).unwrap(),
+        fs::read(&outn).unwrap(),
+        "STORE-nested fat packs must be byte-identical at jobs=1 and jobs=N"
+    );
+}
+
+#[test]
+fn v023_tiny_pack_still_reads() {
+    let pack = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/v0.2.3-tiny.ayz");
+    assert!(
+        pack.is_file(),
+        "check in testdata/v0.2.3-tiny.ayz (0.2.3 pack, not an in-memory Manifest)"
+    );
+    verify(&pack).unwrap();
+    let m = ayzenpack::list(&pack).unwrap();
+    assert_eq!(m.format, "ayzenpack-manifest");
+    assert!(!m.jars.is_empty());
+    let dir = tempfile::tempdir().unwrap();
+    rehydrate(&rehydrate_opts(&pack, dir.path())).unwrap();
+    for jar in &m.jars {
+        assert!(dir.path().join(&jar.name).is_file());
+    }
 }

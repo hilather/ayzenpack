@@ -22,6 +22,7 @@ use crate::exact::{
 use crate::format::{decode_payload, open_ayz_layout, read_record, Record};
 use crate::hashutil::{blake3_bytes, hash_reader, hex_lower, parse_blake3_hex, parse_hex};
 use crate::manifest::{Entry, Jar, Manifest, MANIFEST_FORMAT};
+use crate::reconstruct::reconstruct_child_zip;
 use crate::scan::ZipView;
 
 const DEFAULT_DEFLATE_LEVEL: i32 = 6;
@@ -454,6 +455,22 @@ fn write_exact_jar(jar: &Jar, cas_dir: &Path, dest: &Path, apply_prefix_chmod: b
         path: Some(dest.to_path_buf()),
     })?;
     let prefix_len = write_prefix(jar, cas_dir, dest, &mut file)?;
+    if let Some(hex) = &jar.leading_pad_blob {
+        let pad = read_named_blob(cas_dir, hex, &format!("{} leading_pad", jar.name))?;
+        if let Some(sz) = jar.leading_pad_size {
+            if pad.len() as u64 != sz {
+                return Err(AyzenpackError::HashMismatch(format!(
+                    "{} leading_pad size: recorded {sz} computed {}",
+                    jar.name,
+                    pad.len()
+                )));
+            }
+        }
+        file.write_all(&pad).map_err(|source| AyzenpackError::Io {
+            source,
+            path: Some(dest.to_path_buf()),
+        })?;
+    }
 
     if let (Some(hex), Some(sz)) = (&jar.raw_zip_blob, jar.raw_zip_size) {
         let bytes = read_named_blob(cas_dir, hex, &format!("{} raw_zip", jar.name))?;
@@ -529,12 +546,6 @@ fn write_exact_entry(
     dest: &Path,
     prefix_len: u64,
 ) -> Result<()> {
-    let off = e.local_header_offset.ok_or_else(|| {
-        AyzenpackError::FormatOwned(format!(
-            "missing local_header_offset for {}!{}",
-            jar.name, e.name
-        ))
-    })?;
     let header = load_local_header(jar, e, cas_dir)?;
     let cdata = resolve_cdata(jar, e, cas_dir, false)?;
     let desc = match &e.data_descriptor_hex {
@@ -542,9 +553,19 @@ fn write_exact_entry(
         None => Vec::new(),
     };
 
-    let pos = prefix_len.checked_add(off).ok_or_else(|| {
-        AyzenpackError::FormatOwned(format!("{}!{} seek overflow", jar.name, e.name))
-    })?;
+    let pos = if let Some(oh) = e.offsetheader {
+        oh
+    } else {
+        let off = e.local_header_offset.ok_or_else(|| {
+            AyzenpackError::FormatOwned(format!(
+                "missing local_header_offset for {}!{}",
+                jar.name, e.name
+            ))
+        })?;
+        prefix_len.checked_add(off).ok_or_else(|| {
+            AyzenpackError::FormatOwned(format!("{}!{} seek overflow", jar.name, e.name))
+        })?
+    };
     file.seek(SeekFrom::Start(pos))
         .map_err(|source| AyzenpackError::Io {
             source,
@@ -575,14 +596,14 @@ fn resolve_cdata(jar: &Jar, e: &Entry, cas_dir: &Path, allow_rebuild: bool) -> R
     }
     if let Some(codec) = &e.cdata_codec {
         if !(allow_rebuild && e.is_dir) {
-            let level = deflate::parse_codec(codec)?;
-            // Empty DEFLATE directories have no content blob; encode `[]` at the recorded level.
+            let spec = deflate::parse_codec(codec)?;
+            // Empty DEFLATE directories have no content blob; encode `[]` at the recorded codec.
             let bytes = if e.is_dir && e.blob.is_none() {
                 Vec::new()
             } else {
                 read_entry_content(jar, e, cas_dir)?
             };
-            let out = deflate::deflate_raw(&bytes, level)?;
+            let out = deflate::encode_codec(spec, &bytes)?;
             if out.len() as u64 != e.compressed_size {
                 return Err(AyzenpackError::HashMismatch(format!(
                     "{}!{} cdata_codec size: recorded {} computed {}",
@@ -594,7 +615,8 @@ fn resolve_cdata(jar: &Jar, e: &Entry, cas_dir: &Path, allow_rebuild: bool) -> R
             }
             return Ok(out);
         }
-        // Legacy dir codecs are ignored on rebuild (CleanMiss omits them on new packs).
+        // Miss-jar rebuild may ignore dir codecs (hash may change). Exact jars
+        // take allow_rebuild=false and use the recorded codec.
     }
     if e.is_dir {
         if allow_rebuild && e.method_code == 8 && e.uncompressed_size == 0 {
@@ -634,6 +656,18 @@ fn rebuild_index_fields(e: &Entry) -> (u16, u32, u64) {
 }
 
 fn read_entry_content(jar: &Jar, e: &Entry, cas_dir: &Path) -> Result<Vec<u8>> {
+    if e.blob.is_some() && e.zip_index.is_some() {
+        return Err(AyzenpackError::FormatOwned(format!(
+            "{}!{} has both blob and zip_index",
+            jar.name, e.name
+        )));
+    }
+    if let Some(i) = e.zip_index {
+        let index = jar.nested_index(i)?;
+        return reconstruct_child_zip(index, e.uncompressed_size, |hex| {
+            read_named_blob(cas_dir, hex, &format!("{}!{} child", jar.name, e.name))
+        });
+    }
     let hex = e.blob.as_deref().ok_or_else(|| {
         AyzenpackError::FormatOwned(format!("missing blob for {}!{}", jar.name, e.name))
     })?;
@@ -917,16 +951,21 @@ fn write_jar(
             continue;
         }
 
-        let hex = e.blob.as_deref().ok_or_else(|| {
-            AyzenpackError::FormatOwned(format!("missing blob for {}!{}", jar.name, e.name))
-        })?;
-        let hash = parse_blake3_hex(hex)?;
-        let bytes = read_cas_blob(cas_dir, &hash)?;
-        if blake3_bytes(&bytes) != hash {
-            return Err(AyzenpackError::HashMismatch(format!(
-                "{}!{} blake3",
+        if e.blob.is_some() && e.zip_index.is_some() {
+            return Err(AyzenpackError::FormatOwned(format!(
+                "{}!{} has both blob and zip_index",
                 jar.name, e.name
             )));
+        }
+        let bytes = read_entry_content(jar, e, cas_dir)?;
+        if let Some(hex) = e.blob.as_deref() {
+            let hash = parse_blake3_hex(hex)?;
+            if blake3_bytes(&bytes) != hash {
+                return Err(AyzenpackError::HashMismatch(format!(
+                    "{}!{} blake3",
+                    jar.name, e.name
+                )));
+            }
         }
         let recomputed = crc32fast::hash(&bytes);
         if recomputed != e.crc32 {
@@ -1120,6 +1159,9 @@ mod tests {
             tail_size: None,
             raw_zip_blob: None,
             raw_zip_size: None,
+            leading_pad_blob: None,
+            leading_pad_size: None,
+            nestedindexes: Vec::new(),
             entries: Vec::new(),
         }
     }
@@ -1148,5 +1190,21 @@ mod tests {
         create_parent_dirs_0755(&dest).unwrap();
         assert!(dest.parent().unwrap().is_dir());
         create_parent_dirs_0755(&dest).unwrap();
+    }
+
+    #[test]
+    fn both_blob_and_zip_index_is_refused() {
+        let jar = jar_restore("/abs/a.jar");
+        let e = Entry {
+            name: "lib/inner.jar".into(),
+            blob: Some("aa".repeat(32)),
+            zip_index: Some(0),
+            ..Entry::default()
+        };
+        let err = read_entry_content(&jar, &e, Path::new("/tmp")).unwrap_err();
+        assert!(
+            matches!(err, AyzenpackError::FormatOwned(ref s) if s.contains("both blob and zip_index")),
+            "{err}"
+        );
     }
 }

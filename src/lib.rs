@@ -5,6 +5,7 @@ mod deflate;
 pub mod dehydrate;
 pub mod error;
 mod exact;
+mod reconstruct;
 pub mod format;
 pub mod hashutil;
 pub mod manifest;
@@ -16,6 +17,7 @@ pub use dehydrate::{dehydrate, DehydrateOptions, DehydrateSummary};
 pub use error::{AyzenpackError, Result};
 pub use format::{FileHeader, Record, Trailer};
 pub use manifest::Manifest;
+pub use reconstruct::reconstruct_child_zip;
 pub use rehydrate::{rehydrate, RehydrateOptions};
 
 use std::collections::HashMap;
@@ -24,7 +26,7 @@ use std::path::Path;
 
 use crate::format::{read_ayz_file, read_manifest_records};
 use crate::hashutil::{blake3_bytes, hex_lower, parse_blake3_hex, sha256_bytes};
-use crate::manifest::MANIFEST_FORMAT;
+use crate::manifest::{Entry, NestedIndex, MANIFEST_FORMAT};
 
 fn open_ayz(input: &Path) -> Result<(FileHeader, Trailer, Vec<Record>)> {
     let mut file = File::open(input).map_err(|source| AyzenpackError::Io {
@@ -155,73 +157,184 @@ pub fn verify(input: &Path) -> Result<()> {
             }
         }
         for (hex, sz, label) in [
+            (jar.leading_pad_blob.as_deref(), jar.leading_pad_size, "leading_pad"),
             (jar.tail_blob.as_deref(), jar.tail_size, "tail"),
             (jar.raw_zip_blob.as_deref(), jar.raw_zip_size, "raw_zip"),
         ] {
-            if let Some(hex) = hex {
-                let hash = parse_blake3_hex(hex)?;
-                let data = payloads.get(&hash).ok_or_else(|| {
-                    AyzenpackError::HashMismatch(format!(
-                        "missing {label} blob {} for {}",
-                        hex_prefix(&hash),
-                        jar.name
-                    ))
-                })?;
-                if let Some(sz) = sz {
-                    if data.len() as u64 != sz {
-                        return Err(AyzenpackError::HashMismatch(format!(
-                            "{label} blob {} {} size",
-                            hex_prefix(&hash),
-                            jar.name
-                        )));
-                    }
-                }
-            }
+            require_sized_blob(&payloads, hex, sz, label, &jar.name)?;
         }
         for e in &jar.entries {
-            if !e.is_dir {
-                let hex = e.blob.as_deref().ok_or_else(|| {
-                    AyzenpackError::HashMismatch(format!("{}!{} missing blob id", jar.name, e.name))
-                })?;
-                let hash = parse_blake3_hex(hex)?;
-                let data = payloads.get(&hash).ok_or_else(|| {
-                    AyzenpackError::HashMismatch(format!(
-                        "missing blob {} for {}!{}",
-                        hex_prefix(&hash),
-                        jar.name,
-                        e.name
-                    ))
-                })?;
-                let crc = crc32fast::hash(data);
-                if crc != e.crc32 {
-                    return Err(AyzenpackError::HashMismatch(format!(
-                        "blob {} {}!{} crc32",
-                        hex_prefix(&hash),
-                        jar.name,
-                        e.name
-                    )));
-                }
-            }
-            for hex in [
-                e.cdata_blob.as_deref(),
-                e.local_header_blob.as_deref(),
-                e.pad_blob.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                let h = parse_blake3_hex(hex)?;
-                if !payloads.contains_key(&h) {
-                    return Err(AyzenpackError::HashMismatch(format!(
-                        "missing blob {} for {}!{}",
-                        hex_prefix(&h),
-                        jar.name,
-                        e.name
-                    )));
-                }
-            }
+            verify_entry(&payloads, &jar.name, e, Some(jar))?;
+        }
+        for (i, nested) in jar.nestedindexes.iter().enumerate() {
+            verify_nested_index(&payloads, &jar.name, i, nested)?;
         }
     }
 
+    Ok(())
+}
+
+fn require_sized_blob(
+    payloads: &HashMap<[u8; 32], Vec<u8>>,
+    hex: Option<&str>,
+    sz: Option<u64>,
+    label: &str,
+    jar_name: &str,
+) -> Result<()> {
+    let Some(hex) = hex else {
+        return Ok(());
+    };
+    let hash = parse_blake3_hex(hex)?;
+    let data = payloads.get(&hash).ok_or_else(|| {
+        AyzenpackError::HashMismatch(format!(
+            "missing {label} blob {} for {}",
+            hex_prefix(&hash),
+            jar_name
+        ))
+    })?;
+    if let Some(sz) = sz {
+        if data.len() as u64 != sz {
+            return Err(AyzenpackError::HashMismatch(format!(
+                "{label} blob {} {} size",
+                hex_prefix(&hash),
+                jar_name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn require_present_blob(
+    payloads: &HashMap<[u8; 32], Vec<u8>>,
+    hex: &str,
+    jar_name: &str,
+    entry_name: &str,
+) -> Result<[u8; 32]> {
+    let hash = parse_blake3_hex(hex)?;
+    if !payloads.contains_key(&hash) {
+        return Err(AyzenpackError::HashMismatch(format!(
+            "missing blob {} for {}!{}",
+            hex_prefix(&hash),
+            jar_name,
+            entry_name
+        )));
+    }
+    Ok(hash)
+}
+
+fn verify_entry(
+    payloads: &HashMap<[u8; 32], Vec<u8>>,
+    jar_name: &str,
+    e: &Entry,
+    jar: Option<&crate::manifest::Jar>,
+) -> Result<()> {
+    if e.blob.is_some() && e.zip_index.is_some() {
+        return Err(AyzenpackError::FormatOwned(format!(
+            "{}!{} has both blob and zip_index",
+            jar_name, e.name
+        )));
+    }
+    if let Some(i) = e.zip_index {
+        let Some(jar) = jar else {
+            return Err(AyzenpackError::FormatOwned(format!(
+                "{}!{} nested zip_index past depth 1 is not supported",
+                jar_name, e.name
+            )));
+        };
+        let index = jar.nested_index(i)?;
+        let bytes = reconstruct_child_zip(index, e.uncompressed_size, |hex| {
+            let hash = parse_blake3_hex(hex)?;
+            payloads.get(&hash).cloned().ok_or_else(|| {
+                AyzenpackError::HashMismatch(format!(
+                    "missing blob {} for {}!{}",
+                    hex_prefix(&hash),
+                    jar_name,
+                    e.name
+                ))
+            })
+        })?;
+        if bytes.len() as u64 != e.uncompressed_size {
+            return Err(AyzenpackError::HashMismatch(format!(
+                "{}!{} zip_index size: recorded {} computed {}",
+                jar_name,
+                e.name,
+                e.uncompressed_size,
+                bytes.len()
+            )));
+        }
+        let crc = crc32fast::hash(&bytes);
+        if crc != e.crc32 {
+            return Err(AyzenpackError::HashMismatch(format!(
+                "{}!{} zip_index crc32",
+                jar_name, e.name
+            )));
+        }
+    } else if !e.is_dir {
+        let hex = e.blob.as_deref().ok_or_else(|| {
+            AyzenpackError::HashMismatch(format!("{}!{} missing blob id", jar_name, e.name))
+        })?;
+        let hash = parse_blake3_hex(hex)?;
+        let data = payloads.get(&hash).ok_or_else(|| {
+            AyzenpackError::HashMismatch(format!(
+                "missing blob {} for {}!{}",
+                hex_prefix(&hash),
+                jar_name,
+                e.name
+            ))
+        })?;
+        let crc = crc32fast::hash(data);
+        if crc != e.crc32 {
+            return Err(AyzenpackError::HashMismatch(format!(
+                "blob {} {}!{} crc32",
+                hex_prefix(&hash),
+                jar_name,
+                e.name
+            )));
+        }
+    }
+    for hex in [
+        e.cdata_blob.as_deref(),
+        e.local_header_blob.as_deref(),
+        e.pad_blob.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        require_present_blob(payloads, hex, jar_name, &e.name)?;
+    }
+    Ok(())
+}
+
+fn verify_nested_index(
+    payloads: &HashMap<[u8; 32], Vec<u8>>,
+    jar_name: &str,
+    i: usize,
+    nested: &NestedIndex,
+) -> Result<()> {
+    let label = format!("{jar_name} nestedindexes[{i}]");
+    require_sized_blob(
+        payloads,
+        nested.prefix_blob.as_deref(),
+        nested.prefix_size,
+        "prefix",
+        &label,
+    )?;
+    require_sized_blob(
+        payloads,
+        nested.leading_pad_blob.as_deref(),
+        nested.leading_pad_size,
+        "leading_pad",
+        &label,
+    )?;
+    require_sized_blob(
+        payloads,
+        nested.tail_blob.as_deref(),
+        nested.tail_size,
+        "tail",
+        &label,
+    )?;
+    for e in &nested.entries {
+        verify_entry(payloads, &label, e, None)?;
+    }
     Ok(())
 }

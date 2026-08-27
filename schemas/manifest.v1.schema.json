@@ -91,6 +91,28 @@
         "tail_size": { "type": "integer", "minimum": 0 },
         "raw_zip_blob": { "$ref": "#/$defs/hex64" },
         "raw_zip_size": { "type": "integer", "minimum": 0 },
+        "leading_pad_blob": { "$ref": "#/$defs/hex64" },
+        "leading_pad_size": { "type": "integer", "minimum": 0 },
+        "nestedindexes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nestedindex" }
+        },
+        "entries": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/entry" }
+        }
+      }
+    },
+    "nestedindex": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "prefix_blob": { "$ref": "#/$defs/hex64" },
+        "prefix_size": { "type": "integer", "minimum": 0 },
+        "leading_pad_blob": { "$ref": "#/$defs/hex64" },
+        "leading_pad_size": { "type": "integer", "minimum": 0 },
+        "tail_blob": { "$ref": "#/$defs/hex64" },
+        "tail_size": { "type": "integer", "minimum": 0 },
         "entries": {
           "type": "array",
           "items": { "$ref": "#/$defs/entry" }
@@ -133,14 +155,17 @@
         "cdata_blob": { "$ref": "#/$defs/hex64" },
         "cdata_codec": {
           "type": "string",
-          "pattern": "^deflate-raw:flate2:[1369]$"
+          "pattern": "^deflate-raw:(flate2:[1369]|zlib:[169]|stored)$"
         },
         "local_header_offset": { "type": "integer", "minimum": 0 },
         "local_header_hex": { "type": "string", "pattern": "^([0-9a-f]{2})+$" },
         "local_header_blob": { "$ref": "#/$defs/hex64" },
         "data_descriptor_hex": { "type": "string", "pattern": "^([0-9a-f]{2})+$" },
         "pad_zeros": { "type": "integer", "minimum": 1 },
-        "pad_blob": { "$ref": "#/$defs/hex64" }
+        "pad_blob": { "$ref": "#/$defs/hex64" },
+        "offsetheader": { "type": "integer", "minimum": 0 },
+        "data_start": { "type": "integer", "minimum": 0 },
+        "zip_index": { "type": "integer", "minimum": 0 }
       }
     }
   }

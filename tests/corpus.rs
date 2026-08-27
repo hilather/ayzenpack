@@ -557,6 +557,30 @@ fn corpus_mix_regular_and_spring_whole_file_hashes() {
                 "Zip64 fat bit-identical must be splice, not raw_zip"
             );
             assert!(hashes_eq, "Zip64 nested-lib fat whole-file hash must match");
+            for e in &jar.entries {
+                if e.name.starts_with("BOOT-INF/lib/") {
+                    assert!(
+                        e.zip_index.is_none(),
+                        "DEFLATE-wrapped Zip64 nested must stay opaque"
+                    );
+                    assert!(e.blob.is_some());
+                }
+            }
+        }
+        for e in &jar.entries {
+            if let Some(_) = e.zip_index {
+                assert!(e.blob.is_none());
+                let src_jar = PathBuf::from(&jar.source_path);
+                let mut z = ZipArchive::new(File::open(&src_jar).unwrap()).unwrap();
+                let mut inner = Vec::new();
+                z.by_name(&e.name).unwrap().read_to_end(&mut inner).unwrap();
+                let inner_hex = hex_lower(&ayzenpack::hashutil::blake3_bytes(&inner));
+                assert!(
+                    !manifest.blobs.iter().any(|b| b.blake3 == inner_hex),
+                    "blake3(inner zip) must not be in blobs[] for STORE zip_index {}",
+                    e.name
+                );
+            }
         }
         if jar.bit_identical_restore() {
             assert!(
@@ -572,14 +596,24 @@ fn corpus_mix_regular_and_spring_whole_file_hashes() {
             "{} hash mismatch must be metadata_rebuild (got neither exact nor rebuild)",
             jar.name
         );
-        let proven_miss = jar.entries.iter().all(|e| {
-            e.is_dir || e.method_code != 8 || (e.cdata_codec.is_none() && e.cdata_blob.is_none())
-        });
+        let has_method8_file = jar.entries.iter().any(|e| !e.is_dir && e.method_code == 8);
+        let has_miss = jar
+            .entries
+            .iter()
+            .any(|e| !e.is_dir && e.method_code == 8 && e.cdata_codec.is_none());
         assert!(
-            proven_miss,
-            "{} is not bit-identical but a method-8 file still has cdata_codec/cdata_blob (codec not proven miss)",
+            !has_method8_file || has_miss,
+            "{} is not bit-identical but every method-8 file has a codec (no proven miss)",
             jar.name
         );
+        for e in &jar.entries {
+            assert!(
+                e.cdata_blob.is_none(),
+                "{}!{} must not write cdata_blob on a rebuild jar",
+                jar.name,
+                e.name
+            );
+        }
         assert_functional_identity(&src, &dest);
         if jar.prefix_size.unwrap_or(0) > 0 {
             let dest_bytes = fs::read(&dest).unwrap();
@@ -629,4 +663,73 @@ fn corpus_mix_regular_and_spring_whole_file_hashes() {
         summary.output_len,
         MIX_V019_BYTES * 115 / 100
     );
+}
+
+#[test]
+fn corpus_lucene_jackson_source_identity_only_when_every_slot_hits() {
+    let Some(corpus) = corpus_dir() else {
+        eprintln!(
+            "skipping corpus_lucene_jackson_source_identity_only_when_every_slot_hits: AYZENPACK_CORPUS_DIR not set"
+        );
+        return;
+    };
+    let names: Vec<String> = artifacts()
+        .into_iter()
+        .filter_map(|a| a.get("dest")?.as_str().map(str::to_string))
+        .filter(|n| n.starts_with("lucene-") || n.starts_with("jackson-"))
+        .collect();
+    assert!(!names.is_empty(), "lockfile must list lucene/jackson");
+    let tmp = tempfile::tempdir().unwrap();
+    let inputs: Vec<PathBuf> = names
+        .iter()
+        .map(|n| {
+            let p = corpus.join(n);
+            assert!(p.is_file(), "missing {}", p.display());
+            p
+        })
+        .collect();
+    let out = tmp.path().join("lj.ayz");
+    let restored = tmp.path().join("restored");
+    dehydrate(&dehydrate_opts(&out, inputs)).unwrap();
+    verify(&out).unwrap();
+    rehydrate(&rehydrate_opts(&out, &restored)).unwrap();
+    let manifest = list(&out).unwrap();
+    for jar in &manifest.jars {
+        let mut method8 = 0u64;
+        let mut flate2 = 0u64;
+        let mut zlib = 0u64;
+        let mut stored = 0u64;
+        let mut miss = 0u64;
+        for e in &jar.entries {
+            if e.is_dir || e.method_code != 8 {
+                continue;
+            }
+            method8 += 1;
+            match e.cdata_codec.as_deref() {
+                Some(c) if c.starts_with("deflate-raw:flate2:") => flate2 += 1,
+                Some(c) if c.starts_with("deflate-raw:zlib:") => zlib += 1,
+                Some("deflate-raw:stored") => stored += 1,
+                Some(_) | None => miss += 1,
+            }
+        }
+        println!(
+            "lucene/jackson {} method8={} flate2={} zlib={} stored={} miss={} exact={}",
+            jar.name,
+            method8,
+            flate2,
+            zlib,
+            stored,
+            miss,
+            jar.bit_identical_restore()
+        );
+        if !jar.bit_identical_restore() {
+            continue;
+        }
+        let src = PathBuf::from(&jar.source_path);
+        let dest = restored.join(&jar.name);
+        let (src_b3, src_sha) = hash_reader(File::open(&src).unwrap()).unwrap();
+        let (dest_b3, dest_sha) = hash_reader(File::open(&dest).unwrap()).unwrap();
+        assert_eq!(hex_lower(&src_b3), hex_lower(&dest_b3), "{}", jar.name);
+        assert_eq!(hex_lower(&src_sha), hex_lower(&dest_sha), "{}", jar.name);
+    }
 }

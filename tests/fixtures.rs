@@ -608,8 +608,7 @@ pub fn write_signed_looking_jar(path: &Path) {
     );
 }
 
-/// Raw stored-block DEFLATE (RFC 1951). miniz_oxide levels 1/3/6/9 will not match
-/// this for a compressible payload (repeated bytes).
+/// Raw stored-block DEFLATE (RFC 1951). After 0.2.4 this is a `deflate-raw:stored` hit.
 pub fn raw_stored_deflate(plain: &[u8]) -> Vec<u8> {
     let len = u16::try_from(plain.len()).expect("stored-block fixture payload fits u16");
     let mut out = vec![0x01];
@@ -683,41 +682,42 @@ fn write_locals_and_cd(path: &Path, entries: &[BuiltLocal]) {
     std::fs::write(path, local).unwrap();
 }
 
-/// Compressible payload + stored-block DEFLATE. Built from a ZipWriter template
-/// so zip 2.4 can find the EOCD; only the bitstream and sizes change.
-pub fn write_stored_block_deflate_zip(path: &Path, name: &str, data: &[u8]) {
-    let tmp = path.with_extension("tpl.jar");
-    {
-        let mut z = ZipWriter::new(File::create(&tmp).unwrap());
-        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-        z.start_file(name, opts).unwrap();
-        z.write_all(data).unwrap();
-        z.finish().unwrap();
-    }
-    let tpl = std::fs::read(&tmp).unwrap();
-    std::fs::remove_file(&tmp).unwrap();
-    let patched = replace_first_cdata_with_stored_block(&tpl, data);
-    std::fs::write(path, patched).unwrap();
+/// zlib-rs raw/nowrap DEFLATE (`window_bits = -15`).
+pub fn zlib_raw_deflate(data: &[u8], level: u32) -> Vec<u8> {
+    use zlib_rs::{compress_bound, compress_slice, DeflateConfig, ReturnCode};
+    let mut cfg = DeflateConfig::new(level as i32);
+    cfg.window_bits = -15;
+    let bound = compress_bound(data.len()).max(16);
+    let mut buf = vec![0u8; bound];
+    let (out, rc) = compress_slice(&mut buf, data, cfg);
+    assert_eq!(rc, ReturnCode::Ok, "zlib-rs raw deflate level {level}");
+    out.to_vec()
 }
 
-fn replace_first_cdata_with_stored_block(zip: &[u8], plain: &[u8]) -> Vec<u8> {
+pub fn flate2_raw_deflate(data: &[u8], level: u32) -> Vec<u8> {
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    let mut enc = DeflateEncoder::new(Vec::new(), Compression::new(level));
+    enc.write_all(data).unwrap();
+    enc.finish().unwrap()
+}
+
+fn replace_first_cdata(zip: &[u8], new_cdata: &[u8]) -> Vec<u8> {
     assert_eq!(&zip[..4], b"PK\x03\x04");
     let name_len = u16::from_le_bytes([zip[26], zip[27]]) as usize;
     let extra_len = u16::from_le_bytes([zip[28], zip[29]]) as usize;
     let old_csize = u32::from_le_bytes(zip[18..22].try_into().unwrap()) as usize;
     let header_end = 30 + name_len + extra_len;
     let old_end = header_end + old_csize;
-    let new_cdata = raw_stored_deflate(plain);
     let delta = new_cdata.len() as i64 - old_csize as i64;
 
     let mut out = Vec::with_capacity((zip.len() as i64 + delta) as usize);
     out.extend_from_slice(&zip[..18]);
     out.extend_from_slice(&(new_cdata.len() as u32).to_le_bytes());
     out.extend_from_slice(&zip[22..header_end]);
-    out.extend_from_slice(&new_cdata);
+    out.extend_from_slice(new_cdata);
     out.extend_from_slice(&zip[old_end..]);
 
-    // Patch CD compressed size and EOCD CD offset.
     let eocd = {
         let mut i = out.len() - 22;
         loop {
@@ -733,6 +733,190 @@ fn replace_first_cdata_with_stored_block(zip: &[u8], plain: &[u8]) -> Vec<u8> {
     let i = new_cd as usize;
     out[i + 20..i + 24].copy_from_slice(&(new_cdata.len() as u32).to_le_bytes());
     out
+}
+
+fn write_deflate_cdata_zip(path: &Path, name: &str, data: &[u8], cdata: &[u8]) {
+    let tmp = path.with_extension("tpl.jar");
+    {
+        let mut z = ZipWriter::new(File::create(&tmp).unwrap());
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        z.start_file(name, opts).unwrap();
+        z.write_all(data).unwrap();
+        z.finish().unwrap();
+    }
+    let tpl = std::fs::read(&tmp).unwrap();
+    std::fs::remove_file(&tmp).unwrap();
+    std::fs::write(path, replace_first_cdata(&tpl, cdata)).unwrap();
+}
+
+/// DEFLATE member whose raw cdata is a zlib-rs bitstream (closed set {1,6,9}).
+pub fn write_zlib_deflate_zip(path: &Path, name: &str, data: &[u8]) {
+    let cdata = zlib_raw_deflate(data, 6);
+    write_deflate_cdata_zip(path, name, data, &cdata);
+}
+
+/// zlib-rs level 3: valid inflate, not in the closed codec set (true miss).
+pub fn write_unknown_deflate_zip(path: &Path, name: &str, data: &[u8]) {
+    let cdata = zlib_raw_deflate(data, 3);
+    write_deflate_cdata_zip(path, name, data, &cdata);
+}
+
+pub fn write_unknown_deflate_wrapped(path: &Path, launcher: &[u8], name: &str, data: &[u8]) {
+    let tmp = path.with_extension("inner.jar");
+    write_unknown_deflate_zip(&tmp, name, data);
+    let zip = std::fs::read(&tmp).unwrap();
+    std::fs::remove_file(&tmp).unwrap();
+    let mut out = launcher.to_vec();
+    out.extend_from_slice(&zip);
+    std::fs::write(path, out).unwrap();
+}
+
+/// Flate2-reproducible file plus a zlib-3 miss (Test 4).
+pub fn write_codec_hit_plus_unknown_deflate(
+    path: &Path,
+    hit_name: &str,
+    hit: &[u8],
+    miss_name: &str,
+    miss: &[u8],
+) {
+    write_locals_and_cd(
+        path,
+        &[
+            BuiltLocal {
+                name: hit_name.as_bytes().to_vec(),
+                method: 8,
+                crc: crc32fast::hash(hit),
+                uncomp: hit.len() as u32,
+                cdata: flate2_raw_deflate(hit, 6),
+                extra: Vec::new(),
+            },
+            BuiltLocal {
+                name: miss_name.as_bytes().to_vec(),
+                method: 8,
+                crc: crc32fast::hash(miss),
+                uncomp: miss.len() as u32,
+                cdata: zlib_raw_deflate(miss, 3),
+                extra: Vec::new(),
+            },
+        ],
+    );
+}
+
+/// File starts with `PK\x03\x04` garbage; first CD local is after that decoy.
+pub fn write_leading_pad_pk_decoy_zip(path: &Path, name: &str, data: &[u8]) {
+    let tmp = path.with_extension("inner.jar");
+    write_stored_zip(&tmp, &[(name, data, crc32fast::hash(data))]);
+    let zip = std::fs::read(&tmp).unwrap();
+    std::fs::remove_file(&tmp).unwrap();
+    let mut decoy = b"PK\x03\x04".to_vec();
+    decoy.extend_from_slice(&[0xAA; 28]);
+    let mut out = decoy.clone();
+    out.extend_from_slice(&zip);
+    adjust_self_extracting_offsets(&mut out, u32::try_from(decoy.len()).unwrap());
+    std::fs::write(path, out).unwrap();
+}
+
+/// Overlap (same local offset, two names) plus one STORE listable inner zip.
+pub fn write_overlapping_local_plus_store_nested(path: &Path) {
+    let inner_tmp = path.with_extension("inner.jar");
+    let inner_plain = b"nested-plain";
+    write_stored_zip(
+        &inner_tmp,
+        &[(
+            "n.txt",
+            inner_plain.as_slice(),
+            crc32fast::hash(inner_plain),
+        )],
+    );
+    let inner = std::fs::read(&inner_tmp).unwrap();
+    std::fs::remove_file(&inner_tmp).unwrap();
+    let same = b"SAME-payload";
+    write_stored_zip(
+        path,
+        &[
+            ("a.txt", same.as_slice(), crc32fast::hash(same)),
+            ("b.txt", same.as_slice(), crc32fast::hash(same)),
+            (
+                "lib/inner.jar",
+                inner.as_slice(),
+                crc32fast::hash(&inner),
+            ),
+        ],
+    );
+    let mut buf = std::fs::read(path).unwrap();
+    let eocd = {
+        let mut i = buf.len() - 22;
+        loop {
+            if buf[i..i + 4] == *b"PK\x05\x06" {
+                let comment_len = u16::from_le_bytes([buf[i + 20], buf[i + 21]]) as usize;
+                if i + 22 + comment_len == buf.len() {
+                    break i;
+                }
+            }
+            assert!(i > 0);
+            i -= 1;
+        }
+    };
+    let cd_size = u32::from_le_bytes(buf[eocd + 12..eocd + 16].try_into().unwrap()) as usize;
+    let cd_off = u32::from_le_bytes(buf[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+    let mut i = cd_off;
+    let cd_end = cd_off + cd_size;
+    let mut seen = 0u32;
+    while i + 46 <= cd_end {
+        assert_eq!(&buf[i..i + 4], b"PK\x01\x02");
+        let name_len = u16::from_le_bytes(buf[i + 28..i + 30].try_into().unwrap()) as usize;
+        let extra_len = u16::from_le_bytes(buf[i + 30..i + 32].try_into().unwrap()) as usize;
+        let comment_len = u16::from_le_bytes(buf[i + 32..i + 34].try_into().unwrap()) as usize;
+        if seen == 1 {
+            buf[i + 42..i + 46].copy_from_slice(&0u32.to_le_bytes());
+        }
+        seen += 1;
+        i += 46 + name_len + extra_len + comment_len;
+    }
+    std::fs::write(path, buf).unwrap();
+}
+
+pub fn ayzenpack_cmd() -> assert_cmd::Command {
+    assert_cmd::Command::cargo_bin("ayzenpack").unwrap()
+}
+
+pub fn matt_dehydrate(output: &Path, input: &Path) {
+    ayzenpack_cmd()
+        .args([
+            "dehydrate",
+            "--recursive",
+            "--sort-inputs",
+            "--restore-paths",
+            "-o",
+        ])
+        .arg(output)
+        .arg(input)
+        .assert()
+        .success();
+}
+
+pub fn matt_rehydrate(input: &Path) {
+    ayzenpack_cmd()
+        .args(["rehydrate", "--restore-paths", "-i"])
+        .arg(input)
+        .assert()
+        .success();
+}
+
+/// Compressible payload + stored-block DEFLATE. Built from a ZipWriter template
+/// so zip 2.4 can find the EOCD; only the bitstream and sizes change.
+pub fn write_stored_block_deflate_zip(path: &Path, name: &str, data: &[u8]) {
+    let tmp = path.with_extension("tpl.jar");
+    {
+        let mut z = ZipWriter::new(File::create(&tmp).unwrap());
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        z.start_file(name, opts).unwrap();
+        z.write_all(data).unwrap();
+        z.finish().unwrap();
+    }
+    let tpl = std::fs::read(&tmp).unwrap();
+    std::fs::remove_file(&tmp).unwrap();
+    std::fs::write(path, replace_first_cdata(&tpl, &raw_stored_deflate(data))).unwrap();
 }
 
 pub fn write_stored_block_deflate_wrapped(path: &Path, launcher: &[u8], name: &str, data: &[u8]) {
