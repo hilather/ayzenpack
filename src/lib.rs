@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cas;
+mod cd;
 mod deflate;
 pub mod dehydrate;
 pub mod error;
