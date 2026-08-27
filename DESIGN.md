@@ -330,7 +330,7 @@ Treat a `.ayz` as sensitive as the input JARs: it contains file contents and ori
 
 ## Non-goals (v2 / 0.2.1)
 
-- Recursively exploding nested JARs
+- Recursively exploding nested JARs (depth **> 1** / unlimited). Depth-1 STORE `zip_index` is intended 0.2.4, not this tree.
 - A `--verbatim` / `--exact-cdata` CLI flag
 - Java/zlib bit-identical whole-file hashes (Matt locked this out)
 - Dual `cdata_blob` + content; `raw_zip` of listed jars
