@@ -143,10 +143,29 @@ pub(crate) fn scan_from_bytes(bytes: &[u8], max_entry: u64) -> Result<Vec<Scanne
     let path = Path::new("<bytes>");
     let mut cur = Cursor::new(bytes);
     let layout = detect_zip_layout(path, &mut cur)?;
+    // Prefixed children already ran zip_archive_opens in detect_zip_layout.
+    // PK-start returns prefix_len=0 immediately; still require homemade CD
+    // count == ZipArchive::len() so a nested-EOCD latch is Err (opaque at probe).
+    // Do not require header_start == 0: a PK-start hole is leading_pad, not latch.
+    let homemade_n = if layout.prefix_len == 0 {
+        match find_cd_bounds(path, &mut cur, bytes.len() as u64) {
+            Ok((_, _, _, n)) => Some(n),
+            Err(err) => return Err(err),
+        }
+    } else {
+        None
+    };
     cur.seek(SeekFrom::Start(0))
         .map_err(|source| io_at(source, path))?;
     let reader = BufReader::with_capacity(ZIP_BUF, ZipView::new(cur, layout.view_shift));
     let mut archive = ZipArchive::new(reader).map_err(|err| map_archive_open_err(err, path))?;
+    if let Some(n) = homemade_n {
+        if archive.len() as u64 != n {
+            return Err(AyzenpackError::FormatOwned(
+                "child zip listing disagrees with homemade central directory count".into(),
+            ));
+        }
+    }
     let mut out = Vec::with_capacity(archive.len());
     for i in 0..archive.len() {
         let mut zf = archive
@@ -1390,5 +1409,64 @@ mod tests {
         cur.seek(SeekFrom::Start(0)).unwrap();
         let chosen = ZipArchive::new(ZipView::new(&mut cur, layout.view_shift)).unwrap();
         assert_eq!(chosen.len() as u64, outer);
+    }
+
+    /// Same STORE nested zip as `store_nested_fat(false)`, but the prefix starts
+    /// with `PK\x03\x04` so `detect_zip_layout` returns `prefix_len = 0`.
+    fn pk_start_unadjusted_store_nested_latch() -> Vec<u8> {
+        let (bytes, prefix) = store_nested_fat(false);
+        assert!(
+            prefix > 4,
+            "decoy prefix must be large enough for an inner EOCD to fall in the ZipArchive search window"
+        );
+        let mut pk = b"PK\x03\x04".to_vec();
+        pk.resize(prefix as usize, 0xAA);
+        let mut out = pk;
+        out.extend_from_slice(&bytes[prefix as usize..]);
+        out
+    }
+
+    #[test]
+    fn pk_start_store_nested_scan_from_bytes_latch_is_err() {
+        let bytes = pk_start_unadjusted_store_nested_latch();
+        assert_eq!(&bytes[..4], &LOCAL_FILE_MAGIC);
+        let file_len = bytes.len() as u64;
+        let mut cur = Cursor::new(bytes.clone());
+        let layout = detect_zip_layout(Path::new("latch.jar"), &mut cur).unwrap();
+        assert_eq!(layout.prefix_len, 0, "PK-start must skip prefix detection");
+        assert_eq!(layout.view_shift, 0);
+
+        let mut cur = Cursor::new(bytes.clone());
+        let (_, _, _, homemade) =
+            find_cd_bounds(Path::new("latch.jar"), &mut cur, file_len).unwrap();
+        assert_eq!(homemade, 3, "App + 2 STORE BOOT-INF/lib");
+
+        let mut cur = Cursor::new(bytes.clone());
+        let mut latched = ZipArchive::new(ZipView::new(&mut cur, 0)).expect("latch Ok");
+        assert_ne!(
+            latched.len() as u64,
+            homemade,
+            "ZipArchive on PK-start unadjusted nested must bind an inner EOCD"
+        );
+        let names: Vec<String> = (0..latched.len())
+            .map(|i| latched.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(
+            !names
+                .iter()
+                .any(|n| n == "App.class" || n.starts_with("BOOT-INF/lib/")),
+            "latched names must omit the outer listing, got {names:?}"
+        );
+
+        match scan_from_bytes(&bytes, u64::MAX) {
+            Err(AyzenpackError::FormatOwned(msg)) => {
+                assert!(
+                    msg.contains("homemade central directory count"),
+                    "got {msg}"
+                );
+            }
+            Err(other) => panic!("latch must be FormatOwned, got {other:?}"),
+            Ok(_) => panic!("latch must be Err, not a latched listing"),
+        }
     }
 }

@@ -14,8 +14,8 @@ use ayzenpack::hashutil::blake3_bytes;
 use ayzenpack::manifest::Manifest;
 use ayzenpack::{dehydrate, rehydrate, verify, DehydrateOptions, RehydrateOptions};
 use fixtures::{
-    matt_dehydrate, matt_rehydrate, spring_boot_launch_script,
-    write_codec_hit_plus_unknown_deflate, write_data_descriptor_zip,
+    matt_dehydrate, matt_rehydrate, pk_start_unadjusted_store_nested_latch_bytes,
+    spring_boot_launch_script, write_codec_hit_plus_unknown_deflate, write_data_descriptor_zip,
     write_deflate_miss_plus_dir_cdata, write_deflate_miss_plus_empty_deflate_dir,
     write_encrypted_store_zip, write_fat_spring_store_nested_jar,
     write_fat_spring_store_nested_zipa_jar, write_fat_spring_zip64_zipa_jar, write_jar,
@@ -2862,6 +2862,76 @@ fn prefixed_store_nested_records_child_prefix() {
     .unwrap();
     assert_eq!(got, inner);
     verify(&out).unwrap();
+}
+
+#[test]
+fn child_ziparchive_latch_packs_opaque() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = pk_start_unadjusted_store_nested_latch_bytes();
+    assert_eq!(&inner[..4], b"PK\x03\x04");
+    let inner_hex = ayzenpack::hashutil::hex_lower(&blake3_bytes(&inner));
+    let inner_class_hex = ayzenpack::hashutil::hex_lower(&blake3_bytes(&[1u8; 2048]));
+
+    let jar = dir.path().join("outer.jar");
+    write_jar_entries(
+        &jar,
+        &[
+            JarEntry::File {
+                name: "lib/latch.jar",
+                data: &inner,
+                method: CompressionMethod::Stored,
+            },
+            JarEntry::File {
+                name: "App.class",
+                data: b"outer-app",
+                method: CompressionMethod::Stored,
+            },
+        ],
+    );
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let records = read_archive(&out).2;
+    let m = manifest_from_records(&records);
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    let names: Vec<&str> = m.jars[0].entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["lib/latch.jar", "App.class"]);
+    assert!(
+        !names.iter().any(|n| n.contains("LatchInner")),
+        "latched inner-inner must not become outer entries, got {names:?}"
+    );
+    let e = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.name == "lib/latch.jar")
+        .expect("latch member");
+    assert!(e.zip_index.is_none(), "latch child must stay opaque");
+    assert_eq!(e.blob.as_deref(), Some(inner_hex.as_str()));
+    assert!(e.cdata_blob.is_none());
+    assert!(
+        m.blobs.iter().any(|b| b.blake3 == inner_hex),
+        "blake3(inner) must be the opaque combined blob"
+    );
+    assert!(
+        m.jars[0].nestedindexes.is_empty(),
+        "must not explode a latched inner-inner"
+    );
+    assert!(
+        !content_blob_ids(&m).contains(&inner_class_hex),
+        "must not dual-copy exploded inner-inner classes plus the combined zip"
+    );
+    for e in &m.jars[0].entries {
+        assert!(e.cdata_blob.is_none());
+    }
+    verify(&out).unwrap();
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let mut z = ZipArchive::new(File::open(dest.join("outer.jar")).unwrap()).unwrap();
+    let mut got = Vec::new();
+    z.by_name("lib/latch.jar")
+        .unwrap()
+        .read_to_end(&mut got)
+        .unwrap();
+    assert_eq!(got, inner);
 }
 
 #[test]

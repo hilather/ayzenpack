@@ -206,6 +206,43 @@ pub fn write_classic_nested_store_jar(path: &Path) {
     std::fs::write(path, z.finish().unwrap().into_inner()).unwrap();
 }
 
+/// Unadjusted STORE nested zip whose prefix starts with `PK\x03\x04`.
+///
+/// `detect_zip_layout` returns `prefix_len = 0`; rust zip latches onto an inner
+/// nested EOCD. Homemade `find_cd_bounds` still sees the outer CD (App + 2 libs).
+pub fn pk_start_unadjusted_store_nested_latch_bytes() -> Vec<u8> {
+    use std::io::Cursor;
+    let inner0 = latch_inner_zip(0);
+    let inner1 = latch_inner_zip(1);
+    let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    z.start_file("App.class", opts).unwrap();
+    z.write_all(b"class-bytes-outer").unwrap();
+    z.start_file("BOOT-INF/lib/lib0.jar", opts).unwrap();
+    z.write_all(&inner0).unwrap();
+    z.start_file("BOOT-INF/lib/lib1.jar", opts).unwrap();
+    z.write_all(&inner1).unwrap();
+    let zip = z.finish().unwrap().into_inner();
+    let mut prefix = b"PK\x03\x04".to_vec();
+    prefix.resize(8192, 0xAA);
+    prepend_launcher(&zip, &prefix, false)
+}
+
+fn latch_inner_zip(i: u8) -> Vec<u8> {
+    use std::io::Cursor;
+    let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    z.start_file(format!("com/LatchInner{i}.class"), opts)
+        .unwrap();
+    z.write_all(&[i; 2048]).unwrap();
+    let bytes = z.finish().unwrap().into_inner();
+    assert!(
+        bytes.windows(4).any(|w| w == b"PK\x05\x06"),
+        "inner must be a complete zip"
+    );
+    bytes
+}
+
 pub fn inner_incompressible_jar(i: usize, nbytes: usize) -> Vec<u8> {
     use std::io::Cursor;
     let mut payload = vec![0u8; nbytes];
