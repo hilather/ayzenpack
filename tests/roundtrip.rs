@@ -18,17 +18,16 @@ use fixtures::{
     write_codec_hit_plus_unknown_deflate, write_data_descriptor_zip,
     write_deflate_miss_plus_dir_cdata, write_deflate_miss_plus_empty_deflate_dir,
     write_encrypted_store_zip, write_fat_spring_store_nested_jar,
-    write_fat_spring_store_nested_zipa_jar, write_fat_spring_zip64_zipa_jar,
-    write_homemade_none_listed_zip, write_homemade_none_plus_store_nested, write_jar,
+    write_fat_spring_store_nested_zipa_jar, write_fat_spring_zip64_zipa_jar, write_jar,
     write_jar_entries, write_jar_with_comment, write_leading_pad_pk_decoy_zip,
-    write_non_utf8_name_zip, write_overlapping_local_plus_store_nested,
-    write_overlapping_local_zip, write_padded_locals_zip, write_signed_looking_jar,
-    write_store_file_plus_dir_cdata, write_store_file_plus_empty_deflate_dir,
-    write_store_file_plus_leftover_csize_dir, write_stored_block_deflate_zip,
-    write_stored_jar_dos_zero, write_stored_zip, write_truncated_cd_listed_zip,
-    write_unknown_deflate_wrapped, write_unknown_deflate_zip, write_wrapped_jar,
-    write_wrapped_jar_adjusted, write_wrapped_zip64_jar, write_zlib_deflate_zip, zip64_jar_bytes,
-    JarEntry, SPRING_LAUNCHER,
+    write_leftover_junk_listed_zip, write_leftover_junk_plus_store_nested, write_non_utf8_name_zip,
+    write_overlapping_local_plus_store_nested, write_overlapping_local_zip,
+    write_padded_locals_zip, write_signed_looking_jar, write_store_file_plus_dir_cdata,
+    write_store_file_plus_empty_deflate_dir, write_store_file_plus_leftover_csize_dir,
+    write_stored_block_deflate_zip, write_stored_jar_dos_zero, write_stored_zip,
+    write_truncated_cd_listed_zip, write_unknown_deflate_wrapped, write_unknown_deflate_zip,
+    write_wrapped_jar, write_wrapped_jar_adjusted, write_wrapped_zip64_jar, write_zlib_deflate_zip,
+    zip64_jar_bytes, JarEntry, SPRING_LAUNCHER,
 };
 use zip::{CompressionMethod, DateTime, ZipArchive};
 
@@ -2664,7 +2663,7 @@ fn listed_homemade_leftover_junk_cd_is_exact() {
     let jars = dir.path().join("jars");
     fs::create_dir_all(&jars).unwrap();
     let jar = jars.join("leftover-junk.jar");
-    write_homemade_none_listed_zip(&jar);
+    write_leftover_junk_listed_zip(&jar);
     let listed = ZipArchive::new(File::open(&jar).unwrap()).unwrap().len();
     assert!(listed >= 1, "fixture must stay listable");
     let src = fs::read(&jar).unwrap();
@@ -2743,7 +2742,7 @@ fn listed_true_homemade_none_has_no_tail_blob() {
 fn leftover_junk_plus_store_nested_is_exact_zip_index() {
     let dir = tempfile::tempdir().unwrap();
     let jar = dir.path().join("cd-junk-nested.jar");
-    write_homemade_none_plus_store_nested(&jar);
+    write_leftover_junk_plus_store_nested(&jar);
     let mut z = ZipArchive::new(File::open(&jar).unwrap()).unwrap();
     let mut inner = Vec::new();
     z.by_name("lib/inner.jar")

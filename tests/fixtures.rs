@@ -846,29 +846,35 @@ fn splice_trailing_cd_junk(buf: &mut Vec<u8>, junk: &[u8]) {
 
 const CD_TRAILING_JUNK: [u8; 4] = [0xAB, 0xCD, 0xEF, 0x01];
 
+/// 46-byte `PK\x01\x02` header whose name_len overruns any leftover after it.
+fn magic_but_short_cd_header() -> [u8; 46] {
+    let mut stub = [0u8; 46];
+    stub[..4].copy_from_slice(b"PK\x01\x02");
+    stub[28..30].copy_from_slice(&100u16.to_le_bytes());
+    stub
+}
+
 /// Listed zip with junk after the last complete CD record, counted in EOCD
 /// `cd_size`. Homemade parse must accept N rows + leftover (not skip-exact).
-pub fn write_homemade_none_listed_zip(path: &Path) {
+pub fn write_leftover_junk_listed_zip(path: &Path) {
     write_stored_zip(path, &[("a.txt", b"hello", crc32fast::hash(b"hello"))]);
     let mut buf = std::fs::read(path).unwrap();
     splice_trailing_cd_junk(&mut buf, &CD_TRAILING_JUNK);
     std::fs::write(path, buf).unwrap();
 }
 
-/// Listed zip whose homemade CD parse is still `None`: EOCD `cd_size` is
-/// shorter than the CD record. ZipArchive still lists via `cd_offset` + count.
+/// Listed zip whose homemade CD parse is still `None`: N complete `PK\x01\x02`
+/// rows, then leftover that starts with CD magic but whose name_len overruns
+/// `cd_size`. ZipArchive still lists N via entry count.
 pub fn write_truncated_cd_listed_zip(path: &Path) {
     write_stored_zip(path, &[("a.txt", b"hello", crc32fast::hash(b"hello"))]);
     let mut buf = std::fs::read(path).unwrap();
-    let eocd = classic_eocd_off(&buf);
-    let cd_size = u32::from_le_bytes(buf[eocd + 12..eocd + 16].try_into().unwrap());
-    assert!(cd_size > 4, "fixture needs a CD record to truncate");
-    buf[eocd + 12..eocd + 16].copy_from_slice(&(cd_size - 4).to_le_bytes());
+    splice_trailing_cd_junk(&mut buf, &magic_but_short_cd_header());
     std::fs::write(path, buf).unwrap();
 }
 
 /// Leftover-junk CD plus a STORE listable nested zip (`lib/inner.jar`).
-pub fn write_homemade_none_plus_store_nested(path: &Path) {
+pub fn write_leftover_junk_plus_store_nested(path: &Path) {
     let inner_tmp = path.with_extension("inner.jar");
     let inner_plain = b"nested-plain";
     write_stored_zip(

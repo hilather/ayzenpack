@@ -1187,6 +1187,7 @@ fn find_eocd_in(buf: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
     use std::io::{Cursor, Write};
+    use std::path::Path;
     use zip::write::SimpleFileOptions;
     use zip::{ZipArchive, ZipWriter};
 
@@ -1517,6 +1518,20 @@ mod tests {
         );
     }
 
+    fn zip_rel_layout() -> ZipLayout {
+        ZipLayout {
+            prefix_len: 0,
+            view_shift: 0,
+        }
+    }
+
+    fn magic_but_short_cd_header() -> [u8; 46] {
+        let mut stub = [0u8; 46];
+        stub[..4].copy_from_slice(&CD_MAGIC);
+        stub[28..30].copy_from_slice(&100u16.to_le_bytes());
+        stub
+    }
+
     fn splice_cd_trailing_junk(buf: &mut Vec<u8>, junk: &[u8]) {
         let eocd = find_eocd_in(buf).expect("EOCD");
         let cd_size = u32::from_le_bytes(buf[eocd + 12..eocd + 16].try_into().unwrap());
@@ -1524,6 +1539,52 @@ mod tests {
         let new_eocd = eocd + junk.len();
         buf[new_eocd + 12..new_eocd + 16]
             .copy_from_slice(&(cd_size + junk.len() as u32).to_le_bytes());
+    }
+
+    fn stored_cd_bytes(path: &Path) -> Vec<u8> {
+        let buf = std::fs::read(path).unwrap();
+        let eocd = find_eocd_in(&buf).expect("EOCD");
+        let cd_size = u32::from_le_bytes(buf[eocd + 12..eocd + 16].try_into().unwrap()) as usize;
+        let cd_off = u32::from_le_bytes(buf[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        buf[cd_off..cd_off + cd_size].to_vec()
+    }
+
+    #[test]
+    fn parse_central_directory_leftover_vs_truncated() {
+        let layout = zip_rel_layout();
+        assert_eq!(
+            parse_central_directory(&[], &layout).map(|r| r.len()),
+            Some(0),
+            "empty cd is Some([])"
+        );
+        assert!(
+            parse_central_directory(&[0xAB, 0xCD, 0xEF, 0x01], &layout).is_none(),
+            "junk-only is None"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jar");
+        write_stored_named(&path, &[("a.txt", b"hello")]);
+        let cd = stored_cd_bytes(&path);
+        assert_eq!(
+            parse_central_directory(&cd, &layout).map(|r| r.len()),
+            Some(1)
+        );
+
+        let mut junked = cd.clone();
+        junked.extend_from_slice(&[0xAB, 0xCD, 0xEF, 0x01]);
+        assert_eq!(
+            parse_central_directory(&junked, &layout).map(|r| r.len()),
+            Some(1),
+            "complete rows + non-magic junk is Some(N)"
+        );
+
+        let mut short = cd;
+        short.extend_from_slice(&magic_but_short_cd_header());
+        assert!(
+            parse_central_directory(&short, &layout).is_none(),
+            "complete rows + magic-but-short record is None"
+        );
     }
 
     #[test]
@@ -1557,10 +1618,7 @@ mod tests {
         let path = dir.path().join("truncated-cd.jar");
         write_stored_named(&path, &[("a.txt", b"hello")]);
         let mut buf = std::fs::read(&path).unwrap();
-        let eocd = find_eocd_in(&buf).expect("EOCD");
-        let cd_size = u32::from_le_bytes(buf[eocd + 12..eocd + 16].try_into().unwrap());
-        assert!(cd_size > 4);
-        buf[eocd + 12..eocd + 16].copy_from_slice(&(cd_size - 4).to_le_bytes());
+        splice_cd_trailing_junk(&mut buf, &magic_but_short_cd_header());
         std::fs::write(&path, &buf).unwrap();
 
         let listed = ZipArchive::new(std::fs::File::open(&path).unwrap())
@@ -1568,7 +1626,10 @@ mod tests {
             .len();
         assert_eq!(listed, 1, "fixture must stay listable");
         let (home, arch) = homemade_cd_count_and_archive_len(&path).unwrap();
-        assert_eq!(home, None, "truncated CD record must stay homemade None");
+        assert_eq!(
+            home, None,
+            "magic-but-short CD record must stay homemade None"
+        );
         assert_eq!(arch, 1);
         let sliced = slice_from_archive(&path).expect("listed truncated CD is skip-exact, not Err");
         assert!(!sliced.homemade_ok);
