@@ -938,8 +938,9 @@ fn entry_from_scan(meta: &ScannedEntry, blob: Option<String>, sha256: Option<Str
 }
 
 fn attach_exact(sink: &mut BlobSink<'_>, path: &Path, jar: &mut Jar) -> Result<()> {
-    // Listed jars never store raw_zip. Encrypted still errors. Overlap / count
-    // mismatch is skip-exact. Homemade parse None is Ok without tail_blob.
+    // Listed jars never store raw_zip. Encrypted still errors. Range overlap /
+    // count mismatch is skip-exact. Equal-offset last-wins slices. Homemade
+    // parse None is Ok without tail_blob.
     match slice_from_archive(path) {
         Ok(slice) => {
             if slice.locals.len() != jar.entries.len() {

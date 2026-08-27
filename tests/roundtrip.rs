@@ -23,13 +23,15 @@ use fixtures::{
     write_leading_pad_pk_decoy_zip, write_leftover_junk_listed_zip,
     write_leftover_junk_plus_store_nested, write_non_utf8_name_zip,
     write_overlapping_local_plus_store_nested, write_overlapping_local_zip,
-    write_padded_locals_zip, write_signed_looking_jar, write_store_file_plus_dir_cdata,
-    write_store_file_plus_empty_deflate_dir, write_store_file_plus_leftover_csize_dir,
-    write_stored_block_deflate_zip, write_stored_jar_dos_zero, write_stored_zip,
-    write_truncated_cd_listed_zip, write_truncated_cd_plus_store_nested_unadjusted,
-    write_truncated_cd_zip64_listed_zip, write_unknown_deflate_wrapped, write_unknown_deflate_zip,
-    write_wrapped_jar, write_wrapped_jar_adjusted, write_wrapped_zip64_jar, write_zlib_deflate_zip,
-    zip64_jar_bytes, JarEntry, SPRING_LAUNCHER,
+    write_padded_locals_zip, write_range_overlap_local_zip, write_signed_looking_jar,
+    write_store_file_plus_dir_cdata, write_store_file_plus_empty_deflate_dir,
+    write_store_file_plus_leftover_csize_dir, write_stored_block_deflate_zip,
+    write_stored_jar_dos_zero, write_stored_zip, write_truncated_cd_listed_zip,
+    write_truncated_cd_overlap_unknown_deflate_sibling, write_truncated_cd_overlapping_local_zip,
+    write_truncated_cd_plus_store_nested_unadjusted, write_truncated_cd_zip64_listed_zip,
+    write_unknown_deflate_wrapped, write_unknown_deflate_zip, write_wrapped_jar,
+    write_wrapped_jar_adjusted, write_wrapped_zip64_jar, write_zlib_deflate_zip, zip64_jar_bytes,
+    JarEntry, SPRING_LAUNCHER,
 };
 use zip::{CompressionMethod, DateTime, ZipArchive};
 
@@ -1221,7 +1223,8 @@ fn overlapping_locals_listed_jar_has_no_raw_zip() {
     let dir = tempfile::tempdir().unwrap();
     let jar = dir.path().join("overlap.jar");
     write_overlapping_local_zip(&jar);
-    let zip_len = fs::metadata(&jar).unwrap().len();
+    let src = fs::read(&jar).unwrap();
+    let zip_len = src.len() as u64;
     let out = dir.path().join("out.ayz");
     let summary = dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
     let m = manifest_from_records(&read_archive(&out).2);
@@ -1230,8 +1233,25 @@ fn overlapping_locals_listed_jar_has_no_raw_zip() {
         "listed overlap jar must not store raw_zip"
     );
     assert!(
-        m.jars[0].tail_blob.is_none(),
-        "overlap must skip exact (no broken tail)"
+        m.jars[0].tail_blob.is_some(),
+        "equal-offset last-wins homemade_ok must attach tail_blob"
+    );
+    for e in &m.jars[0].entries {
+        assert!(e.cdata_blob.is_none(), "{} cdata_blob", e.name);
+    }
+    // pad_blob may hold the unreferenced second physical local (index, not cdata_blob).
+    assert!(
+        m.jars[0].entries.iter().any(|e| e.pad_blob.is_some()),
+        "unreferenced second local is pad_blob; do not shrink next"
+    );
+    assert_eq!(
+        content_blob_ids(&m).len(),
+        1,
+        "unique content is SAME-payload; pad is not a second encoding"
+    );
+    assert!(
+        m.jars[0].bit_identical_restore(),
+        "STORE slots hit so source_* must match"
     );
     assert!(
         summary.bytes_unique_blobs < zip_len,
@@ -1241,7 +1261,166 @@ fn overlapping_locals_listed_jar_has_no_raw_zip() {
     );
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
-    assert!(dest.join("overlap.jar").is_file());
+    let restored = dest.join("overlap.jar");
+    assert!(restored.is_file());
+    let dest_entries = cd_payloads(&restored);
+    assert_eq!(dest_entries.len(), 2);
+    assert_eq!(dest_entries[0].0, "a.txt");
+    assert_eq!(dest_entries[1].0, "b.txt");
+    assert_eq!(dest_entries[0].1, b"SAME-payload");
+    assert_eq!(dest_entries[1].1, b"SAME-payload");
+    assert_eq!(fs::read(&restored).unwrap(), src);
+    assert_eq!(m.jars[0].source_size, zip_len);
+    assert_eq!(
+        m.jars[0].source_blake3,
+        ayzenpack::hashutil::hex_lower(&blake3_bytes(&src))
+    );
+    assert_eq!(
+        m.jars[0].source_sha256,
+        ayzenpack::hashutil::hex_lower(&ayzenpack::hashutil::sha256_bytes(&src))
+    );
+}
+
+#[test]
+fn truncated_cd_equal_offset_overlap_is_arm1_listing_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("trunc-overlap.jar");
+    write_truncated_cd_overlapping_local_zip(&jar);
+    let listed = ZipArchive::new(File::open(&jar).unwrap()).unwrap().len();
+    assert_eq!(listed, 2, "fixture must stay listable");
+    let src = fs::read(&jar).unwrap();
+    let src_len = src.len() as u64;
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert!(
+        m.jars[0].tail_blob.is_none(),
+        "truncated-CD overlap must never attach tail_blob"
+    );
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    assert!(!m.jars[0].bit_identical_restore());
+    assert!(!m.jars[0].metadata_rebuild());
+    for e in &m.jars[0].entries {
+        assert!(e.cdata_blob.is_none(), "{} cdata_blob", e.name);
+        assert!(
+            e.local_header_hex.is_some() || e.local_header_blob.is_some(),
+            "{} must capture a local header",
+            e.name
+        );
+    }
+    assert_eq!(
+        content_blob_ids(&m).len(),
+        1,
+        "unique content is SAME-payload"
+    );
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("trunc-overlap.jar");
+    let got = fs::read(&restored).unwrap();
+    let got_len = got.len() as u64;
+    assert!(
+        got_len * 2 >= src_len,
+        "restored {got_len} must stay in the same league as source {src_len}"
+    );
+    let dest_entries = cd_payloads(&restored);
+    assert_eq!(dest_entries.len(), 2);
+    assert_eq!(dest_entries[0].0, "a.txt");
+    assert_eq!(dest_entries[1].0, "b.txt");
+    assert_eq!(dest_entries[0].1, b"SAME-payload");
+    assert_eq!(dest_entries[1].1, b"SAME-payload");
+    let phys_cd = classic_eocd_cd_offset(&src);
+    let cd_start = classic_eocd_cd_offset(&got);
+    assert_eq!(
+        &got[..cd_start as usize],
+        &src[..phys_cd as usize],
+        "arm 1 locals-region identity including pad of unreferenced second local"
+    );
+    assert_ne!(
+        got, src,
+        "homemade-None must not require original-file source_*"
+    );
+}
+
+#[test]
+fn range_overlap_listed_jar_is_arm3_no_raw_zip() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("range-overlap.jar");
+    write_range_overlap_local_zip(&jar);
+    let listed = ZipArchive::new(File::open(&jar).unwrap()).unwrap().len();
+    assert_eq!(listed, 2, "fixture must stay listable");
+    let src_map = entry_map(&jar);
+    assert!(src_map.contains_key("a.txt"));
+    assert!(src_map.contains_key("b.txt"));
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    assert!(m.jars[0].tail_blob.is_none());
+    assert!(!m.jars[0].bit_identical_restore());
+    for e in &m.jars[0].entries {
+        assert!(e.cdata_blob.is_none(), "{} cdata_blob", e.name);
+        assert!(
+            e.local_header_hex.is_none() && e.local_header_blob.is_none(),
+            "{} must not capture headers on slice Err",
+            e.name
+        );
+    }
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("range-overlap.jar");
+    let dest_entries = cd_payloads(&restored);
+    let names: Vec<_> = dest_entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"a.txt"), "got {names:?}");
+    assert!(names.contains(&"b.txt"), "got {names:?}");
+    assert_eq!(entry_map(&restored), src_map);
+}
+
+#[test]
+fn truncated_cd_overlap_unknown_deflate_sibling_is_arm2_listing_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("trunc-overlap-miss.jar");
+    write_truncated_cd_overlap_unknown_deflate_sibling(&jar);
+    let listed = ZipArchive::new(File::open(&jar).unwrap()).unwrap().len();
+    assert_eq!(listed, 3, "fixture must stay listable");
+    let src_len = fs::metadata(&jar).unwrap().len();
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert!(m.jars[0].tail_blob.is_none());
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    assert!(!m.jars[0].bit_identical_restore());
+    assert!(!m.jars[0].metadata_rebuild());
+    for e in &m.jars[0].entries {
+        assert!(e.cdata_blob.is_none(), "{} cdata_blob", e.name);
+        assert!(
+            e.local_header_hex.is_some() || e.local_header_blob.is_some(),
+            "{} must capture a local header",
+            e.name
+        );
+    }
+    let miss = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.name == "miss.bin")
+        .expect("miss");
+    assert_eq!(miss.method_code, 8);
+    assert!(
+        miss.cdata_codec.is_none(),
+        "unknown-deflate must stay a miss"
+    );
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("trunc-overlap-miss.jar");
+    let got_len = fs::metadata(&restored).unwrap().len();
+    assert!(
+        got_len * 2 >= src_len,
+        "restored {got_len} must stay in the same league as source {src_len}"
+    );
+    let dest_entries = cd_payloads(&restored);
+    let names: Vec<_> = dest_entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"a.txt"), "got {names:?}");
+    assert!(names.contains(&"b.txt"), "got {names:?}");
+    assert!(names.contains(&"miss.bin"), "got {names:?}");
 }
 
 #[test]
@@ -2717,12 +2896,19 @@ fn skip_exact_outer_explodes_store_inner() {
         .unwrap();
     drop(z);
     let out = dir.path().join("out.ayz");
+    let src = fs::read(&jar).unwrap();
     matt_dehydrate(&out, &jar);
     let records = read_archive(&out).2;
     let m = manifest_from_records(&records);
-    assert!(m.jars[0].tail_blob.is_none());
+    assert!(
+        m.jars[0].tail_blob.is_some(),
+        "equal-offset outer homemade_ok must attach tail_blob"
+    );
     assert!(m.jars[0].raw_zip_blob.is_none());
-    assert!(!m.jars[0].bit_identical_restore());
+    assert!(
+        m.jars[0].bit_identical_restore(),
+        "outer exact when inner zip_index hits"
+    );
     assert!(!m.jars[0].metadata_rebuild());
     for e in &m.jars[0].entries {
         assert!(e.cdata_blob.is_none(), "{} cdata_blob", e.name);
@@ -2760,6 +2946,7 @@ fn skip_exact_outer_explodes_store_inner() {
     assert_eq!(content_blob_ids(&m).len(), 2, "unique content not doubled");
     verify(&out).unwrap();
     matt_rehydrate(&out);
+    assert_eq!(fs::read(&jar).unwrap(), src);
     let got_len = fs::metadata(&jar).unwrap().len();
     assert!(
         got_len * 2 >= src_len,

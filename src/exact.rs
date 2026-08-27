@@ -97,9 +97,10 @@ fn capture_zip_exact_using(
 /// Locals from the same `ZipArchive` listing scan uses. Never returns a whole-zip `Raw`.
 ///
 /// Store-tail is valid only when homemade `parse_central_directory` yields the same
-/// count as `ZipArchive::len()`. Overlap or a homemade count mismatch is `Err`.
-/// Homemade parse `None` is `Ok` with `homemade_ok == false` and `tail == None`.
-/// A PK-start hole (`prefix_len == 0`, first local ≠ 0) is `leading_pad`.
+/// count as `ZipArchive::len()`. Equal-offset last-wins (CD aliases) slice; range
+/// overlap or a homemade count mismatch is `Err`. Homemade parse `None` is `Ok`
+/// with `homemade_ok == false` and `tail == None`. A PK-start hole (`prefix_len == 0`,
+/// first local ≠ 0) is `leading_pad`.
 pub(crate) fn slice_from_archive(path: &Path) -> Result<ExactSlice> {
     let mut file = File::open(path).map_err(|source| io_at(source, path))?;
     slice_from_reader(path, &mut file)
@@ -144,13 +145,6 @@ fn slice_from_reader<R: Read + Seek>(path: &Path, file: &mut R) -> Result<ExactS
                 pad
             };
         }
-        let mut ordered: Vec<u64> = recs.iter().map(|r| r.zip_rel_offset).collect();
-        ordered.sort_unstable();
-        for pair in ordered.windows(2) {
-            if pair[0] >= pair[1] {
-                return Err(slice_fail(path, "overlapping or unsorted local offsets"));
-            }
-        }
     }
 
     let file_len = file
@@ -188,6 +182,8 @@ fn slice_from_reader<R: Read + Seek>(path: &Path, file: &mut R) -> Result<ExactS
 
     let mut locals = Vec::with_capacity(recs.len());
     for rec in &recs {
+        // Strictly greater subsequent offset, else CD. Equal-offset aliases share
+        // this `next` so the unreferenced physical local is pad, not dropped.
         let next = recs
             .iter()
             .map(|r| r.zip_rel_offset)
@@ -395,14 +391,11 @@ fn slice_zip_using(
             "first local header is not at zip offset 0",
         ));
     }
-    for pair in order.windows(2) {
-        if records[pair[0]].zip_rel_offset >= records[pair[1]].zip_rel_offset {
-            return Err(slice_fail(path, "overlapping or unsorted local offsets"));
-        }
-    }
 
     let mut locals = Vec::with_capacity(records.len());
     for rec in &records {
+        // Strictly greater subsequent offset, else CD. Equal-offset aliases share
+        // this `next` so the unreferenced physical local is pad, not dropped.
         let next = order
             .iter()
             .copied()
@@ -1424,7 +1417,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_locals_are_raw_on_homemade_slice_not_archive_slice() {
+    fn overlapping_locals_slice_as_homemade_ok_equal_offset() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("overlap.jar");
         write_stored_named(
@@ -1441,12 +1434,74 @@ mod tests {
         std::fs::write(&path, &buf).unwrap();
 
         match capture_zip_exact(&path).unwrap() {
-            ZipExact::Raw(_) => {}
-            ZipExact::Sliced(_) => panic!("overlapping locals must be Raw on homemade slice_zip"),
+            ZipExact::Sliced(s) => {
+                assert!(s.homemade_ok);
+                assert!(s.tail.is_some());
+                assert_eq!(s.locals.len(), 2);
+                assert_eq!(s.locals[0].zip_rel_offset, 0);
+                assert_eq!(s.locals[1].zip_rel_offset, 0);
+                assert!(
+                    !s.locals[0].pad.is_empty(),
+                    "unreferenced second local must be pad; do not shrink next"
+                );
+            }
+            ZipExact::Raw(_) => panic!("equal-offset last-wins must homemade-slice, not Raw"),
         }
+        let sliced = slice_from_archive(&path).expect("equal-offset last-wins must slice");
+        assert!(sliced.homemade_ok);
+        assert!(sliced.tail.is_some());
+        assert_eq!(sliced.locals.len(), 2);
+        assert_eq!(sliced.locals[0].zip_rel_offset, 0);
+        assert_eq!(sliced.locals[1].zip_rel_offset, 0);
+        let (home, arch) = homemade_cd_count_and_archive_len(&path).unwrap();
+        assert_eq!(home, Some(2));
+        assert_eq!(arch, 2);
+    }
+
+    #[test]
+    fn range_overlap_local_is_slice_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("range-overlap.jar");
+        let b_data = b"B-payload";
+        let b_crc = crc32fast::hash(b_data);
+        let mut planted = Vec::new();
+        planted.extend_from_slice(b"PK\x03\x04");
+        planted.extend_from_slice(&20u16.to_le_bytes());
+        planted.extend_from_slice(&0u16.to_le_bytes());
+        planted.extend_from_slice(&0u16.to_le_bytes());
+        planted.extend_from_slice(&0u16.to_le_bytes());
+        planted.extend_from_slice(&0u16.to_le_bytes());
+        planted.extend_from_slice(&b_crc.to_le_bytes());
+        planted.extend_from_slice(&(b_data.len() as u32).to_le_bytes());
+        planted.extend_from_slice(&(b_data.len() as u32).to_le_bytes());
+        planted.extend_from_slice(&5u16.to_le_bytes());
+        planted.extend_from_slice(&0u16.to_le_bytes());
+        planted.extend_from_slice(b"b.txt");
+        planted.extend_from_slice(b_data);
+        let mut a_payload = b"AAAA".to_vec();
+        a_payload.extend_from_slice(&planted);
+        write_stored_named(
+            &path,
+            &[
+                ("a.txt", a_payload.as_slice()),
+                ("b.txt", b_data.as_slice()),
+            ],
+        );
+        let mut buf = std::fs::read(&path).unwrap();
+        let eocd = find_eocd_in(&buf).unwrap();
+        let cd_off = u32::from_le_bytes(buf[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        let name_len =
+            u16::from_le_bytes(buf[cd_off + 28..cd_off + 30].try_into().unwrap()) as usize;
+        let rec2 = cd_off + 46 + name_len;
+        // a.txt local is 35 bytes; planted b.txt local starts 4 bytes into cdata.
+        buf[rec2 + 42..rec2 + 46].copy_from_slice(&39u32.to_le_bytes());
+        std::fs::write(&path, &buf).unwrap();
+
+        let err = slice_from_archive(&path).expect_err("range overlap must stay slice Err");
+        let msg = err.to_string();
         assert!(
-            slice_from_archive(&path).is_err(),
-            "overlap must skip exact, not become Raw for dehydrate"
+            msg.contains("overruns next record"),
+            "range overlap must fail via read_local overrun, got {msg}"
         );
         let (home, arch) = homemade_cd_count_and_archive_len(&path).unwrap();
         assert_eq!(home, Some(2));

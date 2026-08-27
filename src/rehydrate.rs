@@ -5,9 +5,10 @@
 //! a valid ZIP with patched sizes. Skip-exact homemade-`None` with captured
 //! headers seeks locals and writes a synthetic CD when every slot keeps recorded
 //! `compressed_size`. Headers-present csize-changing misses concatenate patched
-//! locals and synthesize a CD. Overlap / prefix+hole keep `ZipWriter` (STORE
-//! `method_code == 0` / `zip_index`; never `resolve_cdata`). Prefix bytes are
-//! always bit-exact.
+//! locals and synthesize a CD. Range overlap / ZipArchive count mismatch /
+//! prefix+hole keep `ZipWriter` (STORE `method_code == 0` / `zip_index`; never
+//! `resolve_cdata`). Equal-offset last-wins with matching homemade count exact-
+//! splices. Prefix bytes are always bit-exact.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -511,7 +512,7 @@ enum SkipExactArm {
     StencilSeekSyntheticCd,
     /// Headers, but at least one slot would change csize.
     RebuildConcatSyntheticCd,
-    /// No captured headers (overlap / prefix+hole / slice Err).
+    /// No captured headers (range overlap / count mismatch / prefix+hole / slice Err).
     ZipWriterStore,
 }
 
@@ -543,6 +544,14 @@ fn skip_exact_arm(jar: &Jar) -> SkipExactArm {
         return SkipExactArm::StencilSeekSyntheticCd;
     }
     SkipExactArm::RebuildConcatSyntheticCd
+}
+
+/// Synthetic CD file name from the listing when it differs from the aliased local.
+fn listing_cd_name(e: &Entry) -> Result<Vec<u8>> {
+    match &e.name_raw_hex {
+        Some(hex) => parse_hex(hex),
+        None => Ok(e.name.as_bytes().to_vec()),
+    }
 }
 
 fn pad_len(e: &Entry, get_blob: &mut impl FnMut(&str) -> Result<Vec<u8>>) -> Result<u64> {
@@ -658,7 +667,8 @@ fn write_skip_exact_seek(
         let mut get_blob =
             |hex: &str| read_named_blob(cas_dir, hex, &format!("{}!{}", jar.name, e.name));
         let header = load_header(e, &mut get_blob).map_err(|err| map_dest_io(err, dest))?;
-        let (name, gpbf) = name_and_gpbf_from_local_header(&header)?;
+        let (_, gpbf) = name_and_gpbf_from_local_header(&header)?;
+        let name = listing_cd_name(e)?;
         if name.split(|&b| b == b'/' || b == b'\\').any(|c| c == b"..") {
             return Err(AyzenpackError::FormatOwned(format!(
                 "synthetic CD: name contains .. ({})",
@@ -763,7 +773,8 @@ fn write_skip_exact_concat(
             )));
         }
         let mut header = load_local_header(jar, e, cas_dir)?;
-        let (name, gpbf) = name_and_gpbf_from_local_header(&header)?;
+        let (_, gpbf) = name_and_gpbf_from_local_header(&header)?;
+        let name = listing_cd_name(e)?;
         if name.split(|&b| b == b'/' || b == b'\\').any(|c| c == b"..") {
             return Err(AyzenpackError::FormatOwned(format!(
                 "synthetic CD: name contains .. ({})",

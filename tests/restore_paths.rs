@@ -559,14 +559,15 @@ fn in_place_restore_paths_two_fats_share_nested_lib_blobs() {
 
 #[test]
 fn in_place_restore_paths_overlap_store_nested_stays_stored() {
-    // Skip-exact outer (overlap, no headers) + STORE inner: ZipWriter must STORE
-    // zip_index so dest lib/inner.jar stays Stored. Matt CLI; source_* may change.
+    // Equal-offset outer exact-splices when inner zip_index hits. Dest
+    // lib/inner.jar stays Stored. Matt CLI.
     let dir = tempfile::tempdir().unwrap();
     let jars = dir.path().join("jars");
     fs::create_dir_all(&jars).unwrap();
     let jar = jars.join("overlap-nested.jar");
     write_overlapping_local_plus_store_nested(&jar);
-    let src_len = fs::metadata(&jar).unwrap().len();
+    let src_bytes = fs::read(&jar).unwrap();
+    let src_len = src_bytes.len() as u64;
     let src = file_entry_map(&jar);
     assert!(
         src.contains_key("lib/inner.jar"),
@@ -579,8 +580,12 @@ fn in_place_restore_paths_overlap_store_nested_stays_stored() {
     dehydrate_matt_dir(&jars, &pack, &sidecar);
     let m: Manifest = serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
     assert_listed_no_dual(&m.jars[0]);
-    assert!(m.jars[0].tail_blob.is_none());
+    assert!(
+        m.jars[0].tail_blob.is_some(),
+        "equal-offset outer homemade_ok must attach tail_blob"
+    );
     assert!(m.jars[0].raw_zip_blob.is_none());
+    assert!(m.jars[0].bit_identical_restore());
     let e = m.jars[0]
         .entries
         .iter()
@@ -601,6 +606,7 @@ fn in_place_restore_paths_overlap_store_nested_stays_stored() {
     );
 
     rehydrate_restore_paths_only(&pack);
+    assert_eq!(fs::read(&jar).unwrap(), src_bytes);
     let got_len = fs::metadata(&jar).unwrap().len();
     assert!(
         got_len * 2 >= src_len,

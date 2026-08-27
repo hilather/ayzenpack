@@ -414,10 +414,11 @@ pub fn write_stored_zip(path: &Path, files: &[(&str, &[u8], u32)]) {
 }
 
 /// Two distinct-name CD records that share local offset 0.
-/// ZipArchive still lists both; homemade `slice_zip` fails (overlap) → 0.2.1 `Raw`.
+/// ZipArchive lists both; homemade count matches → exact splice (pad of the
+/// unreferenced second physical local). Never `raw_zip`.
 pub fn write_overlapping_local_zip(path: &Path) {
     // Same CRC so ZipArchive::by_index lists both; distinct names so last-wins
-    // does not collapse. Homemade slice still fails (overlapping offsets).
+    // does not collapse. Equal CD offsets alias local 0.
     let payload = b"SAME-payload";
     write_stored_zip(
         path,
@@ -427,36 +428,92 @@ pub fn write_overlapping_local_zip(path: &Path) {
         ],
     );
     let mut buf = std::fs::read(path).unwrap();
-    let eocd = {
-        let mut i = buf.len() - 22;
-        loop {
-            if buf[i..i + 4] == *b"PK\x05\x06" {
-                let comment_len = u16::from_le_bytes([buf[i + 20], buf[i + 21]]) as usize;
-                if i + 22 + comment_len == buf.len() {
-                    break i;
-                }
-            }
-            assert!(i > 0);
-            i -= 1;
-        }
-    };
-    let cd_size = u32::from_le_bytes(buf[eocd + 12..eocd + 16].try_into().unwrap()) as usize;
-    let cd_off = u32::from_le_bytes(buf[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
-    let mut i = cd_off;
-    let cd_end = cd_off + cd_size;
-    let mut seen = 0u32;
-    while i + 46 <= cd_end {
-        assert_eq!(&buf[i..i + 4], b"PK\x01\x02");
-        let name_len = u16::from_le_bytes(buf[i + 28..i + 30].try_into().unwrap()) as usize;
-        let extra_len = u16::from_le_bytes(buf[i + 30..i + 32].try_into().unwrap()) as usize;
-        let comment_len = u16::from_le_bytes(buf[i + 32..i + 34].try_into().unwrap()) as usize;
-        if seen == 1 {
-            buf[i + 42..i + 46].copy_from_slice(&0u32.to_le_bytes());
-        }
-        seen += 1;
-        i += 46 + name_len + extra_len + comment_len;
-    }
-    assert_eq!(seen, 2);
+    patch_nth_cd_local_offset(&mut buf, 1, 0);
+    std::fs::write(path, buf).unwrap();
+}
+
+/// Equal-offset last-wins plus a truncated CD stub so homemade parse is `None`.
+/// Headers are still captured; restore is arm 1 (listing names, no `tail_blob`).
+pub fn write_truncated_cd_overlapping_local_zip(path: &Path) {
+    write_overlapping_local_zip(path);
+    let mut buf = std::fs::read(path).unwrap();
+    splice_trailing_cd_junk(&mut buf, &magic_but_short_cd_header());
+    std::fs::write(path, buf).unwrap();
+}
+
+/// B's CD local offset sits inside A's STORE cdata (planted local header).
+/// `read_local` overruns; slice `Err` → arm 3. ZipArchive still lists both names.
+pub fn write_range_overlap_local_zip(path: &Path) {
+    let b_name = "b.txt";
+    let b_data = b"B-payload";
+    let b_crc = crc32fast::hash(b_data);
+    let mut planted = Vec::new();
+    planted.extend_from_slice(b"PK\x03\x04");
+    planted.extend_from_slice(&20u16.to_le_bytes());
+    planted.extend_from_slice(&0u16.to_le_bytes());
+    planted.extend_from_slice(&0u16.to_le_bytes());
+    planted.extend_from_slice(&0u16.to_le_bytes());
+    planted.extend_from_slice(&0u16.to_le_bytes());
+    planted.extend_from_slice(&b_crc.to_le_bytes());
+    planted.extend_from_slice(&(b_data.len() as u32).to_le_bytes());
+    planted.extend_from_slice(&(b_data.len() as u32).to_le_bytes());
+    planted.extend_from_slice(&(b_name.len() as u16).to_le_bytes());
+    planted.extend_from_slice(&0u16.to_le_bytes());
+    planted.extend_from_slice(b_name.as_bytes());
+    planted.extend_from_slice(b_data);
+    let mut a_payload = b"AAAA".to_vec();
+    a_payload.extend_from_slice(&planted);
+    write_stored_zip(
+        path,
+        &[
+            ("a.txt", a_payload.as_slice(), crc32fast::hash(&a_payload)),
+            (b_name, b_data, b_crc),
+        ],
+    );
+    // a.txt local header is 30+5=35; planted b.txt local starts 4 bytes into cdata.
+    let b_off = 35u32 + 4;
+    let mut buf = std::fs::read(path).unwrap();
+    patch_nth_cd_local_offset(&mut buf, 1, b_off);
+    std::fs::write(path, buf).unwrap();
+}
+
+/// Equal-offset STORE aliases plus an unknown-deflate sibling, truncated CD.
+/// Homemade `None` + a csize-changing miss → arm 2 concat (listing names).
+pub fn write_truncated_cd_overlap_unknown_deflate_sibling(path: &Path) {
+    let payload = b"SAME-payload";
+    let miss = b"miss-payload-bbbb";
+    write_locals_and_cd(
+        path,
+        &[
+            BuiltLocal {
+                name: b"a.txt".to_vec(),
+                method: 0,
+                crc: crc32fast::hash(payload),
+                uncomp: payload.len() as u32,
+                cdata: payload.to_vec(),
+                extra: Vec::new(),
+            },
+            BuiltLocal {
+                name: b"b.txt".to_vec(),
+                method: 0,
+                crc: crc32fast::hash(payload),
+                uncomp: payload.len() as u32,
+                cdata: payload.to_vec(),
+                extra: Vec::new(),
+            },
+            BuiltLocal {
+                name: b"miss.bin".to_vec(),
+                method: 8,
+                crc: crc32fast::hash(miss),
+                uncomp: miss.len() as u32,
+                cdata: unknown_deflate(miss),
+                extra: Vec::new(),
+            },
+        ],
+    );
+    let mut buf = std::fs::read(path).unwrap();
+    patch_nth_cd_local_offset(&mut buf, 1, 0);
+    splice_trailing_cd_junk(&mut buf, &magic_but_short_cd_header());
     std::fs::write(path, buf).unwrap();
 }
 
@@ -859,6 +916,28 @@ pub fn write_leading_pad_pk_decoy_zip(path: &Path, name: &str, data: &[u8]) {
     std::fs::write(path, out).unwrap();
 }
 
+fn patch_nth_cd_local_offset(buf: &mut [u8], n: u32, new_off: u32) {
+    let eocd = classic_eocd_off(buf);
+    let cd_size = u32::from_le_bytes(buf[eocd + 12..eocd + 16].try_into().unwrap()) as usize;
+    let cd_off = u32::from_le_bytes(buf[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+    let mut i = cd_off;
+    let cd_end = cd_off + cd_size;
+    let mut seen = 0u32;
+    while i + 46 <= cd_end {
+        assert_eq!(&buf[i..i + 4], b"PK\x01\x02");
+        let name_len = u16::from_le_bytes(buf[i + 28..i + 30].try_into().unwrap()) as usize;
+        let extra_len = u16::from_le_bytes(buf[i + 30..i + 32].try_into().unwrap()) as usize;
+        let comment_len = u16::from_le_bytes(buf[i + 32..i + 34].try_into().unwrap()) as usize;
+        if seen == n {
+            buf[i + 42..i + 46].copy_from_slice(&new_off.to_le_bytes());
+            return;
+        }
+        seen += 1;
+        i += 46 + name_len + extra_len + comment_len;
+    }
+    panic!("CD record {n} not found");
+}
+
 fn classic_eocd_off(buf: &[u8]) -> usize {
     let mut i = buf.len() - 22;
     loop {
@@ -1097,35 +1176,7 @@ pub fn write_overlapping_local_plus_store_nested(path: &Path) {
         ],
     );
     let mut buf = std::fs::read(path).unwrap();
-    let eocd = {
-        let mut i = buf.len() - 22;
-        loop {
-            if buf[i..i + 4] == *b"PK\x05\x06" {
-                let comment_len = u16::from_le_bytes([buf[i + 20], buf[i + 21]]) as usize;
-                if i + 22 + comment_len == buf.len() {
-                    break i;
-                }
-            }
-            assert!(i > 0);
-            i -= 1;
-        }
-    };
-    let cd_size = u32::from_le_bytes(buf[eocd + 12..eocd + 16].try_into().unwrap()) as usize;
-    let cd_off = u32::from_le_bytes(buf[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
-    let mut i = cd_off;
-    let cd_end = cd_off + cd_size;
-    let mut seen = 0u32;
-    while i + 46 <= cd_end {
-        assert_eq!(&buf[i..i + 4], b"PK\x01\x02");
-        let name_len = u16::from_le_bytes(buf[i + 28..i + 30].try_into().unwrap()) as usize;
-        let extra_len = u16::from_le_bytes(buf[i + 30..i + 32].try_into().unwrap()) as usize;
-        let comment_len = u16::from_le_bytes(buf[i + 32..i + 34].try_into().unwrap()) as usize;
-        if seen == 1 {
-            buf[i + 42..i + 46].copy_from_slice(&0u32.to_le_bytes());
-        }
-        seen += 1;
-        i += 46 + name_len + extra_len + comment_len;
-    }
+    patch_nth_cd_local_offset(&mut buf, 1, 0);
     std::fs::write(path, buf).unwrap();
 }
 
