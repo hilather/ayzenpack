@@ -93,7 +93,7 @@ enum Cmd {
         overwrite: bool,
         #[arg(long)]
         only: Vec<String>,
-        /// Write each JAR to its recorded restore_path (overwrites; --dir unused)
+        /// Write each JAR to its recorded restore_path (sibling tmp then replace; --dir unused)
         #[arg(long)]
         restore_paths: bool,
     },

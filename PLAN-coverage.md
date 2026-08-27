@@ -20,7 +20,7 @@ Origin `matt-brewer/agent-skills` is not reachable. Skeptic loops use fresh adve
 - dest-dir rehydrate requires `--overwrite` if the dest exists
 - #36 signed warning, #37 Dataflow pair — other PRs
 
-`--restore-paths` skips the overwrite guard (`prepare_restore_dest` unlinks, then `File::create`). Hang new in-place tests off that same rule. Do not add `--overwrite`.
+`--restore-paths` skips the overwrite guard (`prepare_restore_dest` creates parents and does not unlink; writers emit sibling tmp then `replace_file`). Hang new in-place tests off that same rule. Do not add `--overwrite`.
 
 ---
 

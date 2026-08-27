@@ -781,7 +781,7 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
 }
 
 /// Sibling of `dest` (`all.ayz` → `all.ayz.tmp`) so `rename` stays on one filesystem.
-fn sibling_tmp_path(dest: &Path) -> PathBuf {
+pub(crate) fn sibling_tmp_path(dest: &Path) -> PathBuf {
     let mut name = dest
         .file_name()
         .map(|n| n.to_os_string())
@@ -831,7 +831,7 @@ impl Drop for PendingAyz {
     }
 }
 
-fn replace_file(from: &Path, to: &Path) -> Result<()> {
+pub(crate) fn replace_file(from: &Path, to: &Path) -> Result<()> {
     let map_err = |source| AyzenpackError::Io {
         source,
         path: Some(to.to_path_buf()),
@@ -841,6 +841,8 @@ fn replace_file(from: &Path, to: &Path) -> Result<()> {
         Err(e) => {
             // Windows cannot replace an existing dest with rename.
             if to.exists() {
+                #[cfg(windows)]
+                clear_dest_readonly(to)?;
                 fs::remove_file(to).map_err(map_err)?;
                 fs::rename(from, to).map_err(map_err)
             } else {
@@ -848,6 +850,24 @@ fn replace_file(from: &Path, to: &Path) -> Result<()> {
             }
         }
     }
+}
+
+/// `remove_file` of a readonly dest fails on Windows; dest is only unlinked here (replace time).
+#[cfg(windows)]
+fn clear_dest_readonly(to: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(to).map_err(|source| AyzenpackError::Io {
+        source,
+        path: Some(to.to_path_buf()),
+    })?;
+    if !meta.file_type().is_symlink() && meta.permissions().readonly() {
+        let mut perms = meta.permissions();
+        perms.set_readonly(false);
+        fs::set_permissions(to, perms).map_err(|source| AyzenpackError::Io {
+            source,
+            path: Some(to.to_path_buf()),
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

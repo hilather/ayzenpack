@@ -13,6 +13,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime, ZipWriter};
 
 use crate::cas;
+use crate::dehydrate::{replace_file, sibling_tmp_path};
 use crate::error::{AyzenpackError, Result};
 use crate::exact::{
     detect_offset_mode, encode_offset, patch_central_directory, patch_data_descriptor,
@@ -267,7 +268,9 @@ fn restore_dest(jar: &Jar) -> Result<PathBuf> {
     Ok(dest)
 }
 
-/// Unlink dest if it is a file or symlink; create missing parents as 0755.
+/// Create missing parents as 0755. Refuse a real directory dest.
+/// Dest is not unlinked: writers commit via sibling tmp + `replace_file` so a
+/// crash still leaves the original dest bytes.
 fn prepare_restore_dest(dest: &Path) -> Result<()> {
     match fs::symlink_metadata(dest) {
         Ok(meta) => {
@@ -277,7 +280,6 @@ fn prepare_restore_dest(dest: &Path) -> Result<()> {
                     dest.display()
                 )));
             }
-            remove_restore_dest(dest, &meta)?;
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(source) => {
@@ -288,28 +290,6 @@ fn prepare_restore_dest(dest: &Path) -> Result<()> {
         }
     }
     create_parent_dirs_0755(dest)
-}
-
-fn remove_restore_dest(dest: &Path, meta: &fs::Metadata) -> Result<()> {
-    #[cfg(windows)]
-    {
-        if !meta.file_type().is_symlink() && meta.permissions().readonly() {
-            let mut perms = meta.permissions();
-            perms.set_readonly(false);
-            fs::set_permissions(dest, perms).map_err(|source| AyzenpackError::Io {
-                source,
-                path: Some(dest.to_path_buf()),
-            })?;
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = meta;
-    }
-    fs::remove_file(dest).map_err(|source| AyzenpackError::Io {
-        source,
-        path: Some(dest.to_path_buf()),
-    })
 }
 
 fn create_parent_dirs_0755(dest: &Path) -> Result<()> {
@@ -448,11 +428,65 @@ fn set_restore_mode(dest: &Path, mode: u32) -> Result<()> {
     Ok(())
 }
 
-fn write_exact_jar(jar: &Jar, cas_dir: &Path, dest: &Path, apply_prefix_chmod: bool) -> Result<()> {
-    let mut file = File::create(dest).map_err(|source| AyzenpackError::Io {
+/// Sibling tmp for restore. Drop unlinks tmp unless `commit` renamed it onto dest.
+struct PendingRestore {
+    tmp: PathBuf,
+    dest: PathBuf,
+    committed: bool,
+}
+
+impl PendingRestore {
+    fn prepare(dest: &Path) -> Self {
+        Self {
+            tmp: sibling_tmp_path(dest),
+            dest: dest.to_path_buf(),
+            committed: false,
+        }
+    }
+
+    fn commit(mut self) -> Result<()> {
+        replace_file(&self.tmp, &self.dest)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for PendingRestore {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.tmp);
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_AFTER_RESTORE_TMP_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn maybe_inject_restore_tmp_failure() -> Result<()> {
+    #[cfg(test)]
+    {
+        if FAIL_AFTER_RESTORE_TMP_OPEN.with(std::cell::Cell::get) {
+            FAIL_AFTER_RESTORE_TMP_OPEN.with(|c| c.set(false));
+            return Err(AyzenpackError::Format("injected restore failure"));
+        }
+    }
+    Ok(())
+}
+
+fn create_restore_tmp(dest: &Path) -> Result<(File, PendingRestore)> {
+    let pending = PendingRestore::prepare(dest);
+    let file = File::create(&pending.tmp).map_err(|source| AyzenpackError::Io {
         source,
-        path: Some(dest.to_path_buf()),
+        path: Some(pending.tmp.clone()),
     })?;
+    maybe_inject_restore_tmp_failure()?;
+    Ok((file, pending))
+}
+
+fn write_exact_jar(jar: &Jar, cas_dir: &Path, dest: &Path, apply_prefix_chmod: bool) -> Result<()> {
+    let (mut file, pending) = create_restore_tmp(dest)?;
     let prefix_len = write_prefix(jar, cas_dir, dest, &mut file)?;
     if let Some(hex) = &jar.leading_pad_blob {
         let pad = read_named_blob(cas_dir, hex, &format!("{} leading_pad", jar.name))?;
@@ -485,7 +519,9 @@ fn write_exact_jar(jar: &Jar, cas_dir: &Path, dest: &Path, apply_prefix_chmod: b
                 source,
                 path: Some(dest.to_path_buf()),
             })?;
-        return finish_exact(dest, jar, prefix_len, apply_prefix_chmod);
+        drop(file);
+        finish_exact(&pending.tmp, jar, prefix_len, apply_prefix_chmod)?;
+        return pending.commit();
     }
 
     let tail = match (&jar.tail_blob, jar.tail_size) {
@@ -534,7 +570,9 @@ fn write_exact_jar(jar: &Jar, cas_dir: &Path, dest: &Path, apply_prefix_chmod: b
             source,
             path: Some(dest.to_path_buf()),
         })?;
-    finish_exact(dest, jar, prefix_len, apply_prefix_chmod)
+    drop(file);
+    finish_exact(&pending.tmp, jar, prefix_len, apply_prefix_chmod)?;
+    pending.commit()
 }
 
 fn write_exact_entry(
@@ -623,10 +661,7 @@ fn write_rebuilt_jar(
     dest: &Path,
     apply_prefix_chmod: bool,
 ) -> Result<()> {
-    let mut file = File::create(dest).map_err(|source| AyzenpackError::Io {
-        source,
-        path: Some(dest.to_path_buf()),
-    })?;
+    let (mut file, pending) = create_restore_tmp(dest)?;
     let prefix_len = write_prefix(jar, cas_dir, dest, &mut file)?;
 
     let tail = match (&jar.tail_blob, jar.tail_size) {
@@ -654,10 +689,11 @@ fn write_rebuilt_jar(
             source,
             path: Some(dest.to_path_buf()),
         })?;
+        drop(file);
         if prefix_len > 0 && apply_prefix_chmod {
-            chmod_executable(dest)?;
+            chmod_executable(&pending.tmp)?;
         }
-        return Ok(());
+        return pending.commit();
     }
 
     let first_lh = jar.entries[0].local_header_offset.ok_or_else(|| {
@@ -726,10 +762,11 @@ fn write_rebuilt_jar(
         source,
         path: Some(dest.to_path_buf()),
     })?;
+    drop(file);
     if prefix_len > 0 && apply_prefix_chmod {
-        chmod_executable(dest)?;
+        chmod_executable(&pending.tmp)?;
     }
-    Ok(())
+    pending.commit()
 }
 
 fn load_local_header(jar: &Jar, e: &Entry, cas_dir: &Path) -> Result<Vec<u8>> {
@@ -803,10 +840,7 @@ fn write_jar(
     dest: &Path,
     apply_prefix_chmod: bool,
 ) -> Result<()> {
-    let mut file = File::create(dest).map_err(|source| AyzenpackError::Io {
-        source,
-        path: Some(dest.to_path_buf()),
-    })?;
+    let (mut file, pending) = create_restore_tmp(dest)?;
     let prefix_len = write_prefix(jar, cas_dir, dest, &mut file)?;
     let mut writer = ZipWriter::new(ZipView::new(file, prefix_len));
     if !jar.comment.is_empty() {
@@ -889,9 +923,9 @@ fn write_jar(
 
     writer.finish().map_err(|err| zip_err(err, dest))?;
     if prefix_len > 0 && apply_prefix_chmod {
-        chmod_executable(dest)?;
+        chmod_executable(&pending.tmp)?;
     }
-    Ok(())
+    pending.commit()
 }
 
 fn write_prefix(
@@ -1107,5 +1141,108 @@ mod tests {
             matches!(err, AyzenpackError::FormatOwned(ref s) if s.contains("both blob and zip_index")),
             "{err}"
         );
+    }
+
+    #[test]
+    fn prepare_restore_dest_does_not_unlink_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("a.jar");
+        fs::write(&dest, b"keep-me").unwrap();
+        prepare_restore_dest(&dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"keep-me");
+    }
+
+    #[test]
+    fn prepare_restore_dest_refuses_directory_without_removing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("as_dir");
+        fs::create_dir(&dest).unwrap();
+        let err = prepare_restore_dest(&dest).unwrap_err();
+        assert!(
+            matches!(err, AyzenpackError::Usage(ref s) if s.contains("directory")),
+            "{err}"
+        );
+        assert!(dest.is_dir());
+    }
+
+    fn write_test_jar(path: &Path, files: &[(&str, &[u8])]) {
+        let mut z = ZipWriter::new(File::create(path).unwrap());
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        for (name, data) in files {
+            z.start_file(*name, opts).unwrap();
+            z.write_all(data).unwrap();
+        }
+        z.finish().unwrap();
+    }
+
+    fn assert_injected_restore_keeps_dest(err: AyzenpackError, dest: &Path, orig: &[u8]) {
+        assert!(
+            matches!(err, AyzenpackError::Format("injected restore failure")),
+            "inject hook must fire, got {err:?}"
+        );
+        assert_eq!(
+            fs::read(dest).unwrap(),
+            orig,
+            "failed restore must not unlink or truncate dest"
+        );
+        assert!(
+            !sibling_tmp_path(dest).exists(),
+            "temp must be deleted after injected failure"
+        );
+    }
+
+    #[test]
+    fn writer_tmp_open_failure_leaves_dest_original_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("a.jar");
+        let orig = b"source-bytes-must-remain";
+        let cas = dir.path().join("cas");
+        fs::create_dir(&cas).unwrap();
+        let jar = jar_restore(dest.to_str().unwrap());
+        let opts = RehydrateOptions {
+            quiet: true,
+            ..RehydrateOptions::default()
+        };
+
+        for backend in ["exact", "rebuild", "zipwriter"] {
+            fs::write(&dest, orig).unwrap();
+            FAIL_AFTER_RESTORE_TMP_OPEN.with(|c| c.set(true));
+            let err = match backend {
+                "exact" => write_exact_jar(&jar, &cas, &dest, false),
+                "rebuild" => write_rebuilt_jar(&jar, &cas, &dest, false),
+                "zipwriter" => write_jar(&opts, &jar, &cas, &dest, false),
+                _ => unreachable!(),
+            }
+            .unwrap_err();
+            assert_injected_restore_keeps_dest(err, &dest, orig);
+        }
+    }
+
+    #[test]
+    fn rehydrate_tmp_open_failure_leaves_dest_original_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let jar = dir.path().join("a.jar");
+        write_test_jar(&jar, &[("x.txt", b"source-bytes")]);
+        let orig = fs::read(&jar).unwrap();
+        let pack = dir.path().join("all.ayz");
+        crate::dehydrate::dehydrate(&crate::dehydrate::DehydrateOptions {
+            output: pack.clone(),
+            inputs: vec![jar.clone()],
+            restore_paths: true,
+            quiet: true,
+            ..crate::dehydrate::DehydrateOptions::default()
+        })
+        .unwrap();
+        assert_eq!(fs::read(&jar).unwrap(), orig);
+
+        FAIL_AFTER_RESTORE_TMP_OPEN.with(|c| c.set(true));
+        let err = rehydrate(&RehydrateOptions {
+            input: pack,
+            restore_paths: true,
+            quiet: true,
+            ..RehydrateOptions::default()
+        })
+        .unwrap_err();
+        assert_injected_restore_keeps_dest(err, &jar, &orig);
     }
 }

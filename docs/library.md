@@ -105,7 +105,7 @@ ayzenpack = { git = "https://github.com/hilather/ayzenpack" }
 | `clean` | `false` | unlink dest names we will write (not the whole dir) |
 | `overwrite` | `false` | refuse to clobber existing JARs (ignored when `restore_paths`) |
 | `only` | `[]` | jar `name`s from the manifest |
-| `restore_paths` | `false` | write to recorded `restore_path`; `--dir` unused |
+| `restore_paths` | `false` | write to recorded `restore_path`; `--dir` unused. Sibling tmp then `replace_file`; dest is not unlinked first |
 
 ---
 

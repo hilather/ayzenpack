@@ -248,7 +248,7 @@ ayzenpack rehydrate --restore-paths -i <ARCHIVE>
 |------|---------|
 | `-i, --input` | required `.ayz` |
 | `-d, --dir` | output directory (created). Required unless `--restore-paths` |
-| `--restore-paths` | write each jar to its recorded path (overwrites; `--dir` unused) |
+| `--restore-paths` | write each jar to its recorded path (sibling tmp then replace; `--dir` unused) |
 | `--store-all` | write ZIP entries stored (no deflate) |
 | `--overwrite` | default: fail if the target JAR exists (ignored with `--restore-paths`) |
 | `--only <NAME>` | repeatable; only those jar `name`s |

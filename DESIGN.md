@@ -171,7 +171,7 @@ v1 **content** rebuild (old archives) uses `name` (Unicode from `ZipFile::name()
 
 New packs store optional ZIP-slot index fields (omitted when absent, same style as `prefix_blob`). Unknown keys stay ignored on read. These fields point at CAS blobs and record local-header / tail bytes. They are not a license to store a second copy of entry payloads.
 
-`--restore-paths` dehydrate adds optional `jars[].restore_path` (canonical absolute path), `restore_mode`, and on Unix `restore_uid` / `restore_gid`. Omitted when the flag is off. Default rehydrate still writes `dir/name`. `--restore-paths` rehydrate writes `restore_path` (overwrites; dest symlink is replaced, not followed).
+`--restore-paths` dehydrate adds optional `jars[].restore_path` (canonical absolute path), `restore_mode`, and on Unix `restore_uid` / `restore_gid`. Omitted when the flag is off. Default rehydrate still writes `dir/name`. `--restore-paths` rehydrate writes `restore_path` (overwrites; dest symlink is replaced, not followed). Restore does **not** unlink dest first: every writer (`write_exact_jar` / `write_rebuilt_jar` / `write_jar`) emits a sibling `dest.file_name() + ".tmp"`, runs `set_len` / prefix `chmod` / exact `source_*` checks on that tmp, then `replace_file` onto dest. `apply_restore_attrs` runs on dest after replace. A failed restore Drop-unlinks tmp only; dest keeps its original bytes. Outer exact remains a file seek-walk on tmp (no outer `Vec`).
 
 ---
 

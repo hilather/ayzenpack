@@ -34,7 +34,7 @@ ayzenpack dehydrate --recursive --sort-inputs --restore-paths -o pack.ayz <dir-o
 ayzenpack rehydrate --restore-paths -i pack.ayz
 ```
 
-`--overwrite` is **not** used and is not required: `--restore-paths` skips the overwrite guard, `prepare_restore_dest` unlinks, then `write_exact_jar` / `write_rebuilt_jar` / `write_jar` `File::create`.
+`--overwrite` is **not** used and is not required: `--restore-paths` skips the overwrite guard. `prepare_restore_dest` creates parents and refuses a real directory dest (does **not** unlink). Writers emit sibling tmp then `replace_file`.
 
 0.2.3 **fixed** the ZipArchive latch (stub overwrite, e.g. 134 MB → 5.5 MB). Pack size is good. Rehydrate sizes are still wrong on Matt's retest (some improved).
 
