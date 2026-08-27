@@ -47,7 +47,13 @@ pub fn reconstruct_child_zip(
     }
 
     for e in &index.entries {
-        write_slot(&mut cur, e, expected_len, prefix.len() as u64, &mut get_blob)?;
+        write_slot(
+            &mut cur,
+            e,
+            expected_len,
+            prefix.len() as u64,
+            &mut get_blob,
+        )?;
     }
 
     let tail = match (&index.tail_blob, index.tail_size) {

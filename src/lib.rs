@@ -5,10 +5,10 @@ mod deflate;
 pub mod dehydrate;
 pub mod error;
 mod exact;
-mod reconstruct;
 pub mod format;
 pub mod hashutil;
 pub mod manifest;
+mod reconstruct;
 pub mod rehydrate;
 pub mod scan;
 pub mod stats;
@@ -157,7 +157,11 @@ pub fn verify(input: &Path) -> Result<()> {
             }
         }
         for (hex, sz, label) in [
-            (jar.leading_pad_blob.as_deref(), jar.leading_pad_size, "leading_pad"),
+            (
+                jar.leading_pad_blob.as_deref(),
+                jar.leading_pad_size,
+                "leading_pad",
+            ),
             (jar.tail_blob.as_deref(), jar.tail_size, "tail"),
             (jar.raw_zip_blob.as_deref(), jar.raw_zip_size, "raw_zip"),
         ] {

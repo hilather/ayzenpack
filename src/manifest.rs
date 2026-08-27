@@ -410,10 +410,7 @@ mod tests {
         assert!(SCHEMA_JSON.contains("leading_pad_blob"));
         assert!(SCHEMA_JSON.contains("nestedindexes"));
         assert!(SCHEMA_JSON.contains("\"nestedindex\""));
-        assert!(
-            !SCHEMA_JSON.contains("oneOf"),
-            "schema must not use oneOf"
-        );
+        assert!(!SCHEMA_JSON.contains("oneOf"), "schema must not use oneOf");
         assert!(!SCHEMA_JSON.contains("jded"));
         assert_eq!(m.version, 1);
         assert_eq!(m.hash_algo, "blake3");
