@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/banner.jpg" alt="ayzenpack — content-addressed JAR archives" width="1200">
+  <img src="https://raw.githubusercontent.com/hilather/ayzenpack/main/docs/banner.jpg" alt="ayzenpack — content-addressed JAR archives" width="1200">
 </p>
 
 <p align="center">
@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/hilather/ayzenpack/actions/workflows/ci.yml"><img src="https://github.com/hilather/ayzenpack/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-e0b15a?style=flat-square" alt="license"></a>
+  <a href="https://github.com/hilather/ayzenpack/blob/main/LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-e0b15a?style=flat-square" alt="license"></a>
   <img src="https://img.shields.io/badge/MSRV-1.80-6ee7e0?style=flat-square" alt="MSRV 1.80">
   <img src="https://img.shields.io/badge/unsafe-forbidden-b91c1c?style=flat-square" alt="unsafe forbidden">
 </p>
@@ -54,7 +54,7 @@ cargo install --path .
 
 ### Rocky Linux packages
 
-Release tags `v*` run [Packages](.github/workflows/packages.yml) and attach **Rocky Linux 8 and Rocky Linux 9** RPMs plus tarballs (cosign keyless signatures included).
+Release tags `v*` run [Packages](https://github.com/hilather/ayzenpack/blob/main/.github/workflows/packages.yml) and attach **Rocky Linux 8 and Rocky Linux 9** RPMs plus tarballs (cosign keyless signatures included).
 
 ```text
 sudo dnf install ./ayzenpack-*.x86_64.rpm
@@ -118,15 +118,15 @@ fn pack_classpath() -> ayzenpack::Result<()> {
 }
 ```
 
-`list(path)` returns the embedded [`Manifest`](schemas/manifest.v1.schema.json) — that is the archive catalog, not a sidecar you have to keep in sync.
+`list(path)` returns the embedded [`Manifest`](https://github.com/hilather/ayzenpack/blob/main/schemas/manifest.v1.schema.json) — that is the archive catalog, not a sidecar you have to keep in sync.
 
-Full options, YAML job files, and GitHub Actions: **[docs/library.md](docs/library.md)**.
+Full options, YAML job files, and GitHub Actions: **[docs/library.md](https://github.com/hilather/ayzenpack/blob/main/docs/library.md)**.
 
 ---
 
 ## YAML job state
 
-The crate does not parse YAML itself. Load a job file with `serde_yaml`, map it onto `DehydrateOptions` / `RehydrateOptions`, then call the library. A starter file lives at [`examples/ayzenpack.yaml`](examples/ayzenpack.yaml):
+The crate does not parse YAML itself. Load a job file with `serde_yaml`, map it onto `DehydrateOptions` / `RehydrateOptions`, then call the library. A starter file lives at [`examples/ayzenpack.yaml`](https://github.com/hilather/ayzenpack/blob/main/examples/ayzenpack.yaml):
 
 ```yaml
 format: ayzenpack-job
@@ -152,25 +152,25 @@ rehydrate:
   overwrite: true
 ```
 
-See [docs/library.md](docs/library.md#load-a-yaml-job-file) for the loader.
+See [docs/library.md](https://github.com/hilather/ayzenpack/blob/main/docs/library.md#load-a-yaml-job-file) for the loader.
 
 ---
 
 ## Reconstruction
 
-**Storage efficiency is of the utmost importance.** New packs store **one** CAS blob per unique uncompressed entry (BLAKE3 of those bytes) and a ZIP-slot **index** (name, CD order, method, CRC, sizes, local header / descriptor / pad, tail, prefix, blob hash). Format v2 zstd-compresses those uncompressed blobs in 4 MiB record-aligned groups. The original already-deflated ZIP payload must **not** be stored a second time. Crate **0.2.1** never writes `cdata_blob` (file or dir, any method). 0.2.0 MixedExact leftover still reads.
+**Storage efficiency is of the utmost importance.** Priorities: (1) lean pack (2) complete rehydrate (3) class-level dedup. New packs store **one** CAS blob per unique uncompressed entry (BLAKE3 of those bytes) and a ZIP-slot **index** (name, CD order, method, CRC, sizes, local header / descriptor / pad, tail, prefix, blob hash). Format v2 zstd-compresses those uncompressed blobs in 4 MiB record-aligned groups. The original already-deflated ZIP payload must **not** be stored a second time. Crate **0.2.1** never writes `cdata_blob` (file or dir, any method). 0.2.0 MixedExact leftover still reads.
 
-Rehydrate rebuilds a **valid ZIP** from index + blobs: STORE splice, a `cdata_codec` hit (`deflate-raw:flate2:*`, `deflate-raw:zlib:{1,6,9}`, or `deflate-raw:stored`) if one happened at pack time, a depth-1 child `zip_index`, or otherwise a rebuild (new compressed sizes). Whole-file `source_*` hashes may change. That is acceptable. Do not store `cdata_blob` or `raw_zip` a healthy jar to keep hashes. Spring Boot fully-executable JARs keep `[official launch.script][zip]`.
+Rehydrate rebuilds a **valid ZIP** from index + blobs: STORE splice, a `cdata_codec` hit (`deflate-raw:flate2:*`, `deflate-raw:zlib:{1,6,9}`, or `deflate-raw:stored`) if one happened at pack time, a depth-1 child `zip_index`, or otherwise a rebuild (new compressed sizes). Outer exact is a file seek-walk (no outer `Vec`). `source_*` **must** match iff `bit_identical_restore` (every slot hits + tail / `raw_zip`, including leftover-junk listed zips that gained a tail). Miss / remaining skip-exact / homemade-`None` / overlap may change hashes; dest is a valid ZIP in the same size league. That is acceptable. Do not store `cdata_blob` or `raw_zip` a healthy jar to keep hashes. Never CAS `blake3(inner zip)` on a `zip_index` slot. Spring Boot fully-executable JARs keep `[official launch.script][zip]`.
 
 0.1.6–0.1.8 packs that still have `cdata_blob` still read. New packs must not write that shape. A listed jar (`entries[]` populated) is never stored as `raw_zip_blob`: rebuild from index + CAS, or skip-exact `write_jar`. `raw_zip` only if listing never produced `entries[]`. Crate **0.2.2** never writes `raw_zip` of a listed jar. Crate **0.2.3** rejects a `ZipArchive` that latched onto a STORE nested EOCD.
 
 **Old archives** (0.1.4 / 0.1.5, no `tail` / `raw_zip` fields) still rehydrate via `ZipWriter`: uncompressed bytes, names, CD order, and CRC match; the deflate bitstream and extras do not. `--verbatim` is **not** a CLI flag.
 
-Spring Boot launchers (including after `zip -A` and Zip64) keep the existing prefix detection. Nested `BOOT-INF/lib/*.jar` entries are not exploded.
+Spring Boot launchers (including after `zip -A` and Zip64) keep the existing prefix detection. STORE listable nested `BOOT-INF/lib/*.jar` become depth-1 `zip_index` (reassembled from shared class blobs; never CAS `blake3(inner zip)`). DEFLATE-wrapped nested libs stay opaque.
 
-Skip-exact / content-mode `ZipWriter` STOREs directories, `--store-all`, `method_code == 0`, and `zip_index`; method-8 files DEFLATE at `deflate_level`. Payload is uncompressed (`reconstruct_child_zip` for nested STORE libs). `source_*` may change.
+Leftover junk after N complete CD records with `N == ZipArchive::len()` is homemade_ok + `tail_blob` (exact when every slot hits). Remaining homemade-`None` never gets `tail_blob`. Skip-exact / content-mode `ZipWriter` STOREs directories, `--store-all`, `method_code == 0`, and `zip_index`; method-8 files DEFLATE at `deflate_level`. Payload is uncompressed (`reconstruct_child_zip` for nested STORE libs). Never `resolve_cdata`. Synthetic CD is parked. Mix packs keep `cdata_blob == 0` and `output_len <= 569539 * 115 / 100`. Corpus lucene/jackson `source_*` stays gated until every method-8 slot is a measured hit.
 
-Agent rules: [`AGENTS.md`](AGENTS.md). Design: [`DESIGN.md`](DESIGN.md).
+Agent rules: [`AGENTS.md`](https://github.com/hilather/ayzenpack/blob/main/AGENTS.md). Design: [`DESIGN.md`](https://github.com/hilather/ayzenpack/blob/main/DESIGN.md).
 
 ---
 
@@ -200,11 +200,11 @@ One file. Uncompressed header (`AYZP` + version 2), record-aligned zstd BLOB gro
 └──────────────────────────────┘
 ```
 
-Dedup key is **BLAKE3** of uncompressed entry bytes. SHA-256 of the same bytes is recorded for integrity, never used as the CAS key. Nested JARs are opaque blobs; they are not exploded.
+Dedup key is **BLAKE3** of uncompressed entry bytes (class-level: same payload across JARs and nested STORE libs is one blob). SHA-256 of the same bytes is recorded for integrity, never used as the CAS key. STORE listable nested JARs are `zip_index` + shared class blobs, not a second whole-ZIP CAS.
 
-The MANIFEST is compact JSON with `"format": "ayzenpack-manifest"`. Field names in [`schemas/manifest.v1.schema.json`](schemas/manifest.v1.schema.json) and [`examples/tiny.manifest.json`](examples/tiny.manifest.json) are the v1 contract.
+The MANIFEST is compact JSON with `"format": "ayzenpack-manifest"`. Field names in [`schemas/manifest.v1.schema.json`](https://github.com/hilather/ayzenpack/blob/main/schemas/manifest.v1.schema.json) and [`examples/tiny.manifest.json`](https://github.com/hilather/ayzenpack/blob/main/examples/tiny.manifest.json) are the v1 contract.
 
-Layout, hashing, and the memory model: **[DESIGN.md](DESIGN.md)**.
+Layout, hashing, and the memory model: **[DESIGN.md](https://github.com/hilather/ayzenpack/blob/main/DESIGN.md)**.
 
 ---
 
@@ -273,7 +273,7 @@ ayzenpack verify -i libs.ayz
 
 Licensed under either of
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](https://github.com/hilather/ayzenpack/blob/main/LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](https://github.com/hilather/ayzenpack/blob/main/LICENSE-MIT))
 
 at your option. Dual license: **MIT OR Apache-2.0**.

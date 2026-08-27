@@ -12,6 +12,7 @@ const EXAMPLE: &str = include_str!(concat!(
 const AGENTS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/AGENTS.md"));
 const DESIGN: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/DESIGN.md"));
 const PLAN: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/PLAN.md"));
+const LIBRARY: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/library.md"));
 
 #[test]
 fn readme_contains_ayzenpack_dehydrate_example() {
@@ -166,5 +167,93 @@ fn agents_md_locks_single_cas_and_zstd_blocks() {
     assert!(
         README.contains("Crate **0.2.1** never writes `cdata_blob` (file or dir, any method)"),
         "README must say 0.2.1 never writes leftover cdata_blob"
+    );
+}
+
+#[test]
+fn docs_lock_leftover_junk_hash_policy_and_class_dedup() {
+    // Full sentences, not keyword soup. An inverted stub must fail.
+    assert!(
+        DESIGN.contains("**Priorities (in order):**")
+            && DESIGN.contains("1. **Lean pack.**")
+            && DESIGN.contains("2. **Complete rehydrate.**")
+            && DESIGN.contains("3. **Class-level dedup.**"),
+        "DESIGN.md must list priorities 1/2/3: lean pack, complete rehydrate, class-level dedup"
+    );
+    assert!(
+        DESIGN.contains("Never CAS `blake3(inner zip)` when the slot is `zip_index`"),
+        "DESIGN.md must forbid CAS of blake3(inner zip) on zip_index"
+    );
+    assert!(
+        DESIGN.contains(
+            "**Leftover-junk CD:** N complete CD records + trailing junk with `N == ZipArchive::len()` is homemade_ok + `tail_blob`"
+        ),
+        "DESIGN.md must document leftover-junk as homemade_ok + tail_blob"
+    );
+    assert!(
+        DESIGN.contains(
+            "Remaining homemade-`None` (true parse failure, truncated/malformed CD, overlap, prefix+hole) **never** gets `tail_blob`"
+        ) && DESIGN.contains("Never attach tail while homemade parse is `None`"),
+        "DESIGN.md must say remaining homemade-None never gets tail_blob"
+    );
+    assert!(
+        DESIGN.contains("Outer exact (`write_exact_jar`) is a **file seek-walk**")
+            && DESIGN.contains("Synthetic CD is parked"),
+        "DESIGN.md must say outer exact is a file seek-walk and synthetic CD is parked"
+    );
+    assert!(
+        DESIGN.contains("### Restore hash policy")
+            && DESIGN.contains("`source_*` **must** match iff `Jar::bit_identical_restore()`"),
+        "DESIGN.md must document restore hash policy: match iff bit_identical_restore"
+    );
+    assert!(
+        DESIGN.contains("Corpus lucene/jackson `source_*` stays gated")
+            && DESIGN.contains("mix `.ayz` `output_len <= 569539 * 115 / 100`")
+            && DESIGN.contains("`cdata_blob == 0` on every mix entry"),
+        "DESIGN.md must keep mix gates and gated corpus lucene/jackson source_*"
+    );
+    assert!(
+        DESIGN.contains(
+            "Remaining skip-exact uses `write_jar` ZipWriter that STOREs `method_code == 0` / `zip_index` over uncompressed payload (`read_entry_content` / `reconstruct_child_zip`); never `resolve_cdata`"
+        ),
+        "DESIGN.md must document skip-exact ZipWriter STORE over uncompressed payload"
+    );
+    assert!(
+        README.contains("Priorities: (1) lean pack (2) complete rehydrate (3) class-level dedup")
+            && README.contains("`source_*` **must** match iff `bit_identical_restore`")
+            && README.contains("Never CAS `blake3(inner zip)` on a `zip_index` slot")
+            && README.contains("Remaining homemade-`None` never gets `tail_blob`")
+            && README.contains("Synthetic CD is parked"),
+        "README must document priorities, hash match iff bit_identical_restore, leftover-junk vs homemade-None, parked synthetic CD"
+    );
+    assert!(
+        README.contains("STORE listable nested `BOOT-INF/lib/*.jar` become depth-1 `zip_index`")
+            && !README.contains("Nested `BOOT-INF/lib/*.jar` entries are not exploded")
+            && !README.contains("Nested JARs are opaque blobs; they are not exploded"),
+        "README must document nested STORE as zip_index + shared class blobs, not opaque whole-ZIP CAS"
+    );
+    assert!(
+        README.contains("https://github.com/hilather/ayzenpack/blob/main/DESIGN.md")
+            && README.contains("https://github.com/hilather/ayzenpack/blob/main/AGENTS.md")
+            && README.contains("https://github.com/hilather/ayzenpack/blob/main/docs/library.md"),
+        "README must use absolute HTTPS links for DESIGN, AGENTS, and library docs"
+    );
+    assert!(
+        README.contains("Do not store `cdata_blob` or `raw_zip` a healthy jar to keep hashes")
+            && !README.contains("## Reconstruction guarantee")
+            && !README.contains("bit-identical restore is the guarantee"),
+        "README must not tell agents to store cdata_blob or chase bit-identical hashes"
+    );
+    assert!(
+        LIBRARY.contains("`source_*` must match iff `bit_identical_restore`")
+            && LIBRARY.contains("never CAS `blake3(inner zip)`")
+            && LIBRARY.contains("Remaining homemade-`None` never gets `tail_blob`")
+            && LIBRARY.contains("Do not store `cdata_blob`")
+            && LIBRARY.contains("Do not chase bit-identical hashes on a miss")
+            && LIBRARY.contains("https://github.com/hilather/ayzenpack/blob/main/DESIGN.md")
+            && LIBRARY.contains(
+                "https://github.com/hilather/ayzenpack/blob/main/examples/ayzenpack.yaml"
+            ),
+        "docs/library.md must document hash policy, class-level dedup, leftover-junk, and absolute HTTPS links"
     );
 }

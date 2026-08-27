@@ -13,6 +13,8 @@ No clap in the lib. No process-global flags. Quiet / verbose / json-logs are fie
 
 `#![forbid(unsafe_code)]` is on `lib.rs`.
 
+Restore policy (see [DESIGN.md](https://github.com/hilather/ayzenpack/blob/main/DESIGN.md)): `source_*` must match iff `bit_identical_restore`. Skip-exact ZipWriter STOREs `method_code == 0` / `zip_index` over uncompressed payload (`read_entry_content` / `reconstruct_child_zip`); never `resolve_cdata`. Nested STORE is `zip_index` + shared class blobs — never CAS `blake3(inner zip)`. Remaining homemade-`None` never gets `tail_blob`. Do not store `cdata_blob`. Do not chase bit-identical hashes on a miss.
+
 ---
 
 ## Pack and restore
@@ -113,7 +115,7 @@ ayzenpack = { git = "https://github.com/hilather/ayzenpack" }
 
 There is no YAML parser inside ayzenpack. Job state is yours: a file, a CI secret, a struct. Deserialize it, then fill the options.
 
-Starter: [`examples/ayzenpack.yaml`](../examples/ayzenpack.yaml).
+Starter: [`examples/ayzenpack.yaml`](https://github.com/hilather/ayzenpack/blob/main/examples/ayzenpack.yaml).
 
 ```toml
 # your binary / build tool
@@ -243,7 +245,7 @@ jobs:
           path: dist/libs.ayz
 ```
 
-Rocky RPM install in CI is the other path — see `.github/workflows/packages.yml`.
+Rocky RPM install in CI is the other path — see [`.github/workflows/packages.yml`](https://github.com/hilather/ayzenpack/blob/main/.github/workflows/packages.yml).
 
 ---
 

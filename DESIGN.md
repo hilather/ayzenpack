@@ -2,7 +2,7 @@
 
 ayzenpack dehydrates a set of JAR/ZIP/WAR/EAR files into one `.ayz` archive and rehydrates them. **Storage efficiency is of the utmost importance.** Dedup is **BLAKE3 of uncompressed entry bytes** — one CAS blob per unique payload. The manifest is a ZIP-slot **index** (ratarmount-style pointers), not a second copy of file bytes. New packs are **format v2**: uncompressed header, record-aligned zstd BLOB groups (the only pack compression), a final zstd frame of MANIFEST+END, an uncompressed TOC, and a 64-byte trailer. v1 files (one zstd frame, no TOC) still read and rehydrate.
 
-This is the v2 format and library contract. Standing agent rules: [`AGENTS.md`](AGENTS.md). CLI flag names live in `src/cli.rs` and the README. Manifest JSON field names are unchanged from v1. Do not rename `blob`, `local_header_offset`, `cdata_blob`, ….
+This is the v2 format and library contract. Standing agent rules: [`AGENTS.md`](https://github.com/hilather/ayzenpack/blob/main/AGENTS.md). CLI flag names live in `src/cli.rs` and the [README](https://github.com/hilather/ayzenpack/blob/main/README.md). Manifest JSON field names are unchanged from v1. Do not rename `blob`, `local_header_offset`, `cdata_blob`, ….
 
 | | |
 |---|---|
@@ -14,6 +14,12 @@ This is the v2 format and library contract. Standing agent rules: [`AGENTS.md`](
 | MSRV | Rust 1.80, edition 2021, stable only |
 | License | MIT OR Apache-2.0 |
 | `unsafe` | forbidden |
+
+**Priorities (in order):**
+
+1. **Lean pack.** Keep the `.ayz` as small as the contract allows (mix `output_len` gate, no dual encodings, no `cdata_blob`, no `raw_zip` of a listed jar).
+2. **Complete rehydrate.** Dest JARs restore the outer listing and nested STORE payload bytes from index + blobs. `source_*` **must** match when every slot hits (`bit_identical_restore`).
+3. **Class-level dedup.** Same `.class` (and any other uncompressed payload) across JARs — including depth-1 nested STORE libs — is **one** CAS blob keyed by BLAKE3 of uncompressed entry bytes. Restore reassembles inner ZIPs from the child stencil + those shared blobs (`reconstruct_child_zip`). Never CAS `blake3(inner zip)` when the slot is `zip_index`.
 
 ---
 
@@ -161,7 +167,7 @@ Hex is lowercase on write, mixed-case accepted on read.
 
 Compact JSON inside the archive. Sidecar may be pretty (`--write-sidecar-manifest` / `--pretty-manifest`). Snake_case field names are the v1 contract — do not rename them. Serde does **not** `deny_unknown_fields`; extra keys in a future v1.1 archive must still `list` / `rehydrate`. Schema `additionalProperties: false` is a writer check.
 
-Canonical schema: [`schemas/manifest.v1.schema.json`](schemas/manifest.v1.schema.json). Example: [`examples/tiny.manifest.json`](examples/tiny.manifest.json).
+Canonical schema: [`schemas/manifest.v1.schema.json`](https://github.com/hilather/ayzenpack/blob/main/schemas/manifest.v1.schema.json). Example: [`examples/tiny.manifest.json`](https://github.com/hilather/ayzenpack/blob/main/examples/tiny.manifest.json).
 
 Root: `format`, `version`, `hash_algo`, `mode`, `jars[]`, `blobs[]`, `stats`.
 
@@ -189,13 +195,15 @@ The original JAR is gone after dehydrate. What remains:
 
 **Forbidden on write:** a second encoding of the same entry. No default `cdata_blob` beside the content blob. No `raw_zip` of a listed jar (`entries[]` already populated). Count mismatch and homemade parse failure on a listed jar are skip-exact, not `raw_zip`. `raw_zip` only if listing never produced `entries[]` (`UnsupportedArchive` spanning / `NotZip`). Do not store pre-deflated ZIP cdata as the CAS payload. Do not switch to per-file zstd frames.
 
-Crate **0.2.1** never writes leftover `cdata_blob`. Crate **0.2.2** never writes `raw_zip` of a listed jar. Crate 0.2.0 MixedExact / class-4 dual copies still read. [`PLAN.md`](PLAN.md) / [`AGENTS.md`](AGENTS.md). New work must not add more dual copies.
+Crate **0.2.1** never writes leftover `cdata_blob`. Crate **0.2.2** never writes `raw_zip` of a listed jar. Crate 0.2.0 MixedExact / class-4 dual copies still read. [`PLAN.md`](https://github.com/hilather/ayzenpack/blob/main/PLAN.md) / [`AGENTS.md`](https://github.com/hilather/ayzenpack/blob/main/AGENTS.md). New work must not add more dual copies. Mix identity gates stay: `cdata_blob == 0` on every mix entry; mix `.ayz` `output_len <= 569539 * 115 / 100`. Do not loosen either. Corpus lucene/jackson `source_*` stays gated until every method-8 slot is a measured hit.
 
 ---
 
 ## Reconstruction
 
-Rehydrate builds a **valid ZIP** from index + blobs. Paths, in order:
+Rehydrate builds a **valid ZIP** from index + blobs. Outer exact (`write_exact_jar`) is a **file seek-walk** on a sibling tmp (no outer `Vec`). `Vec<u8>` is only for nested children (`reconstruct_child_zip`) and `verify`. Skip-exact has no tail and does not pre-size to `source_size`. Synthetic CD is parked; skip-exact is ZipWriter + STORE.
+
+Paths, in order:
 
 - **STORE:** splice the content `blob` at the recorded local offset. No `cdata_blob`.
 - **DEFLATE codec hit:** optional `cdata_codec` when a pack-time trial matched original cdata: `deflate-raw:zlib:{1,6,9}` (in-process zlib-rs, raw/nowrap), `deflate-raw:flate2:{1,3,6,9}` (existing miniz), or `deflate-raw:stored` (BTYPE 00). Rehydrate encodes and splices. A hit is luck, not a goal. A miss must not drop sibling codecs.
@@ -204,14 +212,29 @@ Rehydrate builds a **valid ZIP** from index + blobs. Paths, in order:
 - **Skip-exact** (no `tail_blob`, no `raw_zip`; remaining homemade-`None`, overlap, slice `Err`): `zip::ZipWriter`. Payload is always uncompressed (`read_entry_content` / `reconstruct_child_zip`). STORE when `is_dir`, `--store-all`, `method_code == 0`, or `zip_index`. Method-8 misses DEFLATE at `deflate_level` (zip crate, not `deflate_raw` 6). Never `resolve_cdata` / `encode_codec`. Never seek `offsetheader`. Never `verify_source_identity`. Nested STORE `zip_index` members stay STORE (reassembled from shared class blobs; never late-CAS `blake3(inner zip)`). Dest size stays in the same league (`restored * 2 >= source`). **`source_*` may change.**
 - **Legacy `cdata_blob`:** read 0.1.6–0.1.8 dual-copy packs and 0.2.0 MixedExact leftovers. **Never write this shape again.** Maven/Java empty DEFLATE directories (`03 00`, usize 0) are codec/empty, not exotic.
 
+**Leftover-junk CD:** N complete CD records + trailing junk with `N == ZipArchive::len()` is homemade_ok + `tail_blob` (phys CD→EOF, junk included). Those listed zips take the exact **file seek-walk** when every slot hits; `source_*` **must** match. Remaining homemade-`None` (true parse failure, truncated/malformed CD, overlap, prefix+hole) **never** gets `tail_blob`. Never attach tail while homemade parse is `None`.
+
 Per jar: `tail_blob` / `tail_size` is the CD-through-EOF index blob (structural, not a second copy of entry payloads).
 
 `raw_zip_blob` is only for a zip that cannot be listed at all. It is not the codec-miss path, not the exotic-sibling path, and not a slice/count-mismatch fallback.
 
 **Old archives** (no tail / `raw_zip`): keep the 0.1.x `ZipWriter` path, with STORE for `method_code == 0` and `zip_index`. `--verbatim` is not a CLI flag.
 
+### Restore hash policy
+
+`source_*` **must** match iff `Jar::bit_identical_restore()`. Hash matching is a restore-time walk of the stencil over shared CAS blobs. Do not buy a match by storing `cdata_blob`, `raw_zip` of a listed jar, or `blake3(inner zip)` next to exploded class blobs.
+
+| Condition | `source_*` | Dest size vs source | Listing |
+|---|---|---|---|
+| Every slot hits + tail / raw_zip (`bit_identical_restore`), including leftover-junk listed zips that gained a tail | **must match** | equal (`set_len(source_size)` + `verify_source_identity`) | identical bytes |
+| Per-entry codec miss, tail present (`metadata_rebuild`) | may change | same league (pads/hole may drop) | names, uncompressed bytes, CRC |
+| Remaining homemade-`None` / overlap / slice `Err` (skip-exact) | may change | **must stay same league**; not inner-sized | outer names; nested STORE payload bytes match `reconstruct_child_zip` |
+| 0.1.x archive, no tail | may change | `ZipWriter` functional identity | names, uncompressed, CRC |
+
+Always-on hash gates: baked zlib-rs bitstream; STORE zip-A fat after `zip_index`; leading-pad PK decoy; leftover-junk listed zip when every slot hits. Corpus lucene/jackson `source_*` stays gated on 100% measured method-8 / zlib hits (`AYZENPACK_CORPUS_DIR`); not always-on CI until those counts are 100%. Mix `cdata_blob == 0` and `output_len <= 569539 * 115 / 100` stay.
+
 ```
-∀ jar (STORE splice / codec-hit / zip_index / legacy cdata_blob / raw_zip):
+∀ jar (STORE splice / codec-hit / zip_index / leftover-junk exact / legacy cdata_blob / raw_zip):
   restored_bytes == source_bytes
   blake3(restored) == jars[].source_blake3
   sha256(restored) == jars[].source_sha256
@@ -262,7 +285,7 @@ The original JAR is still gone after dehydrate. The index is a ratarmount-style 
 
 Closed codec set (record the id that hit original cdata; restore re-encodes): STORE; `deflate-raw:zlib:{1,6,9}` (in-process zlib-rs, not a Java `Deflater` process); `deflate-raw:flate2:{1,3,6,9}`; `deflate-raw:stored`. Other methods rebuild **that entry**. No new `cdata_blob`. A miss must not drop sibling codecs.
 
-A healthy zip -A fat whose first local is the prefix already slices on 0.2.3. Remaining skip-exact: homemade CD parse `None` (**never** `tail_blob`; `write_jar` STOREs `method_code == 0` / `zip_index`) and leading pad (`leading_pad_blob` on a PK-start hole, do not extend `prefix_len`; prefix+hole stays skip-exact). Decide `zip_index` vs opaque before `jobs==1` `commit_blob` and before `--jobs` `spawn_file` via `scan_from_bytes` + `slice_from_bytes` on the STORE payload. After the child `NestedIndex` is built, `probe_explode` reconstructs against the in-hand pending blobs and requires those bytes equal the STORE payload. Mismatch (including child codec length) is opaque `commit_blob` of the combined ZIP **instead of** explode — never both. Do not use `Jar::bit_identical_restore()` as the probe predicate (child tail is still pending). Child `Encrypted` / empty listing / overlap / homemade count mismatch / ZipArchive latch / listing `uncompressed_size` > `--max-entry-bytes` / file-entry count > 65535 → opaque (do not fail the outer). Opaque is **instead of** explode: one combined-inner blob, not a latched inner-inner `zip_index` and not explode-plus-inner dual copy. Prefixed children already ran `zip_archive_opens` in `detect_zip_layout`. If `prefix_len == 0`, `scan_from_bytes` still requires homemade CD count (`find_cd_bounds`) == `ZipArchive::len()`; mismatch is `Err`. Do not require first `header_start == 0` (that is leading_pad). Encrypted outer still fails. `--jobs` applies inner `remember_blob` only from `Sequenced::Exploded` (one seq; first-seen stays jobs-invariant). Child stencil is tail-bearing (child `leading_pad_blob` if the inner ZIP has a hole); cap child file entries at 65535. Never CAS the whole inner ZIP if the slot is a `zip_index`. `verify` / `write_jar` / exact / rebuild all use `reconstruct_child_zip(index, get_blob)`.
+A healthy zip -A fat whose first local is the prefix already slices on 0.2.3. Leftover junk after N complete CD records with `N == ZipArchive::len()` is homemade_ok + `tail_blob` (exact file seek-walk when every slot hits). Remaining homemade-`None` (true parse failure, truncated/malformed CD) **never** gets `tail_blob`; never attach tail while parse is `None`. Overlap / prefix+hole / slice `Err` are other skip-exact reasons. Remaining skip-exact uses `write_jar` ZipWriter that STOREs `method_code == 0` / `zip_index` over uncompressed payload (`read_entry_content` / `reconstruct_child_zip`); never `resolve_cdata`. Leading pad is `leading_pad_blob` on a PK-start hole (do not extend `prefix_len`; prefix+hole stays skip-exact). Decide `zip_index` vs opaque before `jobs==1` `commit_blob` and before `--jobs` `spawn_file` via `scan_from_bytes` + `slice_from_bytes` on the STORE payload. After the child `NestedIndex` is built, `probe_explode` reconstructs against the in-hand pending blobs and requires those bytes equal the STORE payload. Mismatch (including child codec length) is opaque `commit_blob` of the combined ZIP **instead of** explode — never both. Do not use `Jar::bit_identical_restore()` as the probe predicate (child tail is still pending). Child `Encrypted` / empty listing / overlap / homemade count mismatch / ZipArchive latch / listing `uncompressed_size` > `--max-entry-bytes` / file-entry count > 65535 → opaque (do not fail the outer). Opaque is **instead of** explode: one combined-inner blob, not a latched inner-inner `zip_index` and not explode-plus-inner dual copy. Prefixed children already ran `zip_archive_opens` in `detect_zip_layout`. If `prefix_len == 0`, `scan_from_bytes` still requires homemade CD count (`find_cd_bounds`) == `ZipArchive::len()`; mismatch is `Err`. Do not require first `header_start == 0` (that is leading_pad). Encrypted outer still fails. `--jobs` applies inner `remember_blob` only from `Sequenced::Exploded` (one seq; first-seen stays jobs-invariant). Child stencil is tail-bearing (child `leading_pad_blob` if the inner ZIP has a hole); cap child file entries at 65535. Never CAS the whole inner ZIP if the slot is a `zip_index`. `verify` / `write_jar` / exact / rebuild all use `reconstruct_child_zip(index, get_blob)`.
 
 Old packs still read (opaque nested blob, flate2-only `cdata_codec`, zip-rel `local_header_offset`). New packs may add `offsetheader` / `data_start` / `zip_index` / `nestedindexes`. 0.2.3 cannot restore a pack that replaced a nested blob with `zip_index`.
 
@@ -285,7 +308,7 @@ pub fn list(input: &Path) -> Result<Manifest>;
 pub fn verify(input: &Path) -> Result<()>;
 ```
 
-Options structs are the lib contract; they do not read process-global state. Field tables and a YAML job-file loader: [docs/library.md](docs/library.md).
+Options structs are the lib contract; they do not read process-global state. Field tables and a YAML job-file loader: [docs/library.md](https://github.com/hilather/ayzenpack/blob/main/docs/library.md).
 
 CLI exit codes: clap usage → 2. `verify` maps `HashMismatch` and integrity `Format` to **3**; I/O and “not an archive” stay **1**. Every other subcommand maps those variants to **1**.
 
@@ -329,12 +352,15 @@ Treat a `.ayz` as sensitive as the input JARs: it contains file contents and ori
 
 ---
 
-## Non-goals (v2 / 0.2.1)
+## Non-goals (v2 / 0.2.4)
 
 - Recursively exploding nested JARs (depth **> 1** / unlimited). Depth-1 STORE `zip_index` is crate 0.2.4.
 - A `--verbatim` / `--exact-cdata` CLI flag
 - Java/zlib bit-identical whole-file hashes (Matt locked this out)
 - Dual `cdata_blob` + content; `raw_zip` of listed jars
+- CAS of `blake3(inner zip)` when the slot is (or should be) `zip_index`; per-JAR copies of the same uncompressed class bytes
+- Synthetic CD for skip-exact (parked; ZipWriter + STORE is the current path)
+- Requiring corpus lucene/jackson `source_*` until every method-8 slot is a measured hit
 - Per-blob zstd frames as the default
 - HTTP CAS, S3, split archives, GUI, Maven/Gradle plugins
 - Renaming v1 manifest fields (`blob`, `uncompressed_size`, `local_header_offset`, …)
