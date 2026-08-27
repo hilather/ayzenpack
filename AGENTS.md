@@ -30,6 +30,16 @@ The manifest is a ZIP-slot index (ratarmount-style pointers), not a second copy 
 
 Crate **0.2.3** / format **v2** groups uncompressed blobs in 4 MiB record-aligned zstd frames and **never writes** `cdata_blob` on STORE/DEFLATE (file or dir, any method). Crate **0.2.2** never writes `raw_zip` of a listed jar. `zip_archive_opens` must accept only the outer listing (rust zip may latch onto a STORE nested EOCD). CleanMiss rebuilds class-4 / mixed-exotic. Crate 0.2.0 leftover MixedExact / ExactWithExotic dual copies still read. Do not add new `cdata_blob` puts. Do not “fix” mix size by storing more cdata.
 
+## Intended crate 0.2.4 (not this tree)
+
+See [`PLAN.md`](PLAN.md). Format stays **v2** (additive keys). Do not implement in a plan-only PR.
+
+- Stencil: ratarmount-rs columns (`offsetheader`, `data_start`, `ZipMemberTable`, `DurableZipMember` / `nestedindexes`). Offsets are a write recipe after the source file is gone. Keep `blob` / `local_header_offset` / `tail_blob` / `prefix_blob`.
+- Slot payload is **one** of: CAS `blob` + optional `cdata_codec`, or a depth-1 child `zip_index`. No whole-inner-ZIP CAS. No SQLite in the `.ayz`.
+- Codecs (no `cdata_blob`): STORE; `deflate-raw:zlib:{1,6,9}` via in-process zlib-rs (not a Java subprocess); existing `deflate-raw:flate2:{1,3,6,9}`; `deflate-raw:stored`. Cache by `(blob, compressed_size, flags)`. A miss must not drop sibling codecs (today CleanMiss is jar-wide).
+- Slice must accept a complete stencil when the first local is not at ZIP offset 0 if that shift is the prefix / zip -A file-absolute layout (tail + slot rows, not `write_jar`).
+- `source_*` must match when every slot hits. A zopfli / unknown-deflate miss still rebuilds that entry only.
+
 ## Tests that must fail
 
 A new pack of the mix / corpus **must fail CI** if:

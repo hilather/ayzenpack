@@ -149,10 +149,10 @@ fn agents_md_locks_single_cas_and_zstd_blocks() {
         "DESIGN.md must not treat metadata-only exact as the north star"
     );
     assert!(
-        PLAN.contains("# PLAN: do not latch ZipArchive onto nested STORE jars (crate 0.2.3)")
-            && PLAN.contains("`zip_archive_opens` must accept only the outer listing")
-            && PLAN.contains("rust zip may latch onto a STORE nested EOCD"),
-        "PLAN.md must be the 0.2.3 no-nested-STORE-latch plan"
+        PLAN.contains("# PLAN: 0.2.4 stencil restore (ratarmount zip_index + codec recipes)")
+            && PLAN.contains("ratarmount zip_index + codec recipes")
+            && PLAN.contains("first local is not at ZIP offset 0"),
+        "PLAN.md must be the 0.2.4 stencil restore plan"
     );
     assert!(
         !README.contains("## Reconstruction guarantee")

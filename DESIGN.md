@@ -251,6 +251,20 @@ Rehydrate writes the prefix bytes first. Splice packs (STORE / codec-hit / legac
 
 Nested `BOOT-INF/lib/*.jar` entries stay opaque blobs.
 
+### Intended crate 0.2.4 (format v2, additive keys)
+
+Not implemented on this tree. See [`PLAN.md`](PLAN.md). North star stays **one CAS blob + ZIP index + zstd blocks**.
+
+The original JAR is still gone after dehydrate. The index becomes a ratarmount-style **stencil** (write recipe): `files.offsetheader` / `offset` / `size` / `type` / name / mtime / mode, plus `ZipMemberTable` (`headers`, `data_start`, `compressed_size`, `method`, `encrypted`, CD index, name). Nested STORE libs use `DurableZipMember` / `nestedindexes` at **depth 1**. Do not copy SQLite into the `.ayz`. Do not rename `blob`, `local_header_offset`, `cdata_blob`.
+
+Each slot payload pointer is **one** of: content `blob` + optional `cdata_codec`, or a child `zip_index`. Reconstruct walks prefix → local header → payload → data descriptor → pad → tail. A STORE `BOOT-INF/lib/foo.jar` is “write the child ZIP from its index”, not an opaque 30 MB blob. Inner classes still dedup via the same CAS.
+
+Closed codec set (record the id that hit original cdata; restore re-encodes): STORE; `deflate-raw:zlib:{1,6,9}` (in-process zlib-rs, not a Java `Deflater` process); `deflate-raw:flate2:{1,3,6,9}`; `deflate-raw:stored`. Other methods rebuild **that entry**. No new `cdata_blob`. A miss must not drop sibling codecs.
+
+`slice_from_archive` must keep tail + slot rows when the first local is not at ZIP offset 0 if that shift is the prefix / zip -A file-absolute layout. `write_jar` is not the zip -A path.
+
+Old packs still read (opaque nested blob, flate2-only `cdata_codec`, zip-rel `local_header_offset`). New packs may add `offsetheader` / `data_start` / `zip_index` / `nestedindexes`. 0.2.3 cannot restore a pack that replaced a nested blob with `zip_index`.
+
 ---
 
 ## Signed JARs
