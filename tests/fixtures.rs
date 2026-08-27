@@ -910,6 +910,120 @@ pub fn write_truncated_cd_listed_zip(path: &Path) {
     std::fs::write(path, buf).unwrap();
 }
 
+/// Truncated-CD homemade-`None` STORE zip with `lib/inner.jar` (`n.txt` inside),
+/// then unadjusted Spring launcher (`zip_a = false`). Source
+/// `ZipArchive::new(File)` can latch the nested EOCD; `scan_jar` is the listing
+/// oracle. Returns the inner zip bytes (not CAS'd on a `zip_index` slot).
+pub fn write_truncated_cd_plus_store_nested_unadjusted(path: &Path) -> Vec<u8> {
+    let inner_tmp = path.with_extension("inner.jar");
+    let inner_plain = b"nested-plain";
+    write_stored_zip(
+        &inner_tmp,
+        &[(
+            "n.txt",
+            inner_plain.as_slice(),
+            crc32fast::hash(inner_plain),
+        )],
+    );
+    let inner = std::fs::read(&inner_tmp).unwrap();
+    std::fs::remove_file(&inner_tmp).unwrap();
+    write_stored_zip(
+        path,
+        &[
+            ("a.txt", b"hello".as_slice(), crc32fast::hash(b"hello")),
+            ("lib/inner.jar", inner.as_slice(), crc32fast::hash(&inner)),
+        ],
+    );
+    let mut buf = std::fs::read(path).unwrap();
+    splice_trailing_cd_junk(&mut buf, &magic_but_short_cd_header());
+    std::fs::write(path, prepend_launcher(&buf, SPRING_LAUNCHER, false)).unwrap();
+    inner
+}
+
+/// Zip64 EOCD whose record (`12 + rec_size` at +4) ends at locator `loc`.
+/// Same walk as `src/exact.rs` `patch_eocd_cd_start`.
+fn zip64_eocd_off_ending_at_locator(buf: &[u8], loc: usize) -> usize {
+    const ZIP64_EOCD: &[u8; 4] = b"PK\x06\x06";
+    if loc >= 56 && buf[loc - 56..loc - 52] == *ZIP64_EOCD {
+        let rec_size = u64::from_le_bytes(buf[loc - 52..loc - 44].try_into().unwrap());
+        if 12u64.saturating_add(rec_size) == 56 {
+            return loc - 56;
+        }
+    }
+    let mut i = loc.saturating_sub(56);
+    loop {
+        if buf[i..i + 4] == *ZIP64_EOCD {
+            let rec_size = u64::from_le_bytes(buf[i + 4..i + 12].try_into().unwrap());
+            let rec_len = 12u64.saturating_add(rec_size);
+            if i as u64 + rec_len == loc as u64 {
+                return i;
+            }
+        }
+        assert!(i > 0, "Zip64 EOCD must precede locator");
+        i -= 1;
+    }
+}
+
+/// Insert a magic-but-short CD stub **before Zip64 EOCD**, then patch
+/// **post-insert** Zip64 `cd_size` / locator offset. Classic EOCD splice
+/// (`splice_trailing_cd_junk`) would place the stub after the locator so
+/// homemade still sees N complete rows and attaches `tail_blob`.
+fn splice_truncated_cd_before_zip64_eocd(buf: &mut Vec<u8>) {
+    let eocd = classic_eocd_off(buf);
+    assert!(eocd >= 20, "Zip64 locator + classic EOCD");
+    let loc = eocd - 20;
+    assert_eq!(
+        &buf[loc..loc + 4],
+        b"PK\x06\x07",
+        "locator must sit at classic EOCD-20"
+    );
+    let z64 = zip64_eocd_off_ending_at_locator(buf, loc);
+    let rec_size = u64::from_le_bytes(buf[z64 + 4..z64 + 12].try_into().unwrap());
+    assert_eq!(
+        z64 as u64 + 12 + rec_size,
+        loc as u64,
+        "Zip64 EOCD must immediately precede locator"
+    );
+
+    let stub = magic_but_short_cd_header();
+    let stub_len = stub.len();
+    buf.splice(z64..z64, stub.iter().copied());
+
+    // Do not write at pre-insert `z64` (offset 40 there is inside the stub).
+    let new_z64 = z64 + stub_len;
+    let new_loc = loc + stub_len;
+    let new_eocd = eocd + stub_len;
+    let z64_cd_size = u64::from_le_bytes(buf[new_z64 + 40..new_z64 + 48].try_into().unwrap());
+    buf[new_z64 + 40..new_z64 + 48].copy_from_slice(&(z64_cd_size + stub_len as u64).to_le_bytes());
+    let loc_z64_off = u64::from_le_bytes(buf[new_loc + 8..new_loc + 16].try_into().unwrap());
+    buf[new_loc + 8..new_loc + 16].copy_from_slice(&(loc_z64_off + stub_len as u64).to_le_bytes());
+    // Zip64/classic cd_offset stay: CD start did not move.
+    let classic_cd_size = u32::from_le_bytes(buf[new_eocd + 12..new_eocd + 16].try_into().unwrap());
+    if classic_cd_size != u32::MAX {
+        buf[new_eocd + 12..new_eocd + 16]
+            .copy_from_slice(&(classic_cd_size + stub_len as u32).to_le_bytes());
+    }
+}
+
+/// STORE Zip64-forced listed zip (`large_file` + `set_zip64_comment`) whose
+/// homemade CD parse is `None`. ZipArchive still lists N via Zip64 EOCD count.
+/// Do not use [`write_truncated_cd_listed_zip`] or [`zip64_jar_bytes`].
+pub fn write_truncated_cd_zip64_listed_zip(path: &Path) {
+    use std::io::Cursor;
+    let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+    z.set_zip64_comment(Some(""));
+    let opts = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Stored)
+        .large_file(true);
+    z.start_file("a.txt", opts).unwrap();
+    z.write_all(b"hello").unwrap();
+    z.start_file("b.txt", opts).unwrap();
+    z.write_all(b"world").unwrap();
+    let mut buf = z.finish().unwrap().into_inner();
+    splice_truncated_cd_before_zip64_eocd(&mut buf);
+    std::fs::write(path, buf).unwrap();
+}
+
 /// Leftover-junk CD plus a STORE listable nested zip (`lib/inner.jar`).
 pub fn write_leftover_junk_plus_store_nested(path: &Path) {
     let inner_tmp = path.with_extension("inner.jar");
@@ -1194,4 +1308,13 @@ pub fn write_deflate_miss_plus_dir_cdata(path: &Path, name: &str, data: &[u8]) {
             },
         ],
     );
+}
+
+/// PK-start leading pad plus truncated/malformed CD (homemade-`None`).
+/// `prefix_size` stays 0 (do not swallow the hole); never leftover-junk.
+pub fn write_leading_pad_pk_decoy_truncated_cd_zip(path: &Path, name: &str, data: &[u8]) {
+    write_leading_pad_pk_decoy_zip(path, name, data);
+    let mut buf = std::fs::read(path).unwrap();
+    splice_trailing_cd_junk(&mut buf, &magic_but_short_cd_header());
+    std::fs::write(path, buf).unwrap();
 }

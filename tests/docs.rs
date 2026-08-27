@@ -210,8 +210,10 @@ fn docs_lock_leftover_junk_hash_policy_and_class_dedup() {
     );
     assert!(
         DESIGN.contains("Outer exact (`write_exact_jar`) is a **file seek-walk**")
-            && DESIGN.contains("Synthetic CD is parked"),
-        "DESIGN.md must say outer exact is a file seek-walk and synthetic CD is parked"
+            && DESIGN.contains("Arm 1 homemade-`None` with captured local headers")
+            && DESIGN.contains("stencil seek + synthetic CD")
+            && !DESIGN.contains("Synthetic CD is parked"),
+        "DESIGN.md must say outer exact is a file seek-walk and arm 1 is stencil seek + synthetic CD"
     );
     assert!(
         DESIGN.contains("### Restore hash policy")
@@ -225,10 +227,17 @@ fn docs_lock_leftover_junk_hash_policy_and_class_dedup() {
         "DESIGN.md must keep mix gates and gated corpus lucene/jackson source_*"
     );
     assert!(
-        DESIGN.contains(
-            "Remaining skip-exact uses `write_jar` ZipWriter that STOREs `method_code == 0` / `zip_index` over uncompressed payload (`read_entry_content` / `reconstruct_child_zip`); never `resolve_cdata`"
-        ),
-        "DESIGN.md must document skip-exact ZipWriter STORE over uncompressed payload"
+        DESIGN.contains("Skip-exact arm 2")
+            && DESIGN.contains("write_skip_exact_concat")
+            && DESIGN.contains("Never put recorded `offsetheader`")
+            && DESIGN.contains(
+                "Arm 3 (no captured headers: overlap / prefix+hole / slice `Err`) uses `write_jar` ZipWriter that STOREs `method_code == 0` / `zip_index` over uncompressed payload (`read_entry_content` / `reconstruct_child_zip`); never `resolve_cdata`"
+            )
+            && DESIGN.contains("Skip-exact arm 1")
+            && DESIGN.contains("stencil seek + synthetic CD")
+            && !DESIGN.contains("Remaining skip-exact uses `write_jar` ZipWriter")
+            && !DESIGN.contains("arm 2-until-concat"),
+        "DESIGN.md must document arm 1 seek, arm 2 concat + synthetic CD, and ZipWriter as arm 3 never resolve_cdata"
     );
     assert!(
         README.contains("Priorities: (1) lean pack (2) complete rehydrate (3) class-level dedup")
@@ -238,8 +247,11 @@ fn docs_lock_leftover_junk_hash_policy_and_class_dedup() {
                 "Leftover junk after N complete CD records with `N == ZipArchive::len()` is homemade_ok + `tail_blob` (exact when every slot hits)"
             )
             && README.contains("Remaining homemade-`None` never gets `tail_blob`")
-            && README.contains("Synthetic CD is parked"),
-        "README must document priorities, hash match iff bit_identical_restore, leftover-junk vs homemade-None, parked synthetic CD"
+            && README.contains("Arm 1 homemade-`None` with captured headers is stencil seek + synthetic CD")
+            && README.contains("Arm 2 csize-changing skip-exact is concat + synthetic CD")
+            && README.contains("Arm 3 stays `ZipWriter` STORE")
+            && !README.contains("Synthetic CD is parked"),
+        "README must document priorities, hash match iff bit_identical_restore, leftover-junk vs homemade-None, arm 1 synthetic CD"
     );
     assert!(
         README.contains("STORE listable nested `BOOT-INF/lib/*.jar` become depth-1 `zip_index`")
@@ -267,7 +279,10 @@ fn docs_lock_leftover_junk_hash_policy_and_class_dedup() {
                 "Leftover junk after N complete CD records with `N == ZipArchive::len()` is homemade_ok + `tail_blob` (exact when every slot hits)"
             )
             && LIBRARY.contains("Remaining homemade-`None` never gets `tail_blob`")
-            && LIBRARY.contains("Synthetic CD is parked")
+            && LIBRARY.contains("Arm 1 homemade-`None` with captured headers is stencil seek + synthetic CD")
+            && LIBRARY.contains("Arm 2 csize-changing skip-exact is concat + synthetic CD")
+            && LIBRARY.contains("Arm 3 ZipWriter STOREs")
+            && !LIBRARY.contains("Synthetic CD is parked")
             && LIBRARY.contains("never CAS `blake3(inner zip)`")
             && LIBRARY.contains("Do not store `cdata_blob`")
             && LIBRARY.contains("Do not chase bit-identical hashes on a miss")
@@ -275,7 +290,62 @@ fn docs_lock_leftover_junk_hash_policy_and_class_dedup() {
             && LIBRARY.contains(
                 "https://github.com/hilather/ayzenpack/blob/main/examples/ayzenpack.yaml"
             ),
-        "docs/library.md must document priorities, leftover-junk exact vs homemade-None, seek-walk, parked synthetic CD, and absolute HTTPS links"
+        "docs/library.md must document priorities, leftover-junk exact vs homemade-None, seek-walk, arm 1 synthetic CD, and absolute HTTPS links"
+    );
+}
+
+#[test]
+fn docs_lock_synthetic_cd_hash_policy_fileabs_and_corpus() {
+    // Full sentences, not keyword soup. An inverted stub must fail.
+    assert!(
+        DESIGN.contains("**must not** require original-file match")
+            && DESIGN.contains("Locals-region identity")
+            && DESIGN.contains("FileAbs iff `prefix_size > 0`")
+            && DESIGN.contains("Homemade-`None` arm 1 is stencil-faithful skip-exact"),
+        "DESIGN.md hash policy must require locals-region + FileAbs listing on homemade-None, not original-file source_*"
+    );
+    assert!(
+        DESIGN.contains("### FileAbs listing oracle")
+            && DESIGN.contains("**`scan_jar` / `ZipView(prefix)`**")
+            && DESIGN.contains("**Do not** rewrite `assert_functional_identity`")
+            && DESIGN.contains("when `jar.tail_blob.is_none() && jar.prefix_size.unwrap_or(0) > 0`"),
+        "DESIGN.md must document FileAbs listing oracle per (arm, prefix) without rewriting mix assert_functional_identity"
+    );
+    assert!(
+        DESIGN.contains("### Corpus lucene/jackson `source_*`")
+            && DESIGN.contains("AYZENPACK_CORPUS_DIR=/path/to/corpus cargo test --test corpus")
+            && DESIGN.contains("ci/download-corpus.sh")
+            && DESIGN.contains("only when every printed line has `miss=0` and `exact=true`")
+            && DESIGN.contains(
+                "https://github.com/hilather/ayzenpack/blob/main/ci/download-corpus.sh"
+            ),
+        "DESIGN.md must document AYZENPACK_CORPUS_DIR enablement with absolute HTTPS links; not always-on until 100% hits"
+    );
+    assert!(
+        AGENTS.contains("Crate **0.2.6** / format **v2**")
+            && AGENTS.contains("locals-region identity + FileAbs listing")
+            && AGENTS.contains("`AYZENPACK_CORPUS_DIR`; not always-on until 100% hits")
+            && !AGENTS.contains("Crate **0.2.5** / format **v2**"),
+        "AGENTS.md current-tree must be crate 0.2.6 with homemade-None locals-region + FileAbs listing"
+    );
+    assert!(
+        README.contains("locals-region identity")
+            && README.contains("FileAbs listing")
+            && README.contains("AYZENPACK_CORPUS_DIR")
+            && README.contains("ci/download-corpus.sh")
+            && README.contains(
+                "when `!tail && prefix`, dest `ZipArchive::new(File)` vs source `scan_jar`"
+            ),
+        "README must document homemade-None locals-region + FileAbs listing and corpus enablement"
+    );
+    assert!(
+        LIBRARY.contains("locals-region identity")
+            && LIBRARY.contains("FileAbs iff `prefix_size > 0`")
+            && LIBRARY.contains("prefixed source is `scan_jar` / `ZipView`")
+            && LIBRARY.contains("AYZENPACK_CORPUS_DIR")
+            && LIBRARY
+                .contains("https://github.com/hilather/ayzenpack/blob/main/ci/download-corpus.sh"),
+        "docs/library.md must document FileAbs listing oracle and gated corpus enablement"
     );
 }
 
