@@ -2935,6 +2935,66 @@ fn child_ziparchive_latch_packs_opaque() {
 }
 
 #[test]
+fn store_nested_reconstruct_equality_omits_inner_zip_cas() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner_path = dir.path().join("inner.jar");
+    write_jar_entries(
+        &inner_path,
+        &[JarEntry::File {
+            name: "a.class",
+            data: b"class-bytes",
+            method: CompressionMethod::Stored,
+        }],
+    );
+    let inner = fs::read(&inner_path).unwrap();
+    let jar = dir.path().join("outer.jar");
+    write_jar_entries(
+        &jar,
+        &[
+            JarEntry::File {
+                name: "lib/inner.jar",
+                data: &inner,
+                method: CompressionMethod::Stored,
+            },
+            JarEntry::File {
+                name: "App.class",
+                data: b"app",
+                method: CompressionMethod::Stored,
+            },
+        ],
+    );
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let records = read_archive(&out).2;
+    let m = manifest_from_records(&records);
+    let e = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.name == "lib/inner.jar")
+        .expect("inner");
+    assert!(e.blob.is_none());
+    assert!(e.zip_index.is_some());
+    assert!(e.cdata_blob.is_none());
+    let inner_hex = ayzenpack::hashutil::hex_lower(&blake3_bytes(&inner));
+    assert!(
+        !m.blobs.iter().any(|b| b.blake3 == inner_hex),
+        "blake3(inner zip) must not be in blobs[] when reconstruct equality holds"
+    );
+    let class_hex = ayzenpack::hashutil::hex_lower(&blake3_bytes(b"class-bytes"));
+    assert!(m.blobs.iter().any(|b| b.blake3 == class_hex));
+    assert_eq!(
+        content_blob_ids(&m).len(),
+        2,
+        "unique content is App.class + a.class, not doubled with inner zip"
+    );
+    for e in &m.jars[0].entries {
+        assert!(e.cdata_blob.is_none());
+    }
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    verify(&out).unwrap();
+}
+
+#[test]
 fn encrypted_child_store_stays_opaque() {
     let dir = tempfile::tempdir().unwrap();
     let inner_path = dir.path().join("enc.jar");

@@ -16,8 +16,9 @@ use walkdir::WalkDir;
 use crate::error::{AyzenpackError, Result};
 use crate::exact::{slice_from_archive, slice_from_bytes, ExactLocal};
 use crate::format::{verify_finished_ayz, AyzWriter, FileHeader};
-use crate::hashutil::{hash_both, hex_lower};
+use crate::hashutil::{hash_both, hex_lower, parse_blake3_hex};
 use crate::manifest::{Blob, Entry, Jar, Manifest, NestedIndex, Stats, MANIFEST_FORMAT};
+use crate::reconstruct::reconstruct_child_zip;
 use crate::scan::{for_each_jar_entry_with_len, scan_from_bytes, ScannedEntry};
 
 /// Depth-1 child file-entry cap. Overflow stays opaque.
@@ -873,6 +874,7 @@ fn clear_dest_readonly(to: &Path) -> Result<()> {
 #[cfg(test)]
 thread_local! {
     static FAIL_BEFORE_AYZ_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static MUTATE_CHILD_TAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn maybe_inject_commit_failure() -> Result<()> {
@@ -1097,6 +1099,7 @@ fn apply_exploded(
 }
 
 /// Probe a STORE member. `Some` means explode (never CAS the combined ZIP).
+/// Reconstruct against pending blobs must equal `buf`; mismatch is opaque.
 fn probe_explode(
     opts: &DehydrateOptions,
     path: &Path,
@@ -1181,6 +1184,12 @@ fn probe_explode(
     queue_pending(&mut blobs, tail.clone(), b3, s256);
     nested.tail_blob = Some(hex_lower(&b3));
     nested.tail_size = Some(tail.len() as u64);
+    // Do not call Jar::bit_identical_restore: child tail is pending, not on a Jar.
+    #[cfg(test)]
+    maybe_mutate_child_tail(&nested, &mut blobs);
+    if !in_hand_child_matches(&nested, &blobs, buf) {
+        return Ok(None);
+    }
     Ok(Some(ExplodedReady {
         seq: 0,
         inflight,
@@ -1188,6 +1197,41 @@ fn probe_explode(
         nested,
         blobs,
     }))
+}
+
+fn pending_get_blob(blobs: &[PendingBlob], hex: &str) -> Result<Vec<u8>> {
+    let want = parse_blake3_hex(hex)?;
+    blobs
+        .iter()
+        .find(|b| b.b3 == want)
+        .map(|b| b.bytes.clone())
+        .ok_or_else(|| AyzenpackError::HashMismatch(format!("missing pending child blob {hex}")))
+}
+
+/// In-hand reconstruct equality is the explode predicate (opaque on mismatch).
+fn in_hand_child_matches(nested: &NestedIndex, blobs: &[PendingBlob], buf: &[u8]) -> bool {
+    match reconstruct_child_zip(nested, buf.len() as u64, |hex| pending_get_blob(blobs, hex)) {
+        Ok(got) => got.as_slice() == buf,
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_child_tail(nested: &NestedIndex, blobs: &mut [PendingBlob]) {
+    if !MUTATE_CHILD_TAIL.with(std::cell::Cell::get) {
+        return;
+    }
+    let Some(hex) = nested.tail_blob.as_deref() else {
+        return;
+    };
+    let Ok(want) = parse_blake3_hex(hex) else {
+        return;
+    };
+    if let Some(b) = blobs.iter_mut().find(|b| b.b3 == want) {
+        if let Some(byte) = b.bytes.first_mut() {
+            *byte ^= 0xff;
+        }
+    }
 }
 
 fn queue_pending(blobs: &mut Vec<PendingBlob>, bytes: Vec<u8>, b3: [u8; 32], s256: [u8; 32]) {
@@ -1930,5 +1974,219 @@ mod tests {
             ),
             "garbage tail must error, got {err:?}"
         );
+    }
+
+    fn write_deflate_test_jar(path: &Path, files: &[(&str, &[u8])]) {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+        let mut z = ZipWriter::new(File::create(path).unwrap());
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, data) in files {
+            z.start_file(*name, opts).unwrap();
+            z.write_all(data).unwrap();
+        }
+        z.finish().unwrap();
+    }
+
+    fn store_scan_meta(name: &str, buf: &[u8]) -> ScannedEntry {
+        ScannedEntry {
+            name: name.into(),
+            is_dir: false,
+            crc32: crc32fast::hash(buf),
+            method: "stored".into(),
+            method_code: 0,
+            uncompressed_size: buf.len() as u64,
+            compressed_size: buf.len() as u64,
+            dos_date: 0,
+            dos_time: 0,
+            unix_mode: None,
+            utf8_flag: true,
+            name_raw_hex: None,
+        }
+    }
+
+    fn content_blob_ids(m: &Manifest) -> HashSet<String> {
+        m.jars
+            .iter()
+            .flat_map(|j| {
+                j.entries.iter().filter_map(|e| e.blob.clone()).chain(
+                    j.nestedindexes
+                        .iter()
+                        .flat_map(|n| n.entries.iter().filter_map(|e| e.blob.clone())),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn probe_explode_store_inner_matches_reconstruct() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner_path = dir.path().join("inner.jar");
+        write_test_jar(&inner_path, &[("a.class", b"class-bytes")]);
+        let buf = fs::read(&inner_path).unwrap();
+        let meta = store_scan_meta("lib/inner.jar", &buf);
+        let ready = probe_explode(
+            &DehydrateOptions::default(),
+            Path::new("outer.jar"),
+            &meta,
+            &buf,
+        )
+        .unwrap()
+        .expect("STORE listable inner must explode");
+        assert!(in_hand_child_matches(&ready.nested, &ready.blobs, &buf));
+        assert!(ready.nested.tail_blob.is_some());
+        assert!(ready.nested.entries.iter().any(|e| e.blob.is_some()));
+    }
+
+    #[test]
+    fn mutated_child_tail_refuses_in_hand_reconstruct() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner_path = dir.path().join("inner.jar");
+        write_test_jar(&inner_path, &[("a.class", b"class-bytes")]);
+        let buf = fs::read(&inner_path).unwrap();
+        let meta = store_scan_meta("lib/inner.jar", &buf);
+        let mut ready = probe_explode(
+            &DehydrateOptions::default(),
+            Path::new("outer.jar"),
+            &meta,
+            &buf,
+        )
+        .unwrap()
+        .expect("baseline explode");
+        let hex = ready.nested.tail_blob.clone().expect("child tail");
+        let want = parse_blake3_hex(&hex).unwrap();
+        let tail = ready
+            .blobs
+            .iter_mut()
+            .find(|b| b.b3 == want)
+            .expect("pending tail");
+        tail.bytes[0] ^= 0xff;
+        assert!(
+            !in_hand_child_matches(&ready.nested, &ready.blobs, &buf),
+            "mutated child tail must fail reconstruct equality"
+        );
+    }
+
+    #[test]
+    fn child_codec_wrong_length_refuses_in_hand_reconstruct() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner_path = dir.path().join("inner.jar");
+        let payload = b"deflate-child-payload-for-codec-length".repeat(4);
+        write_deflate_test_jar(&inner_path, &[("a.class", payload.as_slice())]);
+        let buf = fs::read(&inner_path).unwrap();
+        let meta = store_scan_meta("lib/inner.jar", &buf);
+        let mut ready = probe_explode(
+            &DehydrateOptions::default(),
+            Path::new("outer.jar"),
+            &meta,
+            &buf,
+        )
+        .unwrap()
+        .expect("deflate child members must still explode on STORE outer");
+        let e = ready
+            .nested
+            .entries
+            .iter_mut()
+            .find(|e| e.cdata_codec.is_some())
+            .expect("deflate child codec");
+        e.compressed_size = 1;
+        assert!(
+            !in_hand_child_matches(&ready.nested, &ready.blobs, &buf),
+            "wrong-length child codec must fail reconstruct (HashMismatch → opaque)"
+        );
+    }
+
+    #[test]
+    fn reconstruct_equality_explodes_without_inner_zip_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner_path = dir.path().join("inner.jar");
+        write_test_jar(&inner_path, &[("a.class", b"class-bytes")]);
+        let inner = fs::read(&inner_path).unwrap();
+        let outer = dir.path().join("outer.jar");
+        write_test_jar(
+            &outer,
+            &[("lib/inner.jar", inner.as_slice()), ("App.class", b"app")],
+        );
+        let out = dir.path().join("out.ayz");
+        dehydrate(&DehydrateOptions {
+            output: out.clone(),
+            inputs: vec![outer],
+            quiet: true,
+            ..DehydrateOptions::default()
+        })
+        .unwrap();
+        let m = crate::list(&out).unwrap();
+        let e = m.jars[0]
+            .entries
+            .iter()
+            .find(|e| e.name == "lib/inner.jar")
+            .expect("inner");
+        assert!(e.blob.is_none());
+        assert!(e.zip_index.is_some());
+        assert!(e.cdata_blob.is_none());
+        let inner_hex = hex_lower(&crate::hashutil::blake3_bytes(&inner));
+        assert!(
+            !m.blobs.iter().any(|b| b.blake3 == inner_hex),
+            "blake3(inner zip) must not be in blobs[] when reconstruct matches"
+        );
+        let class_hex = hex_lower(&crate::hashutil::blake3_bytes(b"class-bytes"));
+        assert!(m.blobs.iter().any(|b| b.blake3 == class_hex));
+        assert_eq!(content_blob_ids(&m).len(), 2);
+        assert!(m.jars[0].raw_zip_blob.is_none());
+    }
+
+    #[test]
+    fn mutated_child_tail_is_opaque_instead_of_explode() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner_path = dir.path().join("inner.jar");
+        write_test_jar(&inner_path, &[("a.class", b"class-bytes")]);
+        let inner = fs::read(&inner_path).unwrap();
+        let outer = dir.path().join("outer.jar");
+        write_test_jar(
+            &outer,
+            &[("lib/inner.jar", inner.as_slice()), ("App.class", b"app")],
+        );
+        let out = dir.path().join("out.ayz");
+        struct ClearMutateTail;
+        impl Drop for ClearMutateTail {
+            fn drop(&mut self) {
+                MUTATE_CHILD_TAIL.with(|c| c.set(false));
+            }
+        }
+        MUTATE_CHILD_TAIL.with(|c| c.set(true));
+        let _clear = ClearMutateTail;
+        dehydrate(&DehydrateOptions {
+            output: out.clone(),
+            inputs: vec![outer],
+            quiet: true,
+            ..DehydrateOptions::default()
+        })
+        .unwrap();
+        let m = crate::list(&out).unwrap();
+        let e = m.jars[0]
+            .entries
+            .iter()
+            .find(|e| e.name == "lib/inner.jar")
+            .expect("inner");
+        assert!(e.zip_index.is_none(), "mismatch must not explode");
+        let inner_hex = hex_lower(&crate::hashutil::blake3_bytes(&inner));
+        assert_eq!(e.blob.as_deref(), Some(inner_hex.as_str()));
+        assert!(
+            m.blobs.iter().any(|b| b.blake3 == inner_hex),
+            "opaque combined bytes: blake3(inner) in blobs[]"
+        );
+        let class_hex = hex_lower(&crate::hashutil::blake3_bytes(b"class-bytes"));
+        assert!(
+            !m.blobs.iter().any(|b| b.blake3 == class_hex),
+            "opaque is instead of explode, not explode-plus-inner"
+        );
+        assert!(m.jars[0].nestedindexes.is_empty());
+        assert_eq!(content_blob_ids(&m).len(), 2);
+        for e in &m.jars[0].entries {
+            assert!(e.cdata_blob.is_none());
+        }
+        assert!(m.jars[0].raw_zip_blob.is_none());
     }
 }
