@@ -26,7 +26,11 @@ use fixtures::{
     write_padded_locals_zip, write_signed_looking_jar, write_store_file_plus_dir_cdata,
     write_store_file_plus_empty_deflate_dir, write_store_file_plus_leftover_csize_dir,
     write_stored_block_deflate_zip, write_stored_jar_dos_zero, write_stored_zip,
+<<<<<<< HEAD
     write_truncated_cd_listed_zip, write_truncated_cd_plus_store_nested_unadjusted,
+=======
+    write_truncated_cd_listed_zip, write_truncated_cd_zip64_listed_zip,
+>>>>>>> 1296af4 (Test Zip64-forced homemade-None lists via synthetic CD (classic dest extra))
     write_unknown_deflate_wrapped, write_unknown_deflate_zip, write_wrapped_jar,
     write_wrapped_jar_adjusted, write_wrapped_zip64_jar, write_zlib_deflate_zip, zip64_jar_bytes,
     JarEntry, SPRING_LAUNCHER,
@@ -2961,6 +2965,180 @@ fn listed_true_homemade_none_has_no_tail_blob() {
         entry_compression(&restored, "a.txt"),
         CompressionMethod::Stored,
         "method-0 files must STORE on skip-exact arm 1"
+    );
+}
+
+/// Dest CD extras: empty or synthesized `0x0001` only. `(cd_extra, local_extra)`.
+fn dest_cd_and_local_extras(buf: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut i = buf.len() - 22;
+    let eocd = loop {
+        if buf[i..i + 4] == *b"PK\x05\x06" {
+            let comment_len = u16::from_le_bytes([buf[i + 20], buf[i + 21]]) as usize;
+            if i + 22 + comment_len == buf.len() {
+                break i;
+            }
+        }
+        assert!(i > 0, "EOCD");
+        i -= 1;
+    };
+    let cd_size = u32::from_le_bytes(buf[eocd + 12..eocd + 16].try_into().unwrap());
+    let cd_off = u32::from_le_bytes(buf[eocd + 16..eocd + 20].try_into().unwrap());
+    assert_ne!(
+        cd_size,
+        u32::MAX,
+        "this STORE dest CD size is classic (walk extras)"
+    );
+    assert_ne!(
+        cd_off,
+        u32::MAX,
+        "this STORE dest CD offset is classic (walk extras)"
+    );
+    let cd_off = cd_off as usize;
+    let cd_end = cd_off + cd_size as usize;
+    let mut out = Vec::new();
+    let mut cdi = cd_off;
+    while cdi + 46 <= cd_end {
+        assert_eq!(&buf[cdi..cdi + 4], b"PK\x01\x02");
+        let name_len = u16::from_le_bytes([buf[cdi + 28], buf[cdi + 29]]) as usize;
+        let extra_len = u16::from_le_bytes([buf[cdi + 30], buf[cdi + 31]]) as usize;
+        let comment_len = u16::from_le_bytes([buf[cdi + 32], buf[cdi + 33]]) as usize;
+        let rec_end = cdi + 46 + name_len + extra_len + comment_len;
+        assert!(rec_end <= cd_end);
+        let extra = buf[cdi + 46 + name_len..cdi + 46 + name_len + extra_len].to_vec();
+        let local_off = u32::from_le_bytes(buf[cdi + 42..cdi + 46].try_into().unwrap()) as usize;
+        assert!(local_off + 30 <= buf.len());
+        assert_eq!(&buf[local_off..local_off + 4], b"PK\x03\x04");
+        let lname = u16::from_le_bytes([buf[local_off + 26], buf[local_off + 27]]) as usize;
+        let lextra = u16::from_le_bytes([buf[local_off + 28], buf[local_off + 29]]) as usize;
+        let local_extra = buf[local_off + 30 + lname..local_off + 30 + lname + lextra].to_vec();
+        out.push((extra, local_extra));
+        cdi = rec_end;
+    }
+    assert_eq!(cdi, cd_end);
+    out
+}
+
+fn extra_is_empty_or_zip64_only(extra: &[u8]) -> bool {
+    if extra.is_empty() {
+        return true;
+    }
+    let mut i = 0;
+    while i + 4 <= extra.len() {
+        let tag = u16::from_le_bytes([extra[i], extra[i + 1]]);
+        let sz = u16::from_le_bytes([extra[i + 2], extra[i + 3]]) as usize;
+        if tag != 0x0001 {
+            return false;
+        }
+        match i.checked_add(4).and_then(|n| n.checked_add(sz)) {
+            Some(n) if n <= extra.len() => i = n,
+            _ => return false,
+        }
+    }
+    i == extra.len()
+}
+
+fn extra_has_tag(extra: &[u8], want: u16) -> bool {
+    let mut i = 0;
+    while i + 4 <= extra.len() {
+        let tag = u16::from_le_bytes([extra[i], extra[i + 1]]);
+        let sz = u16::from_le_bytes([extra[i + 2], extra[i + 3]]) as usize;
+        if tag == want {
+            return true;
+        }
+        match i.checked_add(4).and_then(|n| n.checked_add(sz)) {
+            Some(n) if n <= extra.len() => i = n,
+            _ => return false,
+        }
+    }
+    false
+}
+
+#[test]
+fn listed_zip64_homemade_none_lists_via_synthetic_cd() {
+    // Zip64-aware truncated splice (stub before Zip64 EOCD). Classic splice
+    // would leave homemade Some + tail_blob (exact path, never arm 1).
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("truncated-cd-zip64.jar");
+    write_truncated_cd_zip64_listed_zip(&jar);
+    let listed = ZipArchive::new(File::open(&jar).unwrap()).unwrap().len();
+    assert_eq!(listed, 2, "fixture must stay listable");
+    let src = fs::read(&jar).unwrap();
+    let src_len = src.len() as u64;
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    let packed = &m.jars[0];
+    assert!(
+        packed.tail_blob.is_none(),
+        "remaining homemade-None must never get tail_blob"
+    );
+    assert!(packed.raw_zip_blob.is_none());
+    assert!(!packed.bit_identical_restore());
+    assert!(!packed.metadata_rebuild());
+    assert_eq!(packed.entries.len(), listed);
+    for e in &packed.entries {
+        assert!(e.cdata_blob.is_none(), "{} cdata_blob", e.name);
+        assert!(
+            e.local_header_hex.is_some() || e.local_header_blob.is_some(),
+            "{} must capture a local header",
+            e.name
+        );
+        assert!(
+            packed.slot_exact(e),
+            "{} arm 1 slot_resolves_at_recorded_csize",
+            e.name
+        );
+        if e.zip_index.is_some() {
+            assert_eq!(e.compressed_size, e.uncompressed_size);
+        }
+    }
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("truncated-cd-zip64.jar");
+    let got = fs::read(&restored).unwrap();
+    let got_len = got.len() as u64;
+    assert!(
+        got_len * 2 >= src_len,
+        "restored {got_len} must stay in the same league as source {src_len}"
+    );
+    let mut z = ZipArchive::new(File::open(&restored).unwrap()).unwrap();
+    assert_eq!(z.len(), listed, "dest ZipArchive len N");
+    assert!(
+        z.by_name("a.txt").is_ok() && z.by_name("b.txt").is_ok(),
+        "dest ZipArchive::new(File) must list outer names"
+    );
+    drop(z);
+    let extras = dest_cd_and_local_extras(&got);
+    assert_eq!(extras.len(), listed);
+    for (cd_extra, local_extra) in &extras {
+        assert!(
+            extra_is_empty_or_zip64_only(cd_extra),
+            "dest CD extra must be empty or 0x0001-only, got {cd_extra:?}"
+        );
+        assert!(
+            extra_has_tag(local_extra, 0x0001),
+            "captured local extra must contain 0x0001 so dest CD is not a copy"
+        );
+        assert_ne!(
+            cd_extra, local_extra,
+            "dest CD extra must not copy local extra"
+        );
+    }
+    let phys_cd = classic_eocd_cd_offset(&src);
+    let cd_start = classic_eocd_cd_offset(&got);
+    assert_eq!(
+        &got[..cd_start as usize],
+        &src[..phys_cd as usize],
+        "arm 1 locals-region identity"
+    );
+    assert_functional_identity(&jar, &restored);
+    assert_eq!(
+        entry_compression(&restored, "a.txt"),
+        CompressionMethod::Stored
+    );
+    assert_eq!(
+        entry_compression(&restored, "b.txt"),
+        CompressionMethod::Stored
     );
 }
 

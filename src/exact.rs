@@ -1639,4 +1639,89 @@ mod tests {
         );
         assert_eq!(sliced.locals.len(), 1);
     }
+
+    fn zip64_eocd_off_ending_at_locator(buf: &[u8], loc: usize) -> usize {
+        if loc >= 56 && buf[loc - 56..loc - 52] == ZIP64_EOCD_MAGIC {
+            let rec_size = u64::from_le_bytes(buf[loc - 52..loc - 44].try_into().unwrap());
+            if 12u64.saturating_add(rec_size) == 56 {
+                return loc - 56;
+            }
+        }
+        let mut i = loc.saturating_sub(56);
+        loop {
+            if buf[i..i + 4] == ZIP64_EOCD_MAGIC {
+                let rec_size = u64::from_le_bytes(buf[i + 4..i + 12].try_into().unwrap());
+                let rec_len = 12u64.saturating_add(rec_size);
+                if i as u64 + rec_len == loc as u64 {
+                    return i;
+                }
+            }
+            assert!(i > 0, "Zip64 EOCD must precede locator");
+            i -= 1;
+        }
+    }
+
+    /// Stub before Zip64 EOCD (not classic EOCD). Classic splice would leave
+    /// Zip64 `cd_size` covering only N complete rows → homemade Some + tail.
+    fn splice_truncated_cd_before_zip64_eocd(buf: &mut Vec<u8>) {
+        let eocd = find_eocd_in(buf).expect("EOCD");
+        assert!(eocd >= 20, "Zip64 locator + classic EOCD");
+        let loc = eocd - 20;
+        assert_eq!(&buf[loc..loc + 4], ZIP64_LOCATOR_MAGIC);
+        let z64 = zip64_eocd_off_ending_at_locator(buf, loc);
+        let stub = magic_but_short_cd_header();
+        let stub_len = stub.len();
+        buf.splice(z64..z64, stub.iter().copied());
+        let new_z64 = z64 + stub_len;
+        let new_loc = loc + stub_len;
+        let new_eocd = eocd + stub_len;
+        let z64_cd_size = u64::from_le_bytes(buf[new_z64 + 40..new_z64 + 48].try_into().unwrap());
+        buf[new_z64 + 40..new_z64 + 48]
+            .copy_from_slice(&(z64_cd_size + stub_len as u64).to_le_bytes());
+        let loc_z64_off = u64::from_le_bytes(buf[new_loc + 8..new_loc + 16].try_into().unwrap());
+        buf[new_loc + 8..new_loc + 16]
+            .copy_from_slice(&(loc_z64_off + stub_len as u64).to_le_bytes());
+        let classic_cd_size =
+            u32::from_le_bytes(buf[new_eocd + 12..new_eocd + 16].try_into().unwrap());
+        if classic_cd_size != u32::MAX {
+            buf[new_eocd + 12..new_eocd + 16]
+                .copy_from_slice(&(classic_cd_size + stub_len as u32).to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn truncated_cd_zip64_homemade_none_has_no_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated-cd-zip64.jar");
+        let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+        z.set_zip64_comment(Some(""));
+        let opts = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .large_file(true);
+        z.start_file("a.txt", opts).unwrap();
+        z.write_all(b"hello").unwrap();
+        z.start_file("b.txt", opts).unwrap();
+        z.write_all(b"world").unwrap();
+        let mut buf = z.finish().unwrap().into_inner();
+        splice_truncated_cd_before_zip64_eocd(&mut buf);
+        std::fs::write(&path, &buf).unwrap();
+
+        let listed = ZipArchive::new(std::fs::File::open(&path).unwrap())
+            .unwrap()
+            .len();
+        assert_eq!(listed, 2, "fixture must stay listable");
+        let (home, arch) = homemade_cd_count_and_archive_len(&path).unwrap();
+        assert_eq!(
+            home, None,
+            "Zip64-aware truncated stub must stay homemade None"
+        );
+        assert_eq!(arch, 2);
+        let sliced = slice_from_archive(&path).expect("listed truncated Zip64 CD is skip-exact");
+        assert!(!sliced.homemade_ok);
+        assert!(
+            sliced.tail.is_none(),
+            "homemade None must never attach tail"
+        );
+        assert_eq!(sliced.locals.len(), 2);
+    }
 }
