@@ -37,8 +37,9 @@ See [`PLAN.md`](PLAN.md). Format stays **v2** (additive keys). Do not implement 
 - Stencil: ratarmount-rs columns (`offsetheader`, `data_start`, `ZipMemberTable`, `DurableZipMember` / `nestedindexes`). Offsets are a write recipe after the source file is gone. Keep `blob` / `local_header_offset` / `tail_blob` / `prefix_blob`.
 - Slot payload is **one** of: CAS `blob` + optional `cdata_codec`, or a depth-1 child `zip_index`. No whole-inner-ZIP CAS. No SQLite in the `.ayz`.
 - Codecs (no `cdata_blob`): STORE; `deflate-raw:zlib:{1,6,9}` via in-process zlib-rs (not a Java subprocess); existing `deflate-raw:flate2:{1,3,6,9}`; `deflate-raw:stored`. Cache by `(blob, compressed_size, flags)`. A miss must not drop sibling codecs (today CleanMiss is jar-wide).
-- Slice must accept a complete stencil when the first local is not at ZIP offset 0 if that shift is the prefix / zip -A file-absolute layout (tail + slot rows, not `write_jar`).
-- `source_*` must match when every slot hits. A zopfli / unknown-deflate miss still rebuilds that entry only.
+- Do not treat `first offsetheader == prefix_len` as new work (0.2.3 already slices that). Remaining skip-exact: homemade-`None` (exact-only tail + `archive_local_records`) and leading-pad (record hole bytes). Overlap stays skip-exact.
+- Never CAS `blake3(inner zip)` if that slot becomes `zip_index`. Opaque fallback if the child would be skip-exact.
+- `source_*` must match when every slot hits. A zopfli / unknown-deflate miss still rebuilds that entry only. Rewrite mix `proven_miss` so sibling codecs are allowed.
 
 ## Tests that must fail
 
@@ -49,7 +50,7 @@ A new pack of the mix / corpus **must fail CI** if:
 
 Add an explicit `cdata_blob == 0` on every mix entry. Add a two-jar overlap unit whose unique **content** blob count equals unique uncompressed payloads, not 2× (index tails/headers are not a second encoding; `cdata_blob` is). Add the ExactWithExotic / class-4 dir fixture from `PLAN.md` so “put `cdata_blob` back” cannot be the hash fix.
 
-Do **not** require whole-file hash match on Maven codec-miss jars.
+Do **not** require whole-file hash match on Maven codec-miss jars. After 0.2.4, a zlib **hit** is not a miss: `source_*` must match. Mix `proven_miss` must allow sibling codecs on a rebuild jar.
 
 ## Docs and engineering
 

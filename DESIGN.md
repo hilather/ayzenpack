@@ -261,7 +261,7 @@ Each slot payload pointer is **one** of: content `blob` + optional `cdata_codec`
 
 Closed codec set (record the id that hit original cdata; restore re-encodes): STORE; `deflate-raw:zlib:{1,6,9}` (in-process zlib-rs, not a Java `Deflater` process); `deflate-raw:flate2:{1,3,6,9}`; `deflate-raw:stored`. Other methods rebuild **that entry**. No new `cdata_blob`. A miss must not drop sibling codecs.
 
-`slice_from_archive` must keep tail + slot rows when the first local is not at ZIP offset 0 if that shift is the prefix / zip -A file-absolute layout. `write_jar` is not the zip -A path.
+A healthy zip -A fat whose first local is the prefix already slices on 0.2.3. Remaining skip-exact: homemade CD parse `None` on a listed outer (exact-only tail + ZipArchive locals) and leading pad (record the hole). `write_jar` is not the zip -A path when a stencil exists. Never CAS the whole inner ZIP if the slot is a `zip_index`.
 
 Old packs still read (opaque nested blob, flate2-only `cdata_codec`, zip-rel `local_header_offset`). New packs may add `offsetheader` / `data_start` / `zip_index` / `nestedindexes`. 0.2.3 cannot restore a pack that replaced a nested blob with `zip_index`.
 
