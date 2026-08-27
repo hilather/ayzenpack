@@ -443,12 +443,15 @@ fn check_not_spanned(path: &Path, file: &mut File, file_len: u64) -> Result<()> 
     Ok(())
 }
 
+/// Complete `PK\x01\x02` rows only. Trailing leftover after at least one row is
+/// `Some` (junk lives in the phys CD→EOF tail). A truncated/malformed record
+/// is `None` even if earlier rows looked fine. Empty `cd` is `Some([])`.
 pub(crate) fn parse_central_directory(cd: &[u8], layout: &ZipLayout) -> Option<Vec<CdRecord>> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < cd.len() {
         if i + 46 > cd.len() || cd[i..i + 4] != CD_MAGIC {
-            return None;
+            break;
         }
         let flags = u16::from_le_bytes(cd[i + 8..i + 10].try_into().ok()?);
         let crc = u32::from_le_bytes(cd[i + 16..i + 20].try_into().ok()?);
@@ -485,7 +488,7 @@ pub(crate) fn parse_central_directory(cd: &[u8], layout: &ZipLayout) -> Option<V
         });
         i = rec_end;
     }
-    if i != cd.len() {
+    if out.is_empty() && i != cd.len() {
         return None;
     }
     Some(out)
@@ -1512,5 +1515,67 @@ mod tests {
                 .is_some_and(|z| matches!(z, ZipExact::Sliced(_))),
             "current homemade walker (fixed bounds) must slice"
         );
+    }
+
+    fn splice_cd_trailing_junk(buf: &mut Vec<u8>, junk: &[u8]) {
+        let eocd = find_eocd_in(buf).expect("EOCD");
+        let cd_size = u32::from_le_bytes(buf[eocd + 12..eocd + 16].try_into().unwrap());
+        buf.splice(eocd..eocd, junk.iter().copied());
+        let new_eocd = eocd + junk.len();
+        buf[new_eocd + 12..new_eocd + 16]
+            .copy_from_slice(&(cd_size + junk.len() as u32).to_le_bytes());
+    }
+
+    #[test]
+    fn leftover_junk_cd_homemade_ok_matches_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("leftover-junk.jar");
+        write_stored_named(&path, &[("a.txt", b"hello")]);
+        let mut buf = std::fs::read(&path).unwrap();
+        splice_cd_trailing_junk(&mut buf, &[0xAB, 0xCD, 0xEF, 0x01]);
+        std::fs::write(&path, &buf).unwrap();
+
+        let listed = ZipArchive::new(std::fs::File::open(&path).unwrap())
+            .unwrap()
+            .len();
+        assert_eq!(listed, 1, "fixture must stay listable");
+        let (home, arch) = homemade_cd_count_and_archive_len(&path).unwrap();
+        assert_eq!(home, Some(1), "N complete CD rows + leftover junk is Some");
+        assert_eq!(arch, 1);
+        let sliced = slice_from_archive(&path).expect("leftover-junk must slice");
+        assert!(sliced.homemade_ok);
+        assert!(
+            sliced.tail.is_some(),
+            "homemade_ok must attach phys CD→EOF tail"
+        );
+        assert_eq!(sliced.locals.len(), 1);
+    }
+
+    #[test]
+    fn truncated_cd_homemade_none_has_no_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated-cd.jar");
+        write_stored_named(&path, &[("a.txt", b"hello")]);
+        let mut buf = std::fs::read(&path).unwrap();
+        let eocd = find_eocd_in(&buf).expect("EOCD");
+        let cd_size = u32::from_le_bytes(buf[eocd + 12..eocd + 16].try_into().unwrap());
+        assert!(cd_size > 4);
+        buf[eocd + 12..eocd + 16].copy_from_slice(&(cd_size - 4).to_le_bytes());
+        std::fs::write(&path, &buf).unwrap();
+
+        let listed = ZipArchive::new(std::fs::File::open(&path).unwrap())
+            .unwrap()
+            .len();
+        assert_eq!(listed, 1, "fixture must stay listable");
+        let (home, arch) = homemade_cd_count_and_archive_len(&path).unwrap();
+        assert_eq!(home, None, "truncated CD record must stay homemade None");
+        assert_eq!(arch, 1);
+        let sliced = slice_from_archive(&path).expect("listed truncated CD is skip-exact, not Err");
+        assert!(!sliced.homemade_ok);
+        assert!(
+            sliced.tail.is_none(),
+            "homemade None must never attach tail"
+        );
+        assert_eq!(sliced.locals.len(), 1);
     }
 }

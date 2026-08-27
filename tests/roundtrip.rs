@@ -19,12 +19,13 @@ use fixtures::{
     write_deflate_miss_plus_dir_cdata, write_deflate_miss_plus_empty_deflate_dir,
     write_encrypted_store_zip, write_fat_spring_store_nested_jar,
     write_fat_spring_store_nested_zipa_jar, write_fat_spring_zip64_zipa_jar,
-    write_homemade_none_listed_zip, write_jar, write_jar_entries, write_jar_with_comment,
-    write_leading_pad_pk_decoy_zip, write_non_utf8_name_zip,
-    write_overlapping_local_plus_store_nested, write_overlapping_local_zip,
-    write_padded_locals_zip, write_signed_looking_jar, write_store_file_plus_dir_cdata,
-    write_store_file_plus_empty_deflate_dir, write_store_file_plus_leftover_csize_dir,
-    write_stored_block_deflate_zip, write_stored_jar_dos_zero, write_stored_zip,
+    write_homemade_none_listed_zip, write_homemade_none_plus_store_nested, write_jar,
+    write_jar_entries, write_jar_with_comment, write_leading_pad_pk_decoy_zip,
+    write_non_utf8_name_zip, write_overlapping_local_plus_store_nested,
+    write_overlapping_local_zip, write_padded_locals_zip, write_signed_looking_jar,
+    write_store_file_plus_dir_cdata, write_store_file_plus_empty_deflate_dir,
+    write_store_file_plus_leftover_csize_dir, write_stored_block_deflate_zip,
+    write_stored_jar_dos_zero, write_stored_zip, write_truncated_cd_listed_zip,
     write_unknown_deflate_wrapped, write_unknown_deflate_zip, write_wrapped_jar,
     write_wrapped_jar_adjusted, write_wrapped_zip64_jar, write_zlib_deflate_zip, zip64_jar_bytes,
     JarEntry, SPRING_LAUNCHER,
@@ -2658,23 +2659,149 @@ fn sort_inputs_jobs_1_eq_jobs_n_store_nested_fat() {
 }
 
 #[test]
-fn listed_homemade_none_has_no_tail_blob() {
+fn listed_homemade_leftover_junk_cd_is_exact() {
     let dir = tempfile::tempdir().unwrap();
-    let jar = dir.path().join("homemade-none.jar");
+    let jars = dir.path().join("jars");
+    fs::create_dir_all(&jars).unwrap();
+    let jar = jars.join("leftover-junk.jar");
     write_homemade_none_listed_zip(&jar);
     let listed = ZipArchive::new(File::open(&jar).unwrap()).unwrap().len();
     assert!(listed >= 1, "fixture must stay listable");
+    let src = fs::read(&jar).unwrap();
+    let pack = dir.path().join("out.ayz");
+    matt_dehydrate(&pack, &jars);
+    let m = ayzenpack::list(&pack).unwrap();
+    assert!(
+        m.jars[0].tail_blob.is_some(),
+        "leftover-junk CD must get tail_blob (must not stay skip-exact)"
+    );
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    for e in &m.jars[0].entries {
+        assert!(
+            e.cdata_blob.is_none(),
+            "{} must not grow cdata_blob",
+            e.name
+        );
+    }
+    assert!(
+        m.jars[0].bit_identical_restore(),
+        "STORE leftover-junk jar must exact-restore"
+    );
+    verify(&pack).unwrap();
+    matt_rehydrate(&pack);
+    assert_eq!(fs::read(&jar).unwrap(), src);
+    assert_eq!(m.jars[0].source_size, src.len() as u64);
+    assert_eq!(
+        m.jars[0].source_blake3,
+        ayzenpack::hashutil::hex_lower(&blake3_bytes(&src))
+    );
+    assert_eq!(
+        m.jars[0].source_sha256,
+        ayzenpack::hashutil::hex_lower(&ayzenpack::hashutil::sha256_bytes(&src))
+    );
+}
+
+#[test]
+fn listed_true_homemade_none_has_no_tail_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("homemade-none.jar");
+    write_truncated_cd_listed_zip(&jar);
+    let listed = ZipArchive::new(File::open(&jar).unwrap()).unwrap().len();
+    assert!(listed >= 1, "fixture must stay listable");
+    let src_len = fs::metadata(&jar).unwrap().len();
     let out = dir.path().join("out.ayz");
     dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
     let m = manifest_from_records(&read_archive(&out).2);
     assert!(
         m.jars[0].tail_blob.is_none(),
-        "homemade-None must never get tail_blob"
+        "true homemade-None (truncated CD) must never get tail_blob"
     );
     assert!(m.jars[0].raw_zip_blob.is_none());
+    assert!(
+        !m.jars[0].bit_identical_restore(),
+        "remaining homemade-None stays skip-exact"
+    );
+    for e in &m.jars[0].entries {
+        assert!(
+            e.cdata_blob.is_none(),
+            "{} must not grow cdata_blob",
+            e.name
+        );
+    }
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
-    assert_functional_identity(&jar, &dest.join("homemade-none.jar"));
+    let restored = dest.join("homemade-none.jar");
+    assert_functional_identity(&jar, &restored);
+    let got = fs::metadata(&restored).unwrap().len();
+    assert!(
+        got * 2 >= src_len,
+        "restored {got} must stay in the same league as source {src_len}"
+    );
+}
+
+#[test]
+fn leftover_junk_plus_store_nested_is_exact_zip_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("cd-junk-nested.jar");
+    write_homemade_none_plus_store_nested(&jar);
+    let mut z = ZipArchive::new(File::open(&jar).unwrap()).unwrap();
+    let mut inner = Vec::new();
+    z.by_name("lib/inner.jar")
+        .unwrap()
+        .read_to_end(&mut inner)
+        .unwrap();
+    drop(z);
+    let src = fs::read(&jar).unwrap();
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let records = read_archive(&out).2;
+    let m = manifest_from_records(&records);
+    assert!(
+        m.jars[0].tail_blob.is_some(),
+        "CD-junk + STORE nested must be exact (tail_blob)"
+    );
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    for e in &m.jars[0].entries {
+        assert!(
+            e.cdata_blob.is_none(),
+            "{} must not grow cdata_blob",
+            e.name
+        );
+    }
+    let e = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.name == "lib/inner.jar")
+        .expect("inner");
+    assert!(e.blob.is_none());
+    assert!(e.zip_index.is_some());
+    let inner_hex = ayzenpack::hashutil::hex_lower(&blake3_bytes(&inner));
+    assert!(!m.blobs.iter().any(|b| b.blake3 == inner_hex));
+    assert_eq!(content_blob_ids(&m).len(), 2, "a.txt + inner n.txt, not 2×");
+    let payloads = blob_payloads(&records);
+    let idx = e.zip_index.expect("zip_index");
+    let got = ayzenpack::reconstruct_child_zip(
+        &m.jars[0].nestedindexes[idx],
+        e.uncompressed_size,
+        |hex| {
+            let h = ayzenpack::hashutil::parse_blake3_hex(hex).unwrap();
+            Ok(payloads.get(&h).cloned().expect(hex))
+        },
+    )
+    .unwrap();
+    assert_eq!(got, inner);
+    assert!(m.jars[0].bit_identical_restore());
+    verify(&out).unwrap();
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("cd-junk-nested.jar");
+    assert_bit_identical(&jar, &restored);
+    let mut z = ZipArchive::new(File::open(&restored).unwrap()).unwrap();
+    assert_eq!(
+        z.by_name("lib/inner.jar").unwrap().compression(),
+        CompressionMethod::Stored
+    );
+    assert_eq!(fs::read(&restored).unwrap(), src);
 }
 
 #[test]

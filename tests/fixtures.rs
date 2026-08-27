@@ -822,29 +822,74 @@ pub fn write_leading_pad_pk_decoy_zip(path: &Path, name: &str, data: &[u8]) {
     std::fs::write(path, out).unwrap();
 }
 
-/// Listed zip whose homemade CD parse is `None`: junk after the CD is counted
-/// in EOCD `cd_size` so the walker does not consume exactly `cd_size`.
+fn classic_eocd_off(buf: &[u8]) -> usize {
+    let mut i = buf.len() - 22;
+    loop {
+        if buf[i..i + 4] == *b"PK\x05\x06" {
+            let comment_len = u16::from_le_bytes([buf[i + 20], buf[i + 21]]) as usize;
+            if i + 22 + comment_len == buf.len() {
+                return i;
+            }
+        }
+        assert!(i > 0);
+        i -= 1;
+    }
+}
+
+fn splice_trailing_cd_junk(buf: &mut Vec<u8>, junk: &[u8]) {
+    let eocd = classic_eocd_off(buf);
+    let cd_size = u32::from_le_bytes(buf[eocd + 12..eocd + 16].try_into().unwrap());
+    buf.splice(eocd..eocd, junk.iter().copied());
+    let new_eocd = eocd + junk.len();
+    buf[new_eocd + 12..new_eocd + 16].copy_from_slice(&(cd_size + junk.len() as u32).to_le_bytes());
+}
+
+const CD_TRAILING_JUNK: [u8; 4] = [0xAB, 0xCD, 0xEF, 0x01];
+
+/// Listed zip with junk after the last complete CD record, counted in EOCD
+/// `cd_size`. Homemade parse must accept N rows + leftover (not skip-exact).
 pub fn write_homemade_none_listed_zip(path: &Path) {
     write_stored_zip(path, &[("a.txt", b"hello", crc32fast::hash(b"hello"))]);
     let mut buf = std::fs::read(path).unwrap();
-    let eocd = {
-        let mut i = buf.len() - 22;
-        loop {
-            if buf[i..i + 4] == *b"PK\x05\x06" {
-                let comment_len = u16::from_le_bytes([buf[i + 20], buf[i + 21]]) as usize;
-                if i + 22 + comment_len == buf.len() {
-                    break i;
-                }
-            }
-            assert!(i > 0);
-            i -= 1;
-        }
-    };
+    splice_trailing_cd_junk(&mut buf, &CD_TRAILING_JUNK);
+    std::fs::write(path, buf).unwrap();
+}
+
+/// Listed zip whose homemade CD parse is still `None`: EOCD `cd_size` is
+/// shorter than the CD record. ZipArchive still lists via `cd_offset` + count.
+pub fn write_truncated_cd_listed_zip(path: &Path) {
+    write_stored_zip(path, &[("a.txt", b"hello", crc32fast::hash(b"hello"))]);
+    let mut buf = std::fs::read(path).unwrap();
+    let eocd = classic_eocd_off(&buf);
     let cd_size = u32::from_le_bytes(buf[eocd + 12..eocd + 16].try_into().unwrap());
-    let junk = [0xABu8, 0xCD, 0xEF, 0x01];
-    buf.splice(eocd..eocd, junk);
-    let new_eocd = eocd + junk.len();
-    buf[new_eocd + 12..new_eocd + 16].copy_from_slice(&(cd_size + junk.len() as u32).to_le_bytes());
+    assert!(cd_size > 4, "fixture needs a CD record to truncate");
+    buf[eocd + 12..eocd + 16].copy_from_slice(&(cd_size - 4).to_le_bytes());
+    std::fs::write(path, buf).unwrap();
+}
+
+/// Leftover-junk CD plus a STORE listable nested zip (`lib/inner.jar`).
+pub fn write_homemade_none_plus_store_nested(path: &Path) {
+    let inner_tmp = path.with_extension("inner.jar");
+    let inner_plain = b"nested-plain";
+    write_stored_zip(
+        &inner_tmp,
+        &[(
+            "n.txt",
+            inner_plain.as_slice(),
+            crc32fast::hash(inner_plain),
+        )],
+    );
+    let inner = std::fs::read(&inner_tmp).unwrap();
+    std::fs::remove_file(&inner_tmp).unwrap();
+    write_stored_zip(
+        path,
+        &[
+            ("a.txt", b"hello".as_slice(), crc32fast::hash(b"hello")),
+            ("lib/inner.jar", inner.as_slice(), crc32fast::hash(&inner)),
+        ],
+    );
+    let mut buf = std::fs::read(path).unwrap();
+    splice_trailing_cd_junk(&mut buf, &CD_TRAILING_JUNK);
     std::fs::write(path, buf).unwrap();
 }
 
