@@ -2726,10 +2726,12 @@ fn encrypted_child_store_stays_opaque() {
     let inner = fs::read(&inner_path).unwrap();
     {
         let mut z = ZipArchive::new(File::open(&inner_path).unwrap()).unwrap();
-        assert!(
-            z.by_index(0).unwrap().encrypted(),
-            "fixture must be an encrypted listing"
-        );
+        match z.by_index(0) {
+            Err(zip::result::ZipError::UnsupportedArchive(msg))
+                if msg == zip::result::ZipError::PASSWORD_REQUIRED => {}
+            Err(err) => panic!("fixture must be an encrypted listing, got {err:?}"),
+            Ok(_) => panic!("fixture must be an encrypted listing"),
+        };
     }
     let jar = dir.path().join("outer.jar");
     write_jar_entries(
