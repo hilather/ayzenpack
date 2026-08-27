@@ -5,10 +5,10 @@
 //! a valid ZIP with patched sizes. Skip-exact homemade-`None` with captured
 //! headers seeks locals and writes a synthetic CD when every slot keeps recorded
 //! `compressed_size`. Headers-present csize-changing misses concatenate patched
-//! locals and synthesize a CD. Range overlap / ZipArchive count mismatch /
-//! prefix+hole keep `ZipWriter` (STORE `method_code == 0` / `zip_index`; never
-//! `resolve_cdata`). Equal-offset last-wins with matching homemade count exact-
-//! splices. Prefix bytes are always bit-exact.
+//! locals and synthesize a CD. Range overlap / ZipArchive count mismatch keep
+//! `ZipWriter` (STORE `method_code == 0` / `zip_index`; never `resolve_cdata`;
+//! FileAbs CD/EOCD offsets when `prefix_len > 0`). Equal-offset last-wins with
+//! matching homemade count exact-splices. Prefix bytes are always bit-exact.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -22,8 +22,8 @@ use crate::cd::{name_and_gpbf_from_local_header, write_synthetic_cd, SyntheticCd
 use crate::dehydrate::{replace_file, sibling_tmp_path};
 use crate::error::{AyzenpackError, Result};
 use crate::exact::{
-    detect_offset_mode, encode_offset, patch_central_directory, patch_data_descriptor,
-    patch_eocd_cd_start, patch_local_rebuild_fields, RebuildPatch,
+    detect_offset_mode, encode_offset, fileabs_shift_tail, patch_central_directory,
+    patch_data_descriptor, patch_eocd_cd_start, patch_local_rebuild_fields, RebuildPatch,
 };
 use crate::format::{decode_payload, open_ayz_layout, read_record, Record};
 use crate::hashutil::{blake3_bytes, hash_reader, hex_lower, parse_blake3_hex, parse_hex};
@@ -1287,6 +1287,18 @@ fn write_jar(
     }
 
     writer.finish().map_err(|err| zip_err(err, dest))?;
+    if prefix_len > 0 {
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .open(&pending.tmp)
+            .map_err(|source| AyzenpackError::Io {
+                source,
+                path: Some(pending.tmp.clone()),
+            })?;
+        fileabs_shift_tail(&mut file, prefix_len, &jar.name)
+            .map_err(|err| map_dest_io(err, dest))?;
+    }
     if prefix_len > 0 && apply_prefix_chmod {
         chmod_executable(&pending.tmp)?;
     }

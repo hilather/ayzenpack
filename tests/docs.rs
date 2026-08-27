@@ -313,7 +313,10 @@ fn docs_lock_synthetic_cd_hash_policy_fileabs_and_corpus() {
         DESIGN.contains("### FileAbs listing oracle")
             && DESIGN.contains("**`scan_jar` / `ZipView(prefix)`**")
             && DESIGN.contains("**Do not** rewrite `assert_functional_identity`")
-            && DESIGN.contains("when `jar.tail_blob.is_none() && jar.prefix_size.unwrap_or(0) > 0`"),
+            && DESIGN.contains("when `jar.tail_blob.is_none() && jar.prefix_size.unwrap_or(0) > 0`")
+            && DESIGN.contains(
+                "| Arm 3 ZipWriter | > 0 | `scan_jar` | **`ZipArchive::new(File)`** (FileAbs outer names) |"
+            ),
         "DESIGN.md must document FileAbs listing oracle per (arm, prefix) without rewriting mix assert_functional_identity"
     );
     assert!(

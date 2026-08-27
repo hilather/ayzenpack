@@ -7,7 +7,7 @@
 //! walker; dehydrate must not consume `Raw`.
 
 use std::fs::File;
-use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use zip::ZipArchive;
@@ -1176,10 +1176,115 @@ fn find_eocd_in(buf: &[u8]) -> Option<usize> {
     }
 }
 
+fn fileabs_io(source: std::io::Error) -> AyzenpackError {
+    AyzenpackError::Io { source, path: None }
+}
+
+/// Offset-only FileAbs post-pass on a zip-rel ZipWriter dest (`prefix_len > 0`).
+/// Locals stay zip-rel; CD / EOCD / Zip64 extra 0x0001 offsets become file-absolute.
+/// Does not rewrite method, crc, or sizes, and does not synthesize Zip64 extra.
+pub(crate) fn fileabs_shift_tail<F: Read + Write + Seek>(
+    file: &mut F,
+    prefix_len: u64,
+    jar_name: &str,
+) -> Result<()> {
+    if prefix_len == 0 {
+        return Ok(());
+    }
+    let file_len = file.seek(SeekFrom::End(0)).map_err(fileabs_io)?;
+    let path = Path::new(jar_name);
+    let (struct_off, cd_size, recorded_cd, _) = find_cd_bounds(path, file, file_len)?;
+    let phys_cd = struct_off.checked_sub(cd_size).ok_or_else(|| {
+        AyzenpackError::FormatOwned(format!("{jar_name}: FileAbs CD offset underflow"))
+    })?;
+    let tail_len = file_len.checked_sub(phys_cd).ok_or_else(|| {
+        AyzenpackError::FormatOwned(format!("{jar_name}: FileAbs tail underflow"))
+    })?;
+    let cd_n = usize::try_from(cd_size).map_err(|_| {
+        AyzenpackError::FormatOwned(format!("{jar_name}: FileAbs CD size exceeds usize"))
+    })?;
+    let tail_n = usize::try_from(tail_len).map_err(|_| {
+        AyzenpackError::FormatOwned(format!("{jar_name}: FileAbs tail exceeds usize"))
+    })?;
+    let mut tail = vec![0u8; tail_n];
+    file.seek(SeekFrom::Start(phys_cd)).map_err(fileabs_io)?;
+    file.read_exact(&mut tail).map_err(fileabs_io)?;
+    if tail.len() < cd_n {
+        return Err(AyzenpackError::FormatOwned(format!(
+            "{jar_name}: FileAbs CD truncated"
+        )));
+    }
+    fileabs_shift_cd_local_offsets(&mut tail[..cd_n], prefix_len, jar_name)?;
+    let new_cd_start = recorded_cd.checked_add(prefix_len).ok_or_else(|| {
+        AyzenpackError::FormatOwned(format!("{jar_name}: FileAbs CD start overflow"))
+    })?;
+    patch_eocd_cd_start(&mut tail, cd_n, new_cd_start, jar_name)?;
+    file.seek(SeekFrom::Start(phys_cd)).map_err(fileabs_io)?;
+    file.write_all(&tail).map_err(fileabs_io)?;
+    Ok(())
+}
+
+fn fileabs_shift_cd_local_offsets(cd: &mut [u8], prefix_len: u64, jar_name: &str) -> Result<()> {
+    let mut i = 0usize;
+    let mut idx = 0usize;
+    while i < cd.len() {
+        if i + 46 > cd.len() || cd[i..i + 4] != CD_MAGIC {
+            return Err(AyzenpackError::FormatOwned(format!(
+                "{jar_name}: FileAbs CD record {idx} missing"
+            )));
+        }
+        let name_len = u16::from_le_bytes([cd[i + 28], cd[i + 29]]) as usize;
+        let extra_len = u16::from_le_bytes([cd[i + 30], cd[i + 31]]) as usize;
+        let comment_len = u16::from_le_bytes([cd[i + 32], cd[i + 33]]) as usize;
+        let rec_end = i
+            .checked_add(46)
+            .and_then(|n| n.checked_add(name_len))
+            .and_then(|n| n.checked_add(extra_len))
+            .and_then(|n| n.checked_add(comment_len))
+            .ok_or_else(|| {
+                AyzenpackError::FormatOwned(format!("{jar_name}: FileAbs CD overflow"))
+            })?;
+        if rec_end > cd.len() {
+            return Err(AyzenpackError::FormatOwned(format!(
+                "{jar_name}: FileAbs CD record {idx} truncated"
+            )));
+        }
+        let extra_start = 46 + name_len;
+        let rec = &mut cd[i..rec_end];
+        let uncomp32 = u32::from_le_bytes(rec[24..28].try_into().unwrap());
+        let comp32 = u32::from_le_bytes(rec[20..24].try_into().unwrap());
+        let off32 = u32::from_le_bytes(rec[42..46].try_into().unwrap());
+        let extra_ref = &rec[extra_start..extra_start + extra_len];
+        let (_, _, cur_off, _) = resolve_cd_zip64(extra_ref, uncomp32, comp32, off32, 0)
+            .ok_or_else(|| {
+                AyzenpackError::FormatOwned(format!(
+                    "{jar_name}: FileAbs CD record {idx} Zip64 extra"
+                ))
+            })?;
+        let new_off = cur_off.checked_add(prefix_len).ok_or_else(|| {
+            AyzenpackError::FormatOwned(format!("{jar_name}: FileAbs local offset overflow"))
+        })?;
+        let (head, rest) = rec.split_at_mut(extra_start);
+        let extra = &mut rest[..extra_len];
+        patch_offset32_or_zip64(
+            &mut head[42..46],
+            extra,
+            uncomp32,
+            comp32,
+            off32,
+            new_off,
+            jar_name,
+        )?;
+        i = rec_end;
+        idx += 1;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Cursor, Write};
+    use std::io::{Cursor, Read, Write};
     use std::path::Path;
     use zip::write::SimpleFileOptions;
     use zip::{ZipArchive, ZipWriter};
@@ -1778,5 +1883,80 @@ mod tests {
             "homemade None must never attach tail"
         );
         assert_eq!(sliced.locals.len(), 2);
+    }
+
+    #[test]
+    fn fileabs_shift_tail_adds_prefix_to_cd_and_eocd_offsets_only() {
+        let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        z.start_file("a.txt", opts).unwrap();
+        z.write_all(b"hello").unwrap();
+        z.start_file("b.txt", opts).unwrap();
+        z.write_all(b"world").unwrap();
+        let zip = z.finish().unwrap().into_inner();
+        let zip_cd = classic_eocd_cd_off(&zip);
+        let zip_off0 = cd_rec_offset(&zip, zip_cd);
+        let zip_method = u16::from_le_bytes(zip[zip_cd + 10..zip_cd + 12].try_into().unwrap());
+        let zip_crc = u32::from_le_bytes(zip[zip_cd + 16..zip_cd + 20].try_into().unwrap());
+        let zip_csize = u32::from_le_bytes(zip[zip_cd + 20..zip_cd + 24].try_into().unwrap());
+        let zip_usize = u32::from_le_bytes(zip[zip_cd + 24..zip_cd + 28].try_into().unwrap());
+
+        let prefix = b"#!/bin/bash\n# stub\n";
+        let mut buf = prefix.to_vec();
+        buf.extend_from_slice(&zip);
+
+        fileabs_shift_tail(&mut Cursor::new(&mut buf), prefix.len() as u64, "t.jar").unwrap();
+
+        let mut z = ZipArchive::new(Cursor::new(buf.as_slice())).unwrap();
+        assert_eq!(z.len(), 2);
+        assert_eq!(z.by_index(0).unwrap().name(), "a.txt");
+        assert_eq!(z.by_index(1).unwrap().name(), "b.txt");
+        let mut a = Vec::new();
+        z.by_index(0).unwrap().read_to_end(&mut a).unwrap();
+        let mut b = Vec::new();
+        z.by_index(1).unwrap().read_to_end(&mut b).unwrap();
+        assert_eq!(a, b"hello");
+        assert_eq!(b, b"world");
+        drop(z);
+
+        let dest_cd = classic_eocd_cd_off(&buf);
+        assert_eq!(dest_cd, prefix.len() + zip_cd);
+        assert_eq!(&buf[dest_cd..dest_cd + 4], b"PK\x01\x02");
+        assert_eq!(
+            u16::from_le_bytes(buf[dest_cd + 10..dest_cd + 12].try_into().unwrap()),
+            zip_method
+        );
+        assert_eq!(
+            u32::from_le_bytes(buf[dest_cd + 16..dest_cd + 20].try_into().unwrap()),
+            zip_crc
+        );
+        assert_eq!(
+            u32::from_le_bytes(buf[dest_cd + 20..dest_cd + 24].try_into().unwrap()),
+            zip_csize
+        );
+        assert_eq!(
+            u32::from_le_bytes(buf[dest_cd + 24..dest_cd + 28].try_into().unwrap()),
+            zip_usize
+        );
+        assert_eq!(cd_rec_offset(&buf, dest_cd), prefix.len() as u32 + zip_off0);
+        assert_eq!(&buf[prefix.len()..prefix.len() + 4], b"PK\x03\x04");
+    }
+
+    fn classic_eocd_cd_off(buf: &[u8]) -> usize {
+        let mut i = buf.len() - 22;
+        loop {
+            if buf[i..i + 4] == EOCD_MAGIC {
+                let comment_len = u16::from_le_bytes([buf[i + 20], buf[i + 21]]) as usize;
+                if i + 22 + comment_len == buf.len() {
+                    return u32::from_le_bytes(buf[i + 16..i + 20].try_into().unwrap()) as usize;
+                }
+            }
+            assert!(i > 0, "EOCD");
+            i -= 1;
+        }
+    }
+
+    fn cd_rec_offset(buf: &[u8], cd: usize) -> u32 {
+        u32::from_le_bytes(buf[cd + 42..cd + 46].try_into().unwrap())
     }
 }

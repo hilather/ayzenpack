@@ -23,15 +23,15 @@ use fixtures::{
     write_leading_pad_pk_decoy_truncated_cd_zip, write_leading_pad_pk_decoy_zip,
     write_leftover_junk_listed_zip, write_leftover_junk_plus_store_nested, write_non_utf8_name_zip,
     write_overlapping_local_plus_store_nested, write_overlapping_local_zip,
-    write_padded_locals_zip, write_range_overlap_local_zip, write_signed_looking_jar,
-    write_store_file_plus_dir_cdata, write_store_file_plus_empty_deflate_dir,
-    write_store_file_plus_leftover_csize_dir, write_stored_block_deflate_zip,
-    write_stored_jar_dos_zero, write_stored_zip, write_truncated_cd_listed_zip,
-    write_truncated_cd_overlap_unknown_deflate_sibling, write_truncated_cd_overlapping_local_zip,
-    write_truncated_cd_plus_store_nested_unadjusted, write_truncated_cd_zip64_listed_zip,
-    write_unknown_deflate_wrapped, write_unknown_deflate_zip, write_wrapped_jar,
-    write_wrapped_jar_adjusted, write_wrapped_zip64_jar, write_zlib_deflate_zip, zip64_jar_bytes,
-    JarEntry, BASH_TO_FIRST_LOCAL_HOLE, SPRING_LAUNCHER,
+    write_padded_locals_zip, write_prefixed_range_overlap_unadjusted,
+    write_range_overlap_local_zip, write_signed_looking_jar, write_store_file_plus_dir_cdata,
+    write_store_file_plus_empty_deflate_dir, write_store_file_plus_leftover_csize_dir,
+    write_stored_block_deflate_zip, write_stored_jar_dos_zero, write_stored_zip,
+    write_truncated_cd_listed_zip, write_truncated_cd_overlap_unknown_deflate_sibling,
+    write_truncated_cd_overlapping_local_zip, write_truncated_cd_plus_store_nested_unadjusted,
+    write_truncated_cd_zip64_listed_zip, write_unknown_deflate_wrapped, write_unknown_deflate_zip,
+    write_wrapped_jar, write_wrapped_jar_adjusted, write_wrapped_zip64_jar, write_zlib_deflate_zip,
+    zip64_jar_bytes, JarEntry, BASH_TO_FIRST_LOCAL_HOLE, SPRING_LAUNCHER,
 };
 use zip::{CompressionMethod, DateTime, ZipArchive};
 
@@ -926,6 +926,109 @@ fn duplicate_entry_names_in_one_jar_all_restored() {
         summary.bytes_unique_blobs,
         zip_len
     );
+}
+
+#[test]
+fn prefixed_range_overlap_arm3_fileabs_lists_outer() {
+    // Range overlap stays arm 3. Unadjusted prefix: dest FileAbs so
+    // ZipArchive::new(File) lists outer names. Source listing is scan_jar.
+    // Do not call assert_functional_identity (source File latches / fails).
+    let dir = tempfile::tempdir().unwrap();
+    let jars = dir.path().join("jars");
+    fs::create_dir_all(&jars).unwrap();
+    let jar = jars.join("overlap-prefix.jar");
+    write_prefixed_range_overlap_unadjusted(&jar);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&jar).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&jar, perms).unwrap();
+    }
+    let src = fs::read(&jar).unwrap();
+    assert!(src.starts_with(SPRING_LAUNCHER));
+    let src_scan = ayzenpack::scan::scan_jar(&jar, u64::MAX).unwrap();
+    let src_names: Vec<&str> = src_scan.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(
+        src_names,
+        ["a.txt", "b.txt"],
+        "scan_jar must list outer names, got {src_names:?}"
+    );
+
+    let pack = dir.path().join("out.ayz");
+    matt_dehydrate(&pack, &jars);
+    let records = read_archive(&pack).2;
+    let m = manifest_from_records(&records);
+    assert!(
+        m.jars[0].raw_zip_blob.is_none(),
+        "listed range-overlap jar must not store raw_zip"
+    );
+    assert!(
+        m.jars[0].tail_blob.is_none(),
+        "range overlap must skip exact (no broken tail)"
+    );
+    assert!(!m.jars[0].bit_identical_restore());
+    assert_eq!(
+        m.jars[0].prefix_size,
+        Some(SPRING_LAUNCHER.len() as u64),
+        "unadjusted launcher must be prefix"
+    );
+    for e in &m.jars[0].entries {
+        assert!(e.cdata_blob.is_none(), "{} cdata_blob", e.name);
+        assert!(
+            e.local_header_hex.is_none() && e.local_header_blob.is_none(),
+            "{} must not capture headers (arm 3)",
+            e.name
+        );
+    }
+
+    matt_rehydrate(&pack);
+    let got = fs::read(&jar).unwrap();
+    assert!(
+        got.starts_with(SPRING_LAUNCHER),
+        "prefix bytes must be unchanged"
+    );
+    let prefix_len = m.jars[0].prefix_size.unwrap();
+    let dest_cd = classic_eocd_cd_offset(&got);
+    assert!(
+        dest_cd >= prefix_len,
+        "FileAbs EOCD CD start {dest_cd} must include prefix {prefix_len}"
+    );
+    assert_eq!(
+        &got[dest_cd as usize..dest_cd as usize + 4],
+        b"PK\x01\x02",
+        "FileAbs EOCD CD start must point at the dest CD"
+    );
+    let dest_first_cd = first_cd_local_header_offset(&got);
+    assert_eq!(
+        dest_first_cd, prefix_len,
+        "FileAbs: first CD local offset must be prefix_len, not zip-rel 0"
+    );
+    assert_ne!(dest_first_cd, 0, "FileAbs dest must not use zip-rel 0");
+
+    let mut z = ZipArchive::new(File::open(&jar).unwrap()).unwrap();
+    assert_eq!(
+        z.len(),
+        src_scan.entries.len(),
+        "dest ZipArchive len vs source scan_jar"
+    );
+    for (i, sc) in src_scan.entries.iter().enumerate() {
+        let de = z.by_index(i).unwrap();
+        assert_eq!(de.name(), sc.name, "dest vs scan_jar name[{i}]");
+        assert_eq!(de.is_dir(), sc.is_dir, "dest vs scan_jar dir[{i}]");
+        assert_eq!(de.crc32(), sc.crc32, "dest vs scan_jar crc[{i}]");
+    }
+    assert!(
+        z.by_name("a.txt").is_ok() && z.by_name("b.txt").is_ok(),
+        "dest ZipArchive::new(File) must see outer a.txt and b.txt"
+    );
+    drop(z);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&jar).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "prefixed dest must be executable");
+    }
 }
 
 /// 0.2.1 `find_cd_bounds` used classic `eocd - cd_size` unless EOCD fields were

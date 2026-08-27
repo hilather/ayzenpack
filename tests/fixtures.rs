@@ -413,6 +413,85 @@ pub fn write_stored_zip(path: &Path, files: &[(&str, &[u8], u32)]) {
     std::fs::write(path, local).unwrap();
 }
 
+/// Distinct offsets: `b.txt`'s local sits inside `a.txt`'s STORE payload so
+/// homemade slice overruns. ZipArchive still lists both (valid inner local).
+pub fn write_range_overlap_zip(path: &Path) {
+    let b_name = b"b.txt";
+    let b_data = b"BB";
+    let b_crc = crc32fast::hash(b_data);
+    let inner_b = stored_local(b_name, b_data, b_crc);
+    let mut a_data = b"XXXX".to_vec();
+    a_data.extend_from_slice(&inner_b);
+    let a_name = b"a.txt";
+    let a_crc = crc32fast::hash(&a_data);
+    let local_a = stored_local(a_name, &a_data, a_crc);
+    let b_off = 30u32 + a_name.len() as u32 + 4;
+    assert_eq!(&local_a[b_off as usize..b_off as usize + 4], b"PK\x03\x04");
+    let mut out = local_a;
+    let cd_off = out.len() as u32;
+    out.extend_from_slice(&stored_cd(a_name, a_data.len() as u32, a_crc, 0));
+    out.extend_from_slice(&stored_cd(b_name, b_data.len() as u32, b_crc, b_off));
+    let cd_len = out.len() as u32 - cd_off;
+    out.extend_from_slice(b"PK\x05\x06");
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&cd_len.to_le_bytes());
+    out.extend_from_slice(&cd_off.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    std::fs::write(path, out).unwrap();
+}
+
+/// Unadjusted launcher + range-overlap. Count matches so prefix detection
+/// opens; slice still `Err` (arm 3 ZipWriter).
+pub fn write_prefixed_range_overlap_unadjusted(path: &Path) {
+    write_range_overlap_zip(path);
+    let zip = std::fs::read(path).unwrap();
+    std::fs::write(path, prepend_launcher(&zip, SPRING_LAUNCHER, false)).unwrap();
+}
+
+fn stored_local(name: &[u8], data: &[u8], crc: u32) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"PK\x03\x04");
+    v.extend_from_slice(&20u16.to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(&crc.to_le_bytes());
+    v.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    v.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    v.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(name);
+    v.extend_from_slice(data);
+    v
+}
+
+fn stored_cd(name: &[u8], data_len: u32, crc: u32, off: u32) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"PK\x01\x02");
+    v.extend_from_slice(&20u16.to_le_bytes());
+    v.extend_from_slice(&20u16.to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(&crc.to_le_bytes());
+    v.extend_from_slice(&data_len.to_le_bytes());
+    v.extend_from_slice(&data_len.to_le_bytes());
+    v.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(&0u32.to_le_bytes());
+    v.extend_from_slice(&off.to_le_bytes());
+    v.extend_from_slice(name);
+    v
+}
+
 /// Two distinct-name CD records that share local offset 0.
 /// ZipArchive lists both; homemade count matches → exact splice (pad of the
 /// unreferenced second physical local). Never `raw_zip`.
