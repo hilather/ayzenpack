@@ -168,7 +168,7 @@ Rehydrate rebuilds a **valid ZIP** from index + blobs: STORE splice, a `cdata_co
 
 Spring Boot launchers (including after `zip -A` and Zip64) keep the existing prefix detection. STORE listable nested `BOOT-INF/lib/*.jar` become depth-1 `zip_index` (reassembled from shared class blobs; never CAS `blake3(inner zip)`). DEFLATE-wrapped nested libs stay opaque.
 
-Leftover junk after N complete CD records with `N == ZipArchive::len()` is homemade_ok + `tail_blob` (exact when every slot hits). Remaining homemade-`None` never gets `tail_blob`. Skip-exact / content-mode `ZipWriter` STOREs directories, `--store-all`, `method_code == 0`, and `zip_index`; method-8 files DEFLATE at `deflate_level`. Payload is uncompressed (`reconstruct_child_zip` for nested STORE libs). Never `resolve_cdata`. Synthetic CD is parked. Mix packs keep `cdata_blob == 0` and `output_len <= 569539 * 115 / 100`. Corpus lucene/jackson `source_*` stays gated until every method-8 slot is a measured hit.
+Leftover junk after N complete CD records with `N == ZipArchive::len()` is homemade_ok + `tail_blob` (exact when every slot hits). Remaining homemade-`None` never gets `tail_blob`. Arm 1 homemade-`None` with captured headers is stencil seek + synthetic CD. Arm 3 / arm 2-until-concat stays `ZipWriter` STORE (`method_code == 0` / `zip_index`); never `resolve_cdata`. Mix packs keep `cdata_blob == 0` and `output_len <= 569539 * 115 / 100`. Corpus lucene/jackson `source_*` stays gated until every method-8 slot is a measured hit.
 
 Agent rules: [`AGENTS.md`](https://github.com/hilather/ayzenpack/blob/main/AGENTS.md). Design: [`DESIGN.md`](https://github.com/hilather/ayzenpack/blob/main/DESIGN.md).
 

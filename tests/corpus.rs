@@ -620,7 +620,36 @@ fn corpus_mix_regular_and_spring_whole_file_hashes() {
                 e.name
             );
         }
-        assert_functional_identity(&src, &dest);
+        if jar.tail_blob.is_none() && jar.prefix_size.unwrap_or(0) > 0 {
+            // Skip-exact prefixed dest is FileAbs (outer names via ZipArchive::new(File)).
+            // Source CD is zip-rel, so ZipArchive::new(File) can latch; scan_jar is the oracle.
+            let src_scan = ayzenpack::scan::scan_jar(&src, u64::MAX).unwrap();
+            let mut z = ZipArchive::new(File::open(&dest).unwrap()).unwrap();
+            assert_eq!(
+                z.len(),
+                src_scan.entries.len(),
+                "{} dest ZipArchive len vs source scan_jar",
+                jar.name
+            );
+            for (i, sc) in src_scan.entries.iter().enumerate() {
+                let e = z.by_index(i).unwrap();
+                assert_eq!(e.name(), sc.name, "{} dest vs scan_jar name[{i}]", jar.name);
+                assert_eq!(
+                    e.is_dir(),
+                    sc.is_dir,
+                    "{} dest vs scan_jar dir[{i}]",
+                    jar.name
+                );
+                assert_eq!(
+                    e.crc32(),
+                    sc.crc32,
+                    "{} dest vs scan_jar crc[{i}]",
+                    jar.name
+                );
+            }
+        } else {
+            assert_functional_identity(&src, &dest);
+        }
         if jar.prefix_size.unwrap_or(0) > 0 {
             let dest_bytes = fs::read(&dest).unwrap();
             assert!(

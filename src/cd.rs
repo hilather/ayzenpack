@@ -3,8 +3,6 @@
 //! Encoder writes caller-supplied `cd_start` and `local_offset` verbatim.
 //! Zip64 extra is synthesized; local extra is never copied.
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use crate::error::{AyzenpackError, Result};
 use crate::exact::{
     CD_MAGIC, EOCD_MAGIC, LOCAL_FILE_MAGIC, ZIP64_EOCD_MAGIC, ZIP64_EXTRA_ID, ZIP64_LOCATOR_MAGIC,
