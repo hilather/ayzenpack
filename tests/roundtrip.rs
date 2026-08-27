@@ -26,11 +26,8 @@ use fixtures::{
     write_padded_locals_zip, write_signed_looking_jar, write_store_file_plus_dir_cdata,
     write_store_file_plus_empty_deflate_dir, write_store_file_plus_leftover_csize_dir,
     write_stored_block_deflate_zip, write_stored_jar_dos_zero, write_stored_zip,
-<<<<<<< HEAD
     write_truncated_cd_listed_zip, write_truncated_cd_plus_store_nested_unadjusted,
-=======
     write_truncated_cd_listed_zip, write_truncated_cd_zip64_listed_zip,
->>>>>>> 1296af4 (Test Zip64-forced homemade-None lists via synthetic CD (classic dest extra))
     write_unknown_deflate_wrapped, write_unknown_deflate_zip, write_wrapped_jar,
     write_wrapped_jar_adjusted, write_wrapped_zip64_jar, write_zlib_deflate_zip, zip64_jar_bytes,
     JarEntry, SPRING_LAUNCHER,

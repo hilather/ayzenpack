@@ -910,7 +910,6 @@ pub fn write_truncated_cd_listed_zip(path: &Path) {
     std::fs::write(path, buf).unwrap();
 }
 
-<<<<<<< HEAD
 /// Truncated-CD homemade-`None` STORE zip with `lib/inner.jar` (`n.txt` inside),
 /// then unadjusted Spring launcher (`zip_a = false`). Source
 /// `ZipArchive::new(File)` can latch the nested EOCD; `scan_jar` is the listing
@@ -939,7 +938,6 @@ pub fn write_truncated_cd_plus_store_nested_unadjusted(path: &Path) -> Vec<u8> {
     splice_trailing_cd_junk(&mut buf, &magic_but_short_cd_header());
     std::fs::write(path, prepend_launcher(&buf, SPRING_LAUNCHER, false)).unwrap();
     inner
-=======
 /// Zip64 EOCD whose record (`12 + rec_size` at +4) ends at locator `loc`.
 /// Same walk as `src/exact.rs` `patch_eocd_cd_start`.
 fn zip64_eocd_off_ending_at_locator(buf: &[u8], loc: usize) -> usize {
@@ -1022,7 +1020,6 @@ pub fn write_truncated_cd_zip64_listed_zip(path: &Path) {
     let mut buf = z.finish().unwrap().into_inner();
     splice_truncated_cd_before_zip64_eocd(&mut buf);
     std::fs::write(path, buf).unwrap();
->>>>>>> 1296af4 (Test Zip64-forced homemade-None lists via synthetic CD (classic dest extra))
 }
 
 /// Leftover-junk CD plus a STORE listable nested zip (`lib/inner.jar`).
