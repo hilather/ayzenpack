@@ -405,6 +405,37 @@ Default `cargo test` still skips `corpus_lucene_jackson_source_identity_only_whe
 
 Do **not** buy lucene/jackson hashes with `cdata_blob` or Java `Deflater`. Mix gates stay: `cdata_blob == 0`; `output_len <= 569539 * 115 / 100`; unique content not doubled; no inner-zip CAS on `zip_index`.
 
+### Extra zlib-rs levels `{2,4,5,7,8}` (source-JAR probe)
+
+New packs do not store original method-8 cdata, so a pack-only scan cannot trial extra levels. [`src/deflate.rs`](https://github.com/hilather/ayzenpack/blob/main/src/deflate.rs) `probe_zlib_rs_extra_levels_on_lockfile_source_jars` re-opens lockfile lucene-* / jackson-* plus mix pinned source JARs (`failureaccess-1.0.2.jar`, `slf4j-api-2.0.16.jar`) under `AYZENPACK_CORPUS_DIR`, slices locals (`slice_from_archive`), and compares zlib-rs `{2,4,5,7,8}` (`DeflateConfig::new(level)`, `window_bits = -15`, default strategy / `mem_level`) to that local cdata vs the uncompressed payload. Skip unless `AYZENPACK_CORPUS_DIR` is set **and** `AYZENPACK_CODEC_PROBE=1`. Do **not** set `AYZENPACK_CODEC_PROBE` in [`.github/workflows/corpus.yml`](https://github.com/hilather/ayzenpack/blob/main/.github/workflows/corpus.yml) (25-minute job). Does **not** change dehydrate `match_deflate` / `ZLIB_LEVELS` / `parse_codec`. Mix gates unchanged.
+
+**Last measured (this workspace, 2026-08-27, zlib-rs 0.6.7):** `AYZENPACK_CORPUS_DIR=.corpus` **and** `AYZENPACK_CODEC_PROBE=1`. Closed-set `closed_hit` is zlib `{1,3,6,9}` + flate2 + stored (same as `match_deflate`). Extra columns are **independent** additional hits of that level on closed-set misses.
+
+| Jar | method8 | closed_hit | closed_miss | extra2 | extra4 | extra5 | extra7 | extra8 | extra_any | residual | miss0_if_extra |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| failureaccess-1.0.2.jar | 5 | 4 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | false |
+| slf4j-api-2.0.16.jar | 60 | 29 | 31 | 0 | 0 | 0 | 0 | 0 | 0 | 31 | false |
+| jackson-annotations-2.17.2.jar | 79 | 57 | 22 | 0 | 0 | 0 | 0 | 0 | 0 | 22 | false |
+| jackson-core-2.17.2.jar | 227 | 105 | 122 | 0 | 0 | 0 | 0 | 0 | 0 | 122 | false |
+| jackson-databind-2.17.2.jar | 791 | 261 | 530 | 0 | 0 | 0 | 0 | 0 | 0 | 530 | false |
+| lucene-suggest-9.11.1.jar | 126 | 51 | 75 | 0 | 0 | 0 | 0 | 0 | 0 | 75 | false |
+| lucene-highlighter-9.11.1.jar | 172 | 68 | 104 | 0 | 0 | 0 | 0 | 0 | 0 | 104 | false |
+| lucene-queryparser-9.11.1.jar | 256 | 93 | 163 | 0 | 0 | 0 | 0 | 0 | 0 | 163 | false |
+| lucene-codecs-9.11.1.jar | 217 | 69 | 148 | 0 | 0 | 0 | 0 | 0 | 0 | 148 | false |
+| lucene-backward-codecs-9.11.1.jar | 407 | 204 | 203 | 0 | 0 | 0 | 0 | 0 | 0 | 203 | false |
+| lucene-analysis-common-9.11.1.jar | 680 | 219 | 461 | 0 | 0 | 0 | 0 | 0 | 0 | 461 | false |
+| lucene-core-9.11.1.jar | 2513 | 1043 | 1470 | 0 | 0 | 0 | 0 | 0 | 0 | 1470 | false |
+
+```
+codec-probe extra-zlib-rs-levels totals jars=12 method8=5533 closed_hit=2203 closed_miss=3330
+extra2=0 extra4=0 extra5=0 extra7=0 extra8=0 extra_any_slots=0 residual_slots=3330
+jars_miss0_closed=0 jars_miss0_if_extra_levels=0
+codec-probe strategy/mem_level (NOT promotable; PR 4 must not consume)
+residual_after_extra=3330 hits=0 still_unexplained=3330
+```
+
+Per-jar `closed_hit` matches corpus.yml lucene/jackson `flate2+zlib+stored` (e.g. lucene-core 1+1042, jackson-databind 1+260). Extra zlib-rs levels `{2,4,5,7,8}` added **zero** slot hits. **Zero** jars would become `miss=0`. Residual strategy / `mem_level` histogram is **non-promotable** (non-default `Strategy` × levels 1..=9 at `mem_level` 8; `mem_level` {1,9} × levels {1,6,9} at `Strategy::Default`) and also **zero**. Do **not** promote `{2,4,5,7,8}` into `match_deflate` from this paste. Strategy / `mem_level` needs a new codec-id grammar; PR 4 must not consume that histogram.
+
 ---
 
 ## Executable / prefixed JARs

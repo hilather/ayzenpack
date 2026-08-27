@@ -223,6 +223,12 @@ fn io_err(source: io::Error) -> AyzenpackError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use zlib_rs::Strategy;
+
+    use crate::exact::{slice_from_archive, ExactLocal};
 
     #[test]
     fn gpbf_hint_appnote_mapping() {
@@ -370,5 +376,311 @@ mod tests {
         let c = deflate_raw(&plain, 6).unwrap();
         assert!(inflate_raw_capped(&c, 8).is_err());
         assert_eq!(inflate_raw_capped(&c, 64).unwrap(), plain);
+    }
+
+    /// Extra zlib-rs levels that fit `deflate-raw:zlib:<n>`. Not on the dehydrate path.
+    const EXTRA_ZLIB_LEVELS: [u32; 5] = [2, 4, 5, 7, 8];
+    const MIX_PINNED_DESTS: &[&str] = &["failureaccess-1.0.2.jar", "slf4j-api-2.0.16.jar"];
+    const LOCK_JSON: &str =
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ci/corpus.lock.json"));
+    const CORPUS_YML: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/.github/workflows/corpus.yml"
+    ));
+
+    #[test]
+    fn codec_probe_env_is_not_in_corpus_workflow() {
+        assert!(
+            !CORPUS_YML.contains("AYZENPACK_CODEC_PROBE"),
+            "do not run extra-level probe in the 25-minute corpus.yml job"
+        );
+    }
+
+    fn lockfile_probe_dests() -> Vec<String> {
+        let root: serde_json::Value =
+            serde_json::from_str(LOCK_JSON).expect("ci/corpus.lock.json must be valid JSON");
+        let mut names: Vec<String> = root["artifacts"]
+            .as_array()
+            .expect("lockfile artifacts array")
+            .iter()
+            .filter_map(|a| a.get("dest")?.as_str().map(str::to_string))
+            .filter(|n| {
+                n.starts_with("lucene-")
+                    || n.starts_with("jackson-")
+                    || MIX_PINNED_DESTS.contains(&n.as_str())
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn method8_file_flags(local: &ExactLocal) -> Option<u16> {
+        if local.header.len() < 30 {
+            return None;
+        }
+        let method = u16::from_le_bytes([local.header[8], local.header[9]]);
+        if method != 8 {
+            return None;
+        }
+        let name_len = u16::from_le_bytes([local.header[26], local.header[27]]) as usize;
+        if local.header.len() < 30 + name_len {
+            return None;
+        }
+        if local.header[30..30 + name_len].ends_with(b"/") {
+            return None;
+        }
+        Some(u16::from_le_bytes([local.header[6], local.header[7]]))
+    }
+
+    fn inflate_method8(local: &ExactLocal) -> Option<Vec<u8>> {
+        let uncomp = u32::from_le_bytes(local.header.get(22..26)?.try_into().ok()?) as u64;
+        let cap = if uncomp == 0 { u64::MAX } else { uncomp.max(1) };
+        match inflate_raw_capped(&local.cdata, cap) {
+            Ok(p) => Some(p),
+            Err(_) if cap != u64::MAX => inflate_raw_capped(&local.cdata, u64::MAX).ok(),
+            Err(_) => None,
+        }
+    }
+
+    fn zlib_raw_cfg(
+        plain: &[u8],
+        level: i32,
+        strategy: Strategy,
+        mem_level: i32,
+    ) -> Option<Vec<u8>> {
+        let mut cfg = DeflateConfig::new(level);
+        cfg.window_bits = -15;
+        cfg.strategy = strategy;
+        cfg.mem_level = mem_level;
+        let bound = compress_bound(plain.len()).max(16);
+        let mut buf = vec![0u8; bound];
+        let (out, rc) = compress_slice(&mut buf, plain, cfg);
+        (rc == ReturnCode::Ok).then(|| out.to_vec())
+    }
+
+    fn strategy_name(s: Strategy) -> &'static str {
+        match s {
+            Strategy::Default => "Default",
+            Strategy::Filtered => "Filtered",
+            Strategy::HuffmanOnly => "HuffmanOnly",
+            Strategy::Rle => "Rle",
+            Strategy::Fixed => "Fixed",
+        }
+    }
+
+    /// Re-open source JARs: packs have no original method-8 cdata to trial.
+    /// Skip unless `AYZENPACK_CORPUS_DIR` is set and `AYZENPACK_CODEC_PROBE=1`.
+    #[test]
+    fn probe_zlib_rs_extra_levels_on_lockfile_source_jars() {
+        match std::env::var("AYZENPACK_CODEC_PROBE") {
+            Ok(v) if v == "1" => {}
+            _ => {
+                eprintln!(
+                    "skipping probe_zlib_rs_extra_levels_on_lockfile_source_jars: AYZENPACK_CODEC_PROBE!=1"
+                );
+                return;
+            }
+        }
+        let Some(corpus) = std::env::var_os("AYZENPACK_CORPUS_DIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+        else {
+            eprintln!(
+                "skipping probe_zlib_rs_extra_levels_on_lockfile_source_jars: AYZENPACK_CORPUS_DIR not set"
+            );
+            return;
+        };
+        if !corpus.is_dir() {
+            eprintln!(
+                "skipping probe_zlib_rs_extra_levels_on_lockfile_source_jars: {} is not a directory",
+                corpus.display()
+            );
+            return;
+        }
+
+        let mut dests = lockfile_probe_dests();
+        assert!(
+            !dests.is_empty(),
+            "lockfile must list lucene/jackson or mix pinned dests"
+        );
+        dests.sort_by_key(|d| {
+            std::fs::metadata(corpus.join(d))
+                .map(|m| m.len())
+                .unwrap_or(u64::MAX)
+        });
+
+        let mut jars_seen = 0u64;
+        let mut jars_miss0_closed = 0u64;
+        let mut jars_miss0_if_extra = 0u64;
+        let mut tot_method8 = 0u64;
+        let mut tot_closed_hit = 0u64;
+        let mut tot_closed_miss = 0u64;
+        let mut tot_extra_level = [0u64; 5];
+        let mut tot_extra_any = 0u64;
+        let mut tot_residual = 0u64;
+        let mut strategy_hist: BTreeMap<String, u64> = BTreeMap::new();
+        let mut tot_strategy_hits = 0u64;
+
+        for dest in &dests {
+            let path = corpus.join(dest);
+            if !path.is_file() {
+                eprintln!("codec-probe skip missing {}", path.display());
+                continue;
+            }
+            let slice = match slice_from_archive(&path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("codec-probe skip slice {}: {e}", path.display());
+                    continue;
+                }
+            };
+            jars_seen += 1;
+            let mut method8 = 0u64;
+            let mut closed_hit = 0u64;
+            let mut extra_level = [0u64; 5];
+            let mut extra_any = 0u64;
+            let mut residual = 0u64;
+            for local in &slice.locals {
+                let Some(flags) = method8_file_flags(local) else {
+                    continue;
+                };
+                method8 += 1;
+                let Some(plain) = inflate_method8(local) else {
+                    residual += 1;
+                    continue;
+                };
+                match match_deflate(&plain, &local.cdata, flags) {
+                    Ok(Some(_)) => {
+                        closed_hit += 1;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        residual += 1;
+                        continue;
+                    }
+                }
+                let mut hit_extra = false;
+                for (i, level) in EXTRA_ZLIB_LEVELS.iter().enumerate() {
+                    if zlib_raw_deflate(&plain, *level).ok().as_deref()
+                        == Some(local.cdata.as_slice())
+                    {
+                        extra_level[i] += 1;
+                        hit_extra = true;
+                    }
+                }
+                if hit_extra {
+                    extra_any += 1;
+                    continue;
+                }
+                residual += 1;
+                if let Some(key) = first_strategy_or_mem_hit(&plain, &local.cdata) {
+                    *strategy_hist.entry(key).or_insert(0) += 1;
+                    tot_strategy_hits += 1;
+                }
+            }
+            let closed_miss = method8.saturating_sub(closed_hit);
+            let miss0_closed = closed_miss == 0;
+            let miss0_if_extra = residual == 0;
+            if miss0_closed {
+                jars_miss0_closed += 1;
+            }
+            if miss0_if_extra {
+                jars_miss0_if_extra += 1;
+            }
+            tot_method8 += method8;
+            tot_closed_hit += closed_hit;
+            tot_closed_miss += closed_miss;
+            for (tot, n) in tot_extra_level.iter_mut().zip(extra_level) {
+                *tot += n;
+            }
+            tot_extra_any += extra_any;
+            tot_residual += residual;
+            println!(
+                "codec-probe extra-zlib-rs-levels (promotable) {} method8={} closed_hit={} closed_miss={} extra2={} extra4={} extra5={} extra7={} extra8={} extra_any={} residual={} miss0_closed={} miss0_if_extra={}",
+                dest,
+                method8,
+                closed_hit,
+                closed_miss,
+                extra_level[0],
+                extra_level[1],
+                extra_level[2],
+                extra_level[3],
+                extra_level[4],
+                extra_any,
+                residual,
+                miss0_closed,
+                miss0_if_extra
+            );
+        }
+
+        if jars_seen == 0 {
+            eprintln!(
+                "skipping probe_zlib_rs_extra_levels_on_lockfile_source_jars: no lockfile JARs on disk under {}",
+                corpus.display()
+            );
+            return;
+        }
+
+        println!(
+            "codec-probe extra-zlib-rs-levels totals jars={} method8={} closed_hit={} closed_miss={} extra2={} extra4={} extra5={} extra7={} extra8={} extra_any_slots={} residual_slots={} jars_miss0_closed={} jars_miss0_if_extra_levels={}",
+            jars_seen,
+            tot_method8,
+            tot_closed_hit,
+            tot_closed_miss,
+            tot_extra_level[0],
+            tot_extra_level[1],
+            tot_extra_level[2],
+            tot_extra_level[3],
+            tot_extra_level[4],
+            tot_extra_any,
+            tot_residual,
+            jars_miss0_closed,
+            jars_miss0_if_extra
+        );
+        println!(
+            "codec-probe strategy/mem_level (NOT promotable; PR 4 must not consume) residual_after_extra={} hits={} still_unexplained={}",
+            tot_residual,
+            tot_strategy_hits,
+            tot_residual.saturating_sub(tot_strategy_hits)
+        );
+        for (k, n) in &strategy_hist {
+            println!(
+                "codec-probe strategy/mem_level (NOT promotable; PR 4 must not consume) {k} slots={n}"
+            );
+        }
+    }
+
+    fn first_strategy_or_mem_hit(plain: &[u8], want: &[u8]) -> Option<String> {
+        const STRATS: [Strategy; 4] = [
+            Strategy::Filtered,
+            Strategy::HuffmanOnly,
+            Strategy::Rle,
+            Strategy::Fixed,
+        ];
+        for strategy in STRATS {
+            for level in 1..=9i32 {
+                if zlib_raw_cfg(plain, level, strategy, 8).as_deref() == Some(want) {
+                    return Some(format!(
+                        "strategy={},level={level},mem=8",
+                        strategy_name(strategy)
+                    ));
+                }
+            }
+        }
+        // Default zlib-rs mem_level is already 8 (same as JDK Deflater). Spot-check
+        // extremes only; a full 1..=9 grid is not promotable and blows debug runtime.
+        for mem in [1i32, 9] {
+            for level in [1i32, 6, 9] {
+                if zlib_raw_cfg(plain, level, Strategy::Default, mem).as_deref() == Some(want) {
+                    return Some(format!(
+                        "mem_level={mem},level={level},strategy={}",
+                        strategy_name(Strategy::Default)
+                    ));
+                }
+            }
+        }
+        None
     }
 }

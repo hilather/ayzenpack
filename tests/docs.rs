@@ -454,6 +454,20 @@ fn docs_lock_ci_hash_policy_and_last_measured_corpus_paste() {
             && LIBRARY.contains("requires `source_*` iff `bit_identical_restore`"),
         "docs/library.md must not imply always-on Maven hashes; mix 5/6 and ci.yml env gate"
     );
+    assert!(
+        DESIGN.contains("### Extra zlib-rs levels `{2,4,5,7,8}` (source-JAR probe)")
+            && DESIGN.contains("AYZENPACK_CODEC_PROBE=1")
+            && DESIGN.contains("Do **not** set `AYZENPACK_CODEC_PROBE` in")
+            && DESIGN.contains("Does **not** change dehydrate `match_deflate`")
+            && DESIGN.contains("non-promotable")
+            && DESIGN.contains("extra_any_slots=0")
+            && DESIGN.contains("jars_miss0_if_extra_levels=0")
+            && DESIGN.contains("still_unexplained=3330")
+            && DESIGN.contains(
+                "https://github.com/hilather/ayzenpack/blob/main/.github/workflows/corpus.yml"
+            ),
+        "DESIGN.md must document extra zlib-rs level probe as opt-in, not corpus.yml, dehydrate unchanged, extra levels added 0 slot hits"
+    );
 }
 
 #[test]
