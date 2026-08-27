@@ -44,6 +44,8 @@ pub(crate) struct ExactSlice {
     pub homemade_ok: bool,
     /// Bytes `[0, first zip-rel local)` when `prefix_len == 0` and first local ≠ 0.
     pub leading_pad: Vec<u8>,
+    /// Executable / decoy prefix (`layout.prefix_len`), if any.
+    pub prefix: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -112,6 +114,16 @@ pub(crate) fn slice_from_bytes(bytes: &[u8]) -> Result<ExactSlice> {
 
 fn slice_from_reader<R: Read + Seek>(path: &Path, file: &mut R) -> Result<ExactSlice> {
     let layout = detect_zip_layout(path, file)?;
+    let prefix = if layout.prefix_len > 0 {
+        file.seek(SeekFrom::Start(0))
+            .map_err(|source| io_at(source, path))?;
+        let mut p = vec![0u8; usize_from_u64(layout.prefix_len, path)?];
+        file.read_exact(&mut p)
+            .map_err(|source| io_at(source, path))?;
+        p
+    } else {
+        Vec::new()
+    };
     let recs = archive_local_records(path, &layout, &mut *file)?;
     let mut leading_pad = Vec::new();
     if !recs.is_empty() {
@@ -195,6 +207,7 @@ fn slice_from_reader<R: Read + Seek>(path: &Path, file: &mut R) -> Result<ExactS
         tail: if homemade_ok { Some(tail) } else { None },
         homemade_ok,
         leading_pad,
+        prefix,
     })
 }
 
@@ -370,6 +383,7 @@ fn slice_zip_using(
             tail: Some(tail),
             homemade_ok: true,
             leading_pad: Vec::new(),
+            prefix: Vec::new(),
         });
     }
 
@@ -409,6 +423,7 @@ fn slice_zip_using(
         tail: Some(tail),
         homemade_ok: true,
         leading_pad: Vec::new(),
+        prefix: Vec::new(),
     })
 }
 

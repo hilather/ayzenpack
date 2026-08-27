@@ -1005,7 +1005,7 @@ fn classify_local(entry: &Entry, local: &ExactLocal, inflate_cap: u64) -> LocalC
     if entry.method_code != 8 {
         return LocalClass::Unreproducible;
     }
-    let cap = inflate_cap.max(entry.uncompressed_size);
+    let cap = entry.uncompressed_size.max(1).min(inflate_cap);
     let Ok(plain) = crate::deflate::inflate_raw_capped(&local.cdata, cap) else {
         return LocalClass::Unreproducible;
     };
@@ -1136,8 +1136,20 @@ fn probe_explode(
             LocalClass::EmptyDir | LocalClass::Store | LocalClass::DeflateHit(_) => {}
             _ => return Ok(None),
         }
-        fill_child_entry(&mut entry, local, 0, class, &mut blobs)?;
+        fill_child_entry(
+            &mut entry,
+            local,
+            slice.prefix.len() as u64,
+            class,
+            &mut blobs,
+        )?;
         nested.entries.push(entry);
+    }
+    if !slice.prefix.is_empty() {
+        let (b3, s256) = hash_both(&slice.prefix);
+        queue_pending(&mut blobs, slice.prefix.clone(), b3, s256);
+        nested.prefix_blob = Some(hex_lower(&b3));
+        nested.prefix_size = Some(slice.prefix.len() as u64);
     }
     if !slice.leading_pad.is_empty() {
         let (b3, s256) = hash_both(&slice.leading_pad);
@@ -1417,6 +1429,38 @@ mod tests {
         assert!(!nested_file_count_over_cap(NESTED_MAX_FILE_ENTRIES));
         assert!(nested_file_count_over_cap(NESTED_MAX_FILE_ENTRIES + 1));
         assert!(nested_file_count_over_cap(65_536));
+    }
+
+    #[test]
+    fn classify_inflate_cap_is_min_of_listing_and_max() {
+        let plain = vec![b'z'; 8];
+        let bomb = crate::deflate::deflate_raw(&vec![b'x'; 64 * 1024], 6).unwrap();
+        let mut header = vec![0u8; 30];
+        header[0..4].copy_from_slice(b"PK\x03\x04");
+        header[8..10].copy_from_slice(&8u16.to_le_bytes());
+        let entry = Entry {
+            name: "a.txt".into(),
+            is_dir: false,
+            blob: Some("unused".into()),
+            crc32: crc32fast::hash(&plain),
+            method: "deflated".into(),
+            method_code: 8,
+            uncompressed_size: plain.len() as u64,
+            compressed_size: bomb.len() as u64,
+            utf8_flag: true,
+            ..Entry::default()
+        };
+        let local = ExactLocal {
+            zip_rel_offset: 0,
+            header,
+            cdata: bomb,
+            descriptor: None,
+            pad: Vec::new(),
+        };
+        assert_eq!(
+            classify_local(&entry, &local, 2 * 1024 * 1024 * 1024),
+            LocalClass::Unreproducible
+        );
     }
 
     #[test]

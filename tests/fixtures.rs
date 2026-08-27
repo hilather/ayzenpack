@@ -822,6 +822,33 @@ pub fn write_leading_pad_pk_decoy_zip(path: &Path, name: &str, data: &[u8]) {
     std::fs::write(path, out).unwrap();
 }
 
+/// Listed zip whose homemade CD parse is `None`: junk after the CD is counted
+/// in EOCD `cd_size` so the walker does not consume exactly `cd_size`.
+pub fn write_homemade_none_listed_zip(path: &Path) {
+    write_stored_zip(path, &[("a.txt", b"hello", crc32fast::hash(b"hello"))]);
+    let mut buf = std::fs::read(path).unwrap();
+    let eocd = {
+        let mut i = buf.len() - 22;
+        loop {
+            if buf[i..i + 4] == *b"PK\x05\x06" {
+                let comment_len = u16::from_le_bytes([buf[i + 20], buf[i + 21]]) as usize;
+                if i + 22 + comment_len == buf.len() {
+                    break i;
+                }
+            }
+            assert!(i > 0);
+            i -= 1;
+        }
+    };
+    let cd_size = u32::from_le_bytes(buf[eocd + 12..eocd + 16].try_into().unwrap());
+    let junk = [0xABu8, 0xCD, 0xEF, 0x01];
+    buf.splice(eocd..eocd, junk);
+    let new_eocd = eocd + junk.len();
+    buf[new_eocd + 12..new_eocd + 16]
+        .copy_from_slice(&(cd_size + junk.len() as u32).to_le_bytes());
+    std::fs::write(path, buf).unwrap();
+}
+
 /// Overlap (same local offset, two names) plus one STORE listable inner zip.
 pub fn write_overlapping_local_plus_store_nested(path: &Path) {
     let inner_tmp = path.with_extension("inner.jar");

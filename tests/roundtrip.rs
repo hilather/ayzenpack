@@ -17,7 +17,8 @@ use fixtures::{
     matt_dehydrate, matt_rehydrate, spring_boot_launch_script, write_codec_hit_plus_unknown_deflate,
     write_data_descriptor_zip, write_deflate_miss_plus_dir_cdata,
     write_deflate_miss_plus_empty_deflate_dir, write_fat_spring_store_nested_jar,
-    write_fat_spring_store_nested_zipa_jar, write_fat_spring_zip64_zipa_jar, write_jar,
+    write_fat_spring_store_nested_zipa_jar, write_fat_spring_zip64_zipa_jar,
+    write_homemade_none_listed_zip, write_jar,
     write_jar_entries, write_jar_with_comment, write_leading_pad_pk_decoy_zip,
     write_non_utf8_name_zip, write_overlapping_local_plus_store_nested, write_overlapping_local_zip,
     write_padded_locals_zip, write_signed_looking_jar, write_store_file_plus_dir_cdata,
@@ -2627,6 +2628,87 @@ fn sort_inputs_jobs_1_eq_jobs_n_store_nested_fat() {
         fs::read(&outn).unwrap(),
         "STORE-nested fat packs must be byte-identical at jobs=1 and jobs=N"
     );
+}
+
+#[test]
+fn listed_homemade_none_has_no_tail_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("homemade-none.jar");
+    write_homemade_none_listed_zip(&jar);
+    let listed = ZipArchive::new(File::open(&jar).unwrap()).unwrap().len();
+    assert!(listed >= 1, "fixture must stay listable");
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert!(
+        m.jars[0].tail_blob.is_none(),
+        "homemade-None must never get tail_blob"
+    );
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    assert_functional_identity(&jar, &dest.join("homemade-none.jar"));
+}
+
+#[test]
+fn prefixed_store_nested_records_child_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner_zip = dir.path().join("inner.zip");
+    write_jar_entries(
+        &inner_zip,
+        &[JarEntry::File {
+            name: "n.txt",
+            data: b"pref",
+            method: CompressionMethod::Stored,
+        }],
+    );
+    let zip = fs::read(&inner_zip).unwrap();
+    let inner = fixtures::prepend_launcher(&zip, SPRING_LAUNCHER, false);
+    let jar = dir.path().join("outer.jar");
+    write_jar_entries(
+        &jar,
+        &[
+            JarEntry::File {
+                name: "lib/inner.jar",
+                data: &inner,
+                method: CompressionMethod::Stored,
+            },
+            JarEntry::File {
+                name: "App.class",
+                data: b"app",
+                method: CompressionMethod::Stored,
+            },
+        ],
+    );
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let records = read_archive(&out).2;
+    let m = manifest_from_records(&records);
+    let e = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.name == "lib/inner.jar")
+        .expect("inner");
+    assert!(e.blob.is_none());
+    assert!(e.zip_index.is_some());
+    let idx = e.zip_index.unwrap();
+    assert!(m.jars[0].nestedindexes[idx].prefix_blob.is_some());
+    assert_eq!(
+        m.jars[0].nestedindexes[idx].prefix_size,
+        Some(SPRING_LAUNCHER.len() as u64)
+    );
+    let payloads = blob_payloads(&records);
+    let got = ayzenpack::reconstruct_child_zip(
+        &m.jars[0].nestedindexes[idx],
+        e.uncompressed_size,
+        |hex| {
+            let h = ayzenpack::hashutil::parse_blake3_hex(hex).unwrap();
+            Ok(payloads.get(&h).cloned().expect(hex))
+        },
+    )
+    .unwrap();
+    assert_eq!(got, inner);
+    verify(&out).unwrap();
 }
 
 #[test]
