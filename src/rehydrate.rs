@@ -863,9 +863,7 @@ fn write_jar(
         let dt = DateTime::try_from_msdos(e.dos_date, e.dos_time)
             .unwrap_or_else(|_| DateTime::default());
 
-        // Skip-exact: STORE method 0 / zip_index so nested STORE libs stay STORE.
-        // Payload is uncompressed (read_entry_content / reconstruct_child_zip);
-        // never resolve_cdata / encode_codec on this path.
+        // Uncompressed payload; STORE method 0 / zip_index. ZipWriter encodes; do not resolve_cdata.
         let stored = e.is_dir || opts.store_all || e.method_code == 0 || e.zip_index.is_some();
         let method = if stored {
             CompressionMethod::Stored

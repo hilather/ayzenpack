@@ -168,7 +168,7 @@ Rehydrate rebuilds a **valid ZIP** from index + blobs: STORE splice, a `cdata_co
 
 Spring Boot launchers (including after `zip -A` and Zip64) keep the existing prefix detection. Nested `BOOT-INF/lib/*.jar` entries are not exploded.
 
-The content-mode `ZipWriter` path still uses deflate for file entries and store for directories, unless `--store-all`.
+Skip-exact / content-mode `ZipWriter` STOREs directories, `--store-all`, `method_code == 0`, and `zip_index`; method-8 files DEFLATE at `deflate_level`. Payload is uncompressed (`reconstruct_child_zip` for nested STORE libs). `source_*` may change.
 
 Agent rules: [`AGENTS.md`](AGENTS.md). Design: [`DESIGN.md`](DESIGN.md).
 

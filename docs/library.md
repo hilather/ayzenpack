@@ -100,7 +100,7 @@ ayzenpack = { git = "https://github.com/hilather/ayzenpack" }
 | `dir` | empty (required unless `restore_paths`) | created if missing; unused when `restore_paths` |
 | `cas_dir` | `None` | tempfile, deleted on success |
 | `keep_cas` | `false` | keep that tempfile |
-| `store_all` | `false` | ZIP STORE instead of DEFLATE |
+| `store_all` | `false` | ZIP STORE instead of DEFLATE. Skip-exact already STOREs `method_code == 0` / `zip_index` without this flag; method-8 files DEFLATE at `deflate_level`. `source_*` may change. |
 | `deflate_level` | `6` | 0..=9 |
 | `clean` | `false` | unlink dest names we will write (not the whole dir) |
 | `overwrite` | `false` | refuse to clobber existing JARs (ignored when `restore_paths`) |

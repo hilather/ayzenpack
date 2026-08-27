@@ -1819,6 +1819,28 @@ fn strip_exact_fields(records: Vec<Record>) -> Vec<Record> {
                 keep.insert(b.clone());
             }
         }
+        for nested in &jar.nestedindexes {
+            if let Some(p) = &nested.prefix_blob {
+                keep.insert(p.clone());
+            }
+            if let Some(p) = &nested.leading_pad_blob {
+                keep.insert(p.clone());
+            }
+            if let Some(t) = &nested.tail_blob {
+                keep.insert(t.clone());
+            }
+            for e in &nested.entries {
+                if let Some(b) = &e.blob {
+                    keep.insert(b.clone());
+                }
+                if let Some(b) = &e.local_header_blob {
+                    keep.insert(b.clone());
+                }
+                if let Some(b) = &e.pad_blob {
+                    keep.insert(b.clone());
+                }
+            }
+        }
     }
     m.blobs.retain(|b| keep.contains(&b.blake3));
     m.stats.unique_blob_count = m.blobs.len() as u64;
@@ -2042,6 +2064,95 @@ fn content_mode_archive_still_rehydrates_via_zipwriter() {
         entry_compression(&restored, "payload.bin"),
         CompressionMethod::Stored,
         "content-mode ZipWriter STOREs method_code 0"
+    );
+}
+
+#[test]
+fn skip_exact_zipwriter_deflates_method8_and_stores_method0() {
+    // STORE-everything on skip-exact would keep method-8 Stored; this must fail that.
+    let dir = tempfile::tempdir().unwrap();
+    let inner_path = dir.path().join("inner.jar");
+    write_jar_entries(
+        &inner_path,
+        &[JarEntry::File {
+            name: "n.txt",
+            data: b"nested-plain",
+            method: CompressionMethod::Stored,
+        }],
+    );
+    let inner = fs::read(&inner_path).unwrap();
+    let jar = dir.path().join("mixed-skip.jar");
+    write_jar_entries(
+        &jar,
+        &[
+            JarEntry::File {
+                name: "stored.bin",
+                data: b"store-me-please",
+                method: CompressionMethod::Stored,
+            },
+            JarEntry::File {
+                name: "deflated.bin",
+                data: b"deflate-me-please-aaaaaaaa",
+                method: CompressionMethod::Deflated,
+            },
+            JarEntry::File {
+                name: "lib/inner.jar",
+                data: &inner,
+                method: CompressionMethod::Stored,
+            },
+        ],
+    );
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+
+    let mut f = File::open(&out).unwrap();
+    let (header, _trailer, records) = read_ayz_file(&mut f).unwrap();
+    let stripped = strip_exact_fields(records);
+    let crafted = dir.path().join("skip.ayz");
+    let mut w = File::create(&crafted).unwrap();
+    write_ayz_file(&mut w, &header, &stripped, 1).unwrap();
+
+    let m = manifest_from_records(&stripped);
+    assert!(m.jars[0].tail_blob.is_none());
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    assert!(!m.jars[0].bit_identical_restore());
+    assert!(!m.jars[0].metadata_rebuild());
+    let inner_e = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.name == "lib/inner.jar")
+        .expect("inner");
+    assert!(inner_e.blob.is_none());
+    assert!(inner_e.zip_index.is_some());
+    let deflated_e = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.name == "deflated.bin")
+        .expect("deflated");
+    assert_eq!(deflated_e.method_code, 8);
+    let stored_e = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.name == "stored.bin")
+        .expect("stored");
+    assert_eq!(stored_e.method_code, 0);
+
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&crafted, &dest)).unwrap();
+    let restored = dest.join("mixed-skip.jar");
+    assert_functional_identity(&jar, &restored);
+    assert_eq!(
+        entry_compression(&restored, "stored.bin"),
+        CompressionMethod::Stored
+    );
+    assert_eq!(
+        entry_compression(&restored, "lib/inner.jar"),
+        CompressionMethod::Stored
+    );
+    assert_eq!(
+        entry_compression(&restored, "deflated.bin"),
+        CompressionMethod::Deflated,
+        "method-8 skip-exact files must DEFLATE at deflate_level"
     );
 }
 
