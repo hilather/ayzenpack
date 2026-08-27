@@ -684,12 +684,7 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
                 entries: jar_entries,
             };
             attach_exact(&mut sink, path, &mut jar)?;
-            if jar.signed && !jar.exact_restore() {
-                warn(
-                    opts,
-                    &format!("signed JAR {} (rebuild will break the signature)", jar.name),
-                );
-            } else if jar.signed {
+            if jar.signed {
                 warn(opts, &format!("signed JAR {}", jar.name));
             }
             jars.push(jar);

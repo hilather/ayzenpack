@@ -278,3 +278,31 @@ fn docs_lock_leftover_junk_hash_policy_and_class_dedup() {
         "docs/library.md must document priorities, leftover-junk exact vs homemade-None, seek-walk, parked synthetic CD, and absolute HTTPS links"
     );
 }
+
+#[test]
+fn signed_jar_docs_do_not_claim_rebuild_breaks_jarsigner() {
+    assert!(
+        !DESIGN.contains("rebuild will break the signature")
+            && !README.contains("rebuild will break the signature"),
+        "DESIGN/README must not claim ZIP rebuild breaks the JAR signature"
+    );
+    assert!(
+        !DESIGN.contains("compressed or stored bytes"),
+        "DESIGN.md must not say .SF digests compressed or stored bytes"
+    );
+    assert!(
+        !DESIGN.contains("those signatures will not verify"),
+        "DESIGN.md must not say rebuild signatures will not verify"
+    );
+    assert!(
+        !README.contains("will break them") && !README.contains("can still break a signature"),
+        "README must not say rebuild breaks signatures"
+    );
+    assert!(
+        DESIGN.contains("digest uncompressed entry bytes")
+            && DESIGN.contains("MANIFEST.MF")
+            && README.contains("digest uncompressed entry bytes")
+            && README.contains("MANIFEST.MF"),
+        "DESIGN and README must say .SF / MANIFEST digest uncompressed entry bytes"
+    );
+}
