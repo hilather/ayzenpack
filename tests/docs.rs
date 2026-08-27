@@ -208,7 +208,8 @@ fn docs_lock_leftover_junk_hash_policy_and_class_dedup() {
                 "Remaining homemade-`None` (true parse failure, truncated/malformed CD, overlap, prefix+hole)"
             )
             && !DESIGN.contains("Overlap, prefix+hole, and slice `Err` are other skip-exact reasons")
-            && !DESIGN.contains("prefix+hole stays skip-exact"),
+            && !DESIGN.contains("prefix+hole stays skip-exact")
+            && !DESIGN.contains("Prefix+hole stays skip-exact"),
         "DESIGN.md must say remaining homemade-None never gets tail_blob; range overlap/count mismatch are other skip-exact; equal-offset last-wins is exact splice; prefix+hole is not skip-exact (A)"
     );
     assert!(
@@ -356,6 +357,10 @@ fn docs_lock_synthetic_cd_hash_policy_fileabs_and_corpus() {
                 "Prefix+hole **(B)** `prefix_len > 0 && min(zip_rel) != 0` after convert is a dead defensive `Err` at first-local-not-at-0; keep it; do not call (B) absorbed"
             )
             && !AGENTS.contains("prefix+hole stays skip-exact arm 3")
+            && !DESIGN.contains("prefix+hole stays skip-exact")
+            && !DESIGN.contains("Prefix+hole stays skip-exact")
+            && !AGENTS.contains("prefix+hole stays skip-exact")
+            && !AGENTS.contains("Prefix+hole stays skip-exact")
             && README.contains(
                 "Prefix+hole **(A)** `[non-PK prefix][hole][first CD local]` is already `prefix_blob` covering bash+hole (`find_cd_first_local`); not skip-exact"
             )
@@ -367,6 +372,7 @@ fn docs_lock_synthetic_cd_hash_policy_fileabs_and_corpus() {
             )
             && !README.contains("count mismatch / prefix+hole")
             && !README.contains("prefix+hole stays skip-exact")
+            && !README.contains("Prefix+hole stays skip-exact")
             && LIBRARY.contains(
                 "Prefix+hole **(A)** `[non-PK prefix][hole][first CD local]` is already `prefix_blob` covering bash+hole (`find_cd_first_local`); not skip-exact"
             )
@@ -375,7 +381,9 @@ fn docs_lock_synthetic_cd_hash_policy_fileabs_and_corpus() {
             && LIBRARY.contains(
                 "prefixed arm 3 dest is FileAbs `ZipArchive::new(File)` vs source `scan_jar`"
             )
-            && !LIBRARY.contains("prefix+hole stays skip-exact"),
+            && !LIBRARY.contains("count mismatch / prefix+hole")
+            && !LIBRARY.contains("prefix+hole stays skip-exact")
+            && !LIBRARY.contains("Prefix+hole stays skip-exact"),
         "DESIGN/AGENTS/README/library must split prefix+hole (A) absorbed prefix_blob vs (B) kept dead Err; PK-start hole is leading_pad + arm 1; prefixed arm 3 is FileAbs dest vs scan_jar source"
     );
     assert!(
