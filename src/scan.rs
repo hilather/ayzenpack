@@ -621,8 +621,11 @@ fn read_cd_min_local(
     let mut best: Option<(u64, Vec<u8>)> = None;
     let mut i = 0usize;
     while i < cd.len() {
+        // Stop at leftover junk or a magic-but-short trailing record. Prefix
+        // detect only needs the min local from complete rows; homemade_ok
+        // (exact.rs) still returns None on truncated CD.
         if i + 46 > cd.len() || cd[i..i + 4] != CD_MAGIC {
-            return Ok(None);
+            break;
         }
         let name_len = u16::from_le_bytes(cd[i + 28..i + 30].try_into().unwrap()) as usize;
         let extra_len = u16::from_le_bytes(cd[i + 30..i + 32].try_into().unwrap()) as usize;
@@ -636,10 +639,10 @@ fn read_cd_min_local(
             .and_then(|n| n.checked_add(extra_len))
             .and_then(|n| n.checked_add(comment_len))
         else {
-            return Ok(None);
+            break;
         };
         if rec_end > cd.len() {
-            return Ok(None);
+            break;
         }
         let name = cd[i + 46..i + 46 + name_len].to_vec();
         let extra = &cd[i + 46 + name_len..i + 46 + name_len + extra_len];
@@ -651,9 +654,6 @@ fn read_cd_min_local(
             _ => best = Some((local_off, name)),
         }
         i = rec_end;
-    }
-    if i != cd.len() {
-        return Ok(None);
     }
     Ok(best)
 }

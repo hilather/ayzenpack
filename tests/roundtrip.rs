@@ -25,9 +25,10 @@ use fixtures::{
     write_padded_locals_zip, write_signed_looking_jar, write_store_file_plus_dir_cdata,
     write_store_file_plus_empty_deflate_dir, write_store_file_plus_leftover_csize_dir,
     write_stored_block_deflate_zip, write_stored_jar_dos_zero, write_stored_zip,
-    write_truncated_cd_listed_zip, write_unknown_deflate_wrapped, write_unknown_deflate_zip,
-    write_wrapped_jar, write_wrapped_jar_adjusted, write_wrapped_zip64_jar, write_zlib_deflate_zip,
-    zip64_jar_bytes, JarEntry, SPRING_LAUNCHER,
+    write_truncated_cd_listed_zip, write_truncated_cd_plus_store_nested_unadjusted,
+    write_unknown_deflate_wrapped, write_unknown_deflate_zip, write_wrapped_jar,
+    write_wrapped_jar_adjusted, write_wrapped_zip64_jar, write_zlib_deflate_zip, zip64_jar_bytes,
+    JarEntry, SPRING_LAUNCHER,
 };
 use zip::{CompressionMethod, DateTime, ZipArchive};
 
@@ -2859,6 +2860,27 @@ fn classic_eocd_cd_offset(buf: &[u8]) -> u64 {
     }
 }
 
+fn first_cd_local_header_offset(buf: &[u8]) -> u64 {
+    let mut i = buf.len() - 22;
+    loop {
+        if buf[i..i + 4] == *b"PK\x05\x06" {
+            let comment_len = u16::from_le_bytes([buf[i + 20], buf[i + 21]]) as usize;
+            if i + 22 + comment_len == buf.len() {
+                let cd_off = u32::from_le_bytes(buf[i + 16..i + 20].try_into().unwrap()) as usize;
+                assert_eq!(
+                    &buf[cd_off..cd_off + 4],
+                    b"PK\x01\x02",
+                    "dest CD at EOCD offset"
+                );
+                return u32::from_le_bytes(buf[cd_off + 42..cd_off + 46].try_into().unwrap())
+                    as u64;
+            }
+        }
+        assert!(i > 0, "EOCD");
+        i -= 1;
+    }
+}
+
 fn splice_truncated_cd_stub(path: &Path) {
     let mut buf = fs::read(path).unwrap();
     let mut i = buf.len() - 22;
@@ -2939,6 +2961,163 @@ fn listed_true_homemade_none_has_no_tail_blob() {
         CompressionMethod::Stored,
         "method-0 files must STORE on skip-exact arm 1"
     );
+}
+
+#[test]
+fn truncated_cd_store_nested_unadjusted_fileabs_lists_outer() {
+    // Homemade-None + STORE nested + unadjusted prefix: dest FileAbs CD so
+    // ZipArchive::new(File) lists outer names. Source ZipArchive latches; scan_jar
+    // is the oracle. Do not call assert_functional_identity (File on both paths).
+    let dir = tempfile::tempdir().unwrap();
+    let jars = dir.path().join("jars");
+    fs::create_dir_all(&jars).unwrap();
+    let jar = jars.join("trunc-nested-prefix.jar");
+    let inner = write_truncated_cd_plus_store_nested_unadjusted(&jar);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&jar).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&jar, perms).unwrap();
+    }
+    let src = fs::read(&jar).unwrap();
+    assert!(src.starts_with(SPRING_LAUNCHER));
+    let src_len = src.len() as u64;
+    let src_scan = ayzenpack::scan::scan_jar(&jar, u64::MAX).unwrap();
+    let src_names: Vec<&str> = src_scan.entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        src_names.contains(&"lib/inner.jar"),
+        "scan_jar must list outer names, got {src_names:?}"
+    );
+    assert!(
+        !src_names.contains(&"n.txt"),
+        "scan_jar must not explode inner n.txt, got {src_names:?}"
+    );
+
+    let pack = dir.path().join("out.ayz");
+    matt_dehydrate(&pack, &jars);
+    let records = read_archive(&pack).2;
+    let m = manifest_from_records(&records);
+    assert!(
+        m.jars[0].tail_blob.is_none(),
+        "remaining homemade-None must never get tail_blob"
+    );
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    assert!(!m.jars[0].bit_identical_restore());
+    assert!(!m.jars[0].metadata_rebuild());
+    assert_eq!(
+        m.jars[0].prefix_size,
+        Some(SPRING_LAUNCHER.len() as u64),
+        "unadjusted launcher must be prefix"
+    );
+    for e in &m.jars[0].entries {
+        assert!(e.cdata_blob.is_none(), "{} cdata_blob", e.name);
+        assert!(
+            e.local_header_hex.is_some() || e.local_header_blob.is_some(),
+            "{} must capture a local header",
+            e.name
+        );
+    }
+    for nested in &m.jars[0].nestedindexes {
+        for e in &nested.entries {
+            assert!(e.cdata_blob.is_none(), "nested {} cdata_blob", e.name);
+        }
+    }
+    let e = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.name == "lib/inner.jar")
+        .expect("inner");
+    assert!(e.blob.is_none());
+    assert!(e.zip_index.is_some());
+    let inner_hex = ayzenpack::hashutil::hex_lower(&blake3_bytes(&inner));
+    assert!(
+        !m.blobs.iter().any(|b| b.blake3 == inner_hex),
+        "blake3(inner zip) must not be in blobs[]"
+    );
+    assert_eq!(
+        content_blob_ids(&m).len(),
+        2,
+        "a.txt + inner n.txt, unique content not doubled"
+    );
+    let payloads = blob_payloads(&records);
+    let idx = e.zip_index.expect("zip_index");
+    let got_inner = ayzenpack::reconstruct_child_zip(
+        &m.jars[0].nestedindexes[idx],
+        e.uncompressed_size,
+        |hex| {
+            let h = ayzenpack::hashutil::parse_blake3_hex(hex).unwrap();
+            Ok(payloads.get(&h).cloned().expect(hex))
+        },
+    )
+    .unwrap();
+    assert_eq!(got_inner, inner);
+    let first_oh = m.jars[0].entries[0].offsetheader.expect("offsetheader");
+    assert_eq!(
+        first_oh,
+        SPRING_LAUNCHER.len() as u64,
+        "first offsetheader includes prefix"
+    );
+    verify(&pack).unwrap();
+
+    matt_rehydrate(&pack);
+    let got = fs::read(&jar).unwrap();
+    let got_len = got.len() as u64;
+    assert!(
+        got_len * 2 >= src_len,
+        "restored {got_len} must stay in the same league as source {src_len}"
+    );
+    assert!(
+        got.starts_with(SPRING_LAUNCHER),
+        "prefix bytes must be unchanged"
+    );
+    let prefix_len = m.jars[0].prefix_size.unwrap();
+    let phys_cd = prefix_len + classic_eocd_cd_offset(&src);
+    let cd_start = classic_eocd_cd_offset(&got);
+    assert_eq!(
+        &got[..cd_start as usize],
+        &src[..phys_cd as usize],
+        "arm 1 prefix+locals identity"
+    );
+    let dest_first_cd = first_cd_local_header_offset(&got);
+    assert_eq!(
+        dest_first_cd, first_oh,
+        "FileAbs: first CD local offset must equal offsetheader, not zip-rel 0"
+    );
+    assert_ne!(dest_first_cd, 0, "FileAbs dest must not use zip-rel 0");
+
+    let mut z = ZipArchive::new(File::open(&jar).unwrap()).unwrap();
+    assert_eq!(
+        z.len(),
+        src_scan.entries.len(),
+        "dest ZipArchive len vs source scan_jar"
+    );
+    for (i, sc) in src_scan.entries.iter().enumerate() {
+        let de = z.by_index(i).unwrap();
+        assert_eq!(de.name(), sc.name, "dest vs scan_jar name[{i}]");
+        assert_eq!(de.is_dir(), sc.is_dir, "dest vs scan_jar dir[{i}]");
+        assert_eq!(de.crc32(), sc.crc32, "dest vs scan_jar crc[{i}]");
+    }
+    assert!(
+        z.by_name("lib/inner.jar").is_ok(),
+        "dest ZipArchive::new(File) must see outer lib/inner.jar"
+    );
+    assert!(
+        z.by_name("n.txt").is_err(),
+        "dest ZipArchive::new(File) must not latch inner n.txt"
+    );
+    drop(z);
+    assert_eq!(
+        entry_compression(&jar, "lib/inner.jar"),
+        CompressionMethod::Stored,
+        "dest lib/inner.jar must stay Stored"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&jar).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "prefixed dest must be executable");
+    }
 }
 
 #[test]

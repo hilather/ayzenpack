@@ -910,6 +910,36 @@ pub fn write_truncated_cd_listed_zip(path: &Path) {
     std::fs::write(path, buf).unwrap();
 }
 
+/// Truncated-CD homemade-`None` STORE zip with `lib/inner.jar` (`n.txt` inside),
+/// then unadjusted Spring launcher (`zip_a = false`). Source
+/// `ZipArchive::new(File)` can latch the nested EOCD; `scan_jar` is the listing
+/// oracle. Returns the inner zip bytes (not CAS'd on a `zip_index` slot).
+pub fn write_truncated_cd_plus_store_nested_unadjusted(path: &Path) -> Vec<u8> {
+    let inner_tmp = path.with_extension("inner.jar");
+    let inner_plain = b"nested-plain";
+    write_stored_zip(
+        &inner_tmp,
+        &[(
+            "n.txt",
+            inner_plain.as_slice(),
+            crc32fast::hash(inner_plain),
+        )],
+    );
+    let inner = std::fs::read(&inner_tmp).unwrap();
+    std::fs::remove_file(&inner_tmp).unwrap();
+    write_stored_zip(
+        path,
+        &[
+            ("a.txt", b"hello".as_slice(), crc32fast::hash(b"hello")),
+            ("lib/inner.jar", inner.as_slice(), crc32fast::hash(&inner)),
+        ],
+    );
+    let mut buf = std::fs::read(path).unwrap();
+    splice_trailing_cd_junk(&mut buf, &magic_but_short_cd_header());
+    std::fs::write(path, prepend_launcher(&buf, SPRING_LAUNCHER, false)).unwrap();
+    inner
+}
+
 /// Leftover-junk CD plus a STORE listable nested zip (`lib/inner.jar`).
 pub fn write_leftover_junk_plus_store_nested(path: &Path) {
     let inner_tmp = path.with_extension("inner.jar");
