@@ -950,7 +950,7 @@ pub fn write_unknown_deflate_wrapped(path: &Path, launcher: &[u8], name: &str, d
     std::fs::write(path, out).unwrap();
 }
 
-/// Flate2-reproducible file plus a zlib-3 miss (Test 4).
+/// Flate2-reproducible file plus an unknown-deflate miss (empty stored prefix + zlib-6; Test 4).
 pub fn write_codec_hit_plus_unknown_deflate(
     path: &Path,
     hit_name: &str,
