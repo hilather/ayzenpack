@@ -13,7 +13,7 @@ No clap in the lib. No process-global flags. Quiet / verbose / json-logs are fie
 
 `#![forbid(unsafe_code)]` is on `lib.rs`.
 
-Restore policy (see [DESIGN.md](https://github.com/hilather/ayzenpack/blob/main/DESIGN.md)): `source_*` must match iff `bit_identical_restore`. Skip-exact ZipWriter STOREs `method_code == 0` / `zip_index` over uncompressed payload (`read_entry_content` / `reconstruct_child_zip`); never `resolve_cdata`. Nested STORE is `zip_index` + shared class blobs — never CAS `blake3(inner zip)`. Remaining homemade-`None` never gets `tail_blob`. Do not store `cdata_blob`. Do not chase bit-identical hashes on a miss.
+Restore policy (see [DESIGN.md](https://github.com/hilather/ayzenpack/blob/main/DESIGN.md)): Priorities: (1) lean pack (2) complete rehydrate (3) class-level dedup. `source_*` must match iff `bit_identical_restore`. Outer exact is a file seek-walk (no outer `Vec`). Leftover junk after N complete CD records with `N == ZipArchive::len()` is homemade_ok + `tail_blob` (exact when every slot hits). Remaining homemade-`None` never gets `tail_blob`. Skip-exact ZipWriter STOREs `method_code == 0` / `zip_index` over uncompressed payload (`read_entry_content` / `reconstruct_child_zip`); never `resolve_cdata`. Nested STORE is `zip_index` + shared class blobs — never CAS `blake3(inner zip)`. Synthetic CD is parked. Do not store `cdata_blob`. Do not chase bit-identical hashes on a miss.
 
 ---
 

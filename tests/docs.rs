@@ -192,9 +192,21 @@ fn docs_lock_leftover_junk_hash_policy_and_class_dedup() {
     );
     assert!(
         DESIGN.contains(
-            "Remaining homemade-`None` (true parse failure, truncated/malformed CD, overlap, prefix+hole) **never** gets `tail_blob`"
-        ) && DESIGN.contains("Never attach tail while homemade parse is `None`"),
-        "DESIGN.md must say remaining homemade-None never gets tail_blob"
+            "Remaining homemade-`None` (true parse failure, truncated/malformed CD) **never** gets `tail_blob`"
+        ) && DESIGN.contains("Never attach tail while homemade parse is `None`")
+            && DESIGN.contains(
+                "Overlap, prefix+hole, and slice `Err` are other skip-exact reasons"
+            )
+            && !DESIGN.contains(
+                "Remaining homemade-`None` (true parse failure, truncated/malformed CD, overlap, prefix+hole)"
+            ),
+        "DESIGN.md must say remaining homemade-None never gets tail_blob; overlap/prefix+hole are other skip-exact, not parse-None"
+    );
+    assert!(
+        DESIGN.contains(
+            "∀ jar (bit_identical_restore: STORE splice / codec-hit / leftover-junk exact / legacy cdata_blob / raw_zip):"
+        ) && !DESIGN.contains("/ zip_index / leftover-junk exact"),
+        "DESIGN.md forall must require source_* iff bit_identical_restore, not on skip-exact zip_index"
     );
     assert!(
         DESIGN.contains("Outer exact (`write_exact_jar`) is a **file seek-walk**")
@@ -222,6 +234,9 @@ fn docs_lock_leftover_junk_hash_policy_and_class_dedup() {
         README.contains("Priorities: (1) lean pack (2) complete rehydrate (3) class-level dedup")
             && README.contains("`source_*` **must** match iff `bit_identical_restore`")
             && README.contains("Never CAS `blake3(inner zip)` on a `zip_index` slot")
+            && README.contains(
+                "Leftover junk after N complete CD records with `N == ZipArchive::len()` is homemade_ok + `tail_blob` (exact when every slot hits)"
+            )
             && README.contains("Remaining homemade-`None` never gets `tail_blob`")
             && README.contains("Synthetic CD is parked"),
         "README must document priorities, hash match iff bit_identical_restore, leftover-junk vs homemade-None, parked synthetic CD"
@@ -245,15 +260,21 @@ fn docs_lock_leftover_junk_hash_policy_and_class_dedup() {
         "README must not tell agents to store cdata_blob or chase bit-identical hashes"
     );
     assert!(
-        LIBRARY.contains("`source_*` must match iff `bit_identical_restore`")
-            && LIBRARY.contains("never CAS `blake3(inner zip)`")
+        LIBRARY.contains("Priorities: (1) lean pack (2) complete rehydrate (3) class-level dedup")
+            && LIBRARY.contains("`source_*` must match iff `bit_identical_restore`")
+            && LIBRARY.contains("Outer exact is a file seek-walk")
+            && LIBRARY.contains(
+                "Leftover junk after N complete CD records with `N == ZipArchive::len()` is homemade_ok + `tail_blob` (exact when every slot hits)"
+            )
             && LIBRARY.contains("Remaining homemade-`None` never gets `tail_blob`")
+            && LIBRARY.contains("Synthetic CD is parked")
+            && LIBRARY.contains("never CAS `blake3(inner zip)`")
             && LIBRARY.contains("Do not store `cdata_blob`")
             && LIBRARY.contains("Do not chase bit-identical hashes on a miss")
             && LIBRARY.contains("https://github.com/hilather/ayzenpack/blob/main/DESIGN.md")
             && LIBRARY.contains(
                 "https://github.com/hilather/ayzenpack/blob/main/examples/ayzenpack.yaml"
             ),
-        "docs/library.md must document hash policy, class-level dedup, leftover-junk, and absolute HTTPS links"
+        "docs/library.md must document priorities, leftover-junk exact vs homemade-None, seek-walk, parked synthetic CD, and absolute HTTPS links"
     );
 }
