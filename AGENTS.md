@@ -2,6 +2,8 @@
 
 This file is mandatory. It is not a suggestion. Read it before changing pack format, dehydrate, rehydrate, corpus tests, or storage docs.
 
+Cloud agents must use the in-repo `.cursor/skills` plan/skeptic skills (`review-plan`, `skeptic-plan-review`, `skeptic-code-review`) and `knowledge/*-skepticism/`. Origin `matt-brewer/agent-skills` is not required and is often unreachable.
+
 ## Storage efficiency is of the utmost importance
 
 That is the product. Valid ZIP out of index + blobs is enough. Whole-file `source_*` hashes may change. Do not trade pack size for Java-zlib bit-identical files.
@@ -35,7 +37,7 @@ Crate **0.2.3** / format **v2** groups uncompressed blobs in 4 MiB record-aligne
 See [`PLAN.md`](PLAN.md). Format stays **v2** (additive keys). Do not implement in a plan-only PR.
 
 - Stencil: ratarmount-rs columns (`offsetheader`, `data_start`, `ZipMemberTable`, `DurableZipMember` / `nestedindexes`). Offsets are a write recipe after the source file is gone. Keep `blob` / `local_header_offset` / `tail_blob` / `prefix_blob`.
-- Slot payload is **one** of: CAS `blob` + optional `cdata_codec`, or a depth-1 child `zip_index`. Decide before `--jobs` `spawn_file`. Never `commit_blob` inners onto the outer listing. Never CAS `blake3(inner zip)` if that slot becomes `zip_index`. Child stencil is tail-bearing. Cap child file entries at **65535**. Opaque fallback if the child would not exact-restore. No SQLite in the `.ayz`.
+- Slot payload is **one** of: CAS `blob` + optional `cdata_codec`, or a depth-1 child `zip_index`. Probe with `slice_from_bytes` before `--jobs` `spawn_file`. Never `commit_blob` inners onto the outer listing. Never CAS `blake3(inner zip)` if that slot becomes `zip_index`. Child stencil is tail-bearing. Cap child file entries at **65535**. Opaque fallback if the child would not exact-restore. `verify` / `write_jar` use `reconstruct_child_zip` (skip-exact outer has no opaque inner CAS). No SQLite in the `.ayz`.
 - Codecs (no `cdata_blob`): STORE; `deflate-raw:zlib:{1,6,9}` via in-process zlib-rs (not a Java subprocess); existing `deflate-raw:flate2:{1,3,6,9}`; `deflate-raw:stored`. Cache by `(blob, compressed_size, flags)`. A miss must not drop sibling codecs (today CleanMiss is jar-wide).
 - Do not treat `first offsetheader == prefix_len` as new work (0.2.3 already slices that). Remaining skip-exact: homemade-`None` (`tail_blob` only if every slot hits) and leading-pad (`leading_pad_blob`, do not extend `prefix_len`). Overlap stays skip-exact.
 - `source_*` must match when every slot hits. A zopfli / unknown-deflate miss still rebuilds that entry only. Rewrite mix `proven_miss` so sibling codecs are allowed.
