@@ -479,6 +479,12 @@ fn docs_lock_restore_backend_cli_visibility() {
             && README.contains("`--verbose` still prints every jar including `exact`"),
         "README must document human list RESTORE column and default rehydrate notice"
     );
+    assert!(
+        LIBRARY.contains("Default `rehydrate` (`quiet=false`, `verbose=false`) prints")
+            && LIBRARY.contains("`quiet: true` restores the old silence")
+            && LIBRARY.contains("quiet: true,"),
+        "docs/library.md must note default restore stderr and that quiet: true restores old silence"
+    );
 }
 
 #[test]

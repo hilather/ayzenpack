@@ -9,7 +9,7 @@ pub fn list(input: &Path) -> Result<Manifest>;
 pub fn verify(input: &Path) -> Result<()>;
 ```
 
-No clap in the lib. No process-global flags. Quiet / verbose / json-logs are fields on the options structs — copy them in from your own CLI, or leave the defaults.
+No clap in the lib. No process-global flags. Quiet / verbose / json-logs are fields on the options structs — copy them in from your own CLI. Default `rehydrate` (`quiet=false`, `verbose=false`) prints `ayzenpack: restoring {name} ({backend})` for each `!bit_identical_restore()` jar; `json_logs` still logs every jar; `quiet: true` restores the old silence.
 
 `#![forbid(unsafe_code)]` is on `lib.rs`.
 
@@ -52,6 +52,7 @@ fn main() -> ayzenpack::Result<()> {
         input: PathBuf::from("libs.ayz"),
         dir: PathBuf::from("restored"),
         overwrite: true,
+        quiet: true,
         ..RehydrateOptions::default()
     })
 }
@@ -108,6 +109,7 @@ ayzenpack = { git = "https://github.com/hilather/ayzenpack" }
 | `overwrite` | `false` | refuse to clobber existing JARs (ignored when `restore_paths`) |
 | `only` | `[]` | jar `name`s from the manifest |
 | `restore_paths` | `false` | write to recorded `restore_path`; `--dir` unused. Sibling tmp then `replace_file`; dest is not unlinked first |
+| `quiet` / `verbose` / `json_logs` | `false` | default: one stderr line per non-exact jar (`ayzenpack: restoring {name} ({backend})`); `quiet: true` restores old silence; `verbose` still prints `exact`; `json_logs` logs every jar |
 
 ---
 
@@ -194,6 +196,7 @@ fn run_job(path: &Path) -> anyhow::Result<()> {
             input: r.input,
             dir: r.dir,
             overwrite: r.overwrite,
+            quiet: true,
             ..RehydrateOptions::default()
         })?;
     }

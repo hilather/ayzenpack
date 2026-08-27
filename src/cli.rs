@@ -302,12 +302,12 @@ fn read_trailer_file(path: &Path) -> std::result::Result<Trailer, CliError> {
 /// Human table (name, entries, signed, source_size, restore backend, method-8 misses).
 fn print_human_list(manifest: &Manifest, trailer: &Trailer) {
     println!(
-        "{:<32} {:>7} {:>6} {:>12} {:<32} {:>6}",
+        "{:<32} {:>7} {:>6} {:>12} {:<34} {:>6}",
         "NAME", "ENTRIES", "SIGNED", "SIZE", "RESTORE", "M8MISS"
     );
     for jar in &manifest.jars {
         println!(
-            "{:<32} {:>7} {:>6} {:>12} {:<32} {:>6}",
+            "{:<32} {:>7} {:>6} {:>12} {:<34} {:>6}",
             jar.name,
             jar.entries.len(),
             jar.signed,
@@ -325,7 +325,6 @@ fn print_human_list(manifest: &Manifest, trailer: &Trailer) {
     );
 }
 
-/// Outer listing method-8 files with no `cdata_codec` (same definition as mix stats).
 fn method8_file_miss_count(jar: &Jar) -> usize {
     jar.entries
         .iter()

@@ -402,7 +402,7 @@ fn pack_one(dir: &Path, jar: &Path) -> std::path::PathBuf {
     out
 }
 
-fn assert_list_restore(out: &Path, want: &str) {
+fn assert_list_restore(out: &Path, want: &str, want_m8miss: usize) {
     let m = list(out).unwrap();
     assert_eq!(m.jars[0].restore_backend(), want, "{}", m.jars[0].name);
     let stdout = String::from_utf8(
@@ -421,9 +421,16 @@ fn assert_list_restore(out: &Path, want: &str) {
         stdout.contains("RESTORE") && stdout.contains("M8MISS"),
         "human list must have RESTORE and M8MISS columns: {stdout}"
     );
-    assert!(
-        stdout.contains(want),
-        "human list must print {want}: {stdout}"
+    let row = stdout
+        .lines()
+        .find(|l| l.contains(&m.jars[0].name) && l.contains(want))
+        .unwrap_or_else(|| panic!("missing list row for {} ({want}): {stdout}", m.jars[0].name));
+    let last = row.split_whitespace().last().unwrap_or("");
+    assert_eq!(
+        last.parse::<usize>().ok(),
+        Some(want_m8miss),
+        "M8MISS for {} want {want_m8miss}: {row}",
+        m.jars[0].name
     );
 }
 
@@ -455,7 +462,7 @@ fn list_restore_store_is_exact() {
         &[("x.txt", b"hello".as_slice(), crc32fast::hash(b"hello"))],
     );
     let out = pack_one(dir.path(), &jar);
-    assert_list_restore(&out, "exact");
+    assert_list_restore(&out, "exact", 0);
 }
 
 #[test]
@@ -464,7 +471,7 @@ fn list_restore_unknown_deflate_with_tail_is_rebuild() {
     let jar = dir.path().join("miss.jar");
     write_unknown_deflate_zip(&jar, "a.txt", &vec![b'a'; 256]);
     let out = pack_one(dir.path(), &jar);
-    assert_list_restore(&out, "rebuild");
+    assert_list_restore(&out, "rebuild", 1);
 }
 
 #[test]
@@ -473,7 +480,7 @@ fn list_restore_truncated_cd_leading_pad_is_skip_exact_seek() {
     let jar = dir.path().join("lead-trunc.jar");
     write_leading_pad_pk_decoy_truncated_cd_zip(&jar, "a.txt", b"leading-pad-plain");
     let out = pack_one(dir.path(), &jar);
-    assert_list_restore(&out, "skip_exact_seek_synthetic_cd");
+    assert_list_restore(&out, "skip_exact_seek_synthetic_cd", 0);
 }
 
 #[test]
@@ -482,7 +489,7 @@ fn list_restore_method8_miss_without_tail_is_skip_exact_concat() {
     let jar = dir.path().join("trunc-overlap-miss.jar");
     write_truncated_cd_overlap_unknown_deflate_sibling(&jar);
     let out = pack_one(dir.path(), &jar);
-    assert_list_restore(&out, "skip_exact_concat_synthetic_cd");
+    assert_list_restore(&out, "skip_exact_concat_synthetic_cd", 1);
 }
 
 #[test]
@@ -491,7 +498,7 @@ fn list_restore_range_overlap_is_skip_exact_zipwriter() {
     let jar = dir.path().join("range-overlap.jar");
     write_range_overlap_local_zip(&jar);
     let out = pack_one(dir.path(), &jar);
-    assert_list_restore(&out, "skip_exact_zipwriter");
+    assert_list_restore(&out, "skip_exact_zipwriter", 0);
 }
 
 #[test]
@@ -508,7 +515,7 @@ fn list_restore_dup_txt_is_skip_exact_zipwriter() {
         ],
     );
     let out = pack_one(dir.path(), &jar);
-    assert_list_restore(&out, "skip_exact_zipwriter");
+    assert_list_restore(&out, "skip_exact_zipwriter", 0);
 }
 
 #[test]
