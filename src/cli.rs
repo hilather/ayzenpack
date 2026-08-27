@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::anyhow;
 use clap::{Parser, Subcommand};
 
+use ayzenpack::manifest::Jar;
 use ayzenpack::stats::{fmt_bytes, format_stats_line, json_event};
 use ayzenpack::{
     dehydrate, list, rehydrate, verify, AyzenpackError, DehydrateOptions, DehydrateSummary,
@@ -298,19 +299,21 @@ fn read_trailer_file(path: &Path) -> std::result::Result<Trailer, CliError> {
     ayzenpack::format::read_trailer(&mut file).map_err(CliError::from)
 }
 
-/// Human table (name, entries, signed, source_size) plus footer from trailer + manifest.
+/// Human table (name, entries, signed, source_size, restore backend, method-8 misses).
 fn print_human_list(manifest: &Manifest, trailer: &Trailer) {
     println!(
-        "{:<32} {:>7} {:>6} {:>12}",
-        "NAME", "ENTRIES", "SIGNED", "SIZE"
+        "{:<32} {:>7} {:>6} {:>12} {:<32} {:>6}",
+        "NAME", "ENTRIES", "SIGNED", "SIZE", "RESTORE", "M8MISS"
     );
     for jar in &manifest.jars {
         println!(
-            "{:<32} {:>7} {:>6} {:>12}",
+            "{:<32} {:>7} {:>6} {:>12} {:<32} {:>6}",
             jar.name,
             jar.entries.len(),
             jar.signed,
-            jar.source_size
+            jar.source_size,
+            jar.restore_backend(),
+            method8_file_miss_count(jar)
         );
     }
     println!();
@@ -320,6 +323,14 @@ fn print_human_list(manifest: &Manifest, trailer: &Trailer) {
         trailer.blob_count,
         fmt_bytes(manifest.stats.bytes_unique_blobs)
     );
+}
+
+/// Outer listing method-8 files with no `cdata_codec` (same definition as mix stats).
+fn method8_file_miss_count(jar: &Jar) -> usize {
+    jar.entries
+        .iter()
+        .filter(|e| !e.is_dir && e.method_code == 8 && e.cdata_codec.is_none())
+        .count()
 }
 
 fn print_dehydrate_stats(opts: &DehydrateOptions, summary: &DehydrateSummary) {

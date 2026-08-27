@@ -457,6 +457,31 @@ fn docs_lock_ci_hash_policy_and_last_measured_corpus_paste() {
 }
 
 #[test]
+fn docs_lock_restore_backend_cli_visibility() {
+    assert!(
+        DESIGN.contains("`Jar::restore_backend()` is the single dispatch")
+            && DESIGN.contains("skip_exact_seek_synthetic_cd")
+            && DESIGN.contains("skip_exact_concat_synthetic_cd")
+            && DESIGN.contains("skip_exact_zipwriter")
+            && DESIGN.contains("Human `list` prints a `RESTORE` column")
+            && DESIGN.contains("`list --json` remains the Manifest")
+            && DESIGN.contains("Default `rehydrate` prints `ayzenpack: restoring {name} ({backend})`")
+            && DESIGN.contains("`--quiet` suppresses")
+            && DESIGN.contains("`--verbose` still prints every jar including `exact`"),
+        "DESIGN.md must document Jar::restore_backend tokens, list RESTORE column, and default rehydrate notice"
+    );
+    assert!(
+        README.contains("`RESTORE` backend")
+            && README.contains("skip_exact_seek_synthetic_cd")
+            && README.contains("no `restore_backend` key")
+            && README
+                .contains("Default `rehydrate` prints one line per jar that is not bit-identical")
+            && README.contains("`--verbose` still prints every jar including `exact`"),
+        "README must document human list RESTORE column and default rehydrate notice"
+    );
+}
+
+#[test]
 fn signed_jar_docs_do_not_claim_rebuild_breaks_jarsigner() {
     assert!(
         !DESIGN.contains("rebuild will break the signature")

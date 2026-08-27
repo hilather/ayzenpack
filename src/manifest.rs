@@ -98,6 +98,63 @@ impl Jar {
     pub fn metadata_rebuild(&self) -> bool {
         self.raw_zip_blob.is_none() && self.tail_blob.is_some() && !self.bit_identical_restore()
     }
+
+    /// Restore writer class. Tokens match `log_restore` / `--verbose`.
+    /// `exact` | `rebuild` | `skip_exact_seek_synthetic_cd` |
+    /// `skip_exact_concat_synthetic_cd` | `skip_exact_zipwriter`.
+    pub fn restore_backend(&self) -> &'static str {
+        if self.bit_identical_restore() {
+            "exact"
+        } else if self.metadata_rebuild() {
+            "rebuild"
+        } else {
+            match self.skip_exact_arm() {
+                SkipExactArm::StencilSeekSyntheticCd => "skip_exact_seek_synthetic_cd",
+                SkipExactArm::RebuildConcatSyntheticCd => "skip_exact_concat_synthetic_cd",
+                SkipExactArm::ZipWriterStore => "skip_exact_zipwriter",
+            }
+        }
+    }
+
+    fn has_captured_local_header(e: &Entry) -> bool {
+        e.local_header_hex.is_some() || e.local_header_blob.is_some()
+    }
+
+    /// Closed predicate. Do not call `resolve_cdata(..., false)` on a miss.
+    fn slot_resolves_at_recorded_csize(&self, e: &Entry) -> bool {
+        if !self.slot_exact(e) {
+            return false;
+        }
+        if e.zip_index.is_some() {
+            return e.compressed_size == e.uncompressed_size;
+        }
+        true
+    }
+
+    fn skip_exact_arm(&self) -> SkipExactArm {
+        debug_assert!(self.tail_blob.is_none() && self.raw_zip_blob.is_none());
+        if !self.entries.iter().all(Self::has_captured_local_header) {
+            return SkipExactArm::ZipWriterStore;
+        }
+        if self
+            .entries
+            .iter()
+            .all(|e| self.slot_resolves_at_recorded_csize(e))
+        {
+            return SkipExactArm::StencilSeekSyntheticCd;
+        }
+        SkipExactArm::RebuildConcatSyntheticCd
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SkipExactArm {
+    /// Headers + every slot keeps recorded csize. Seek + synthetic CD.
+    StencilSeekSyntheticCd,
+    /// Headers, but at least one slot would change csize.
+    RebuildConcatSyntheticCd,
+    /// No captured headers (range overlap / ZipArchive count mismatch / slice Err).
+    ZipWriterStore,
 }
 
 impl Entry {
@@ -768,6 +825,7 @@ mod tests {
             "data_descriptor_hex",
             "pad_zeros",
             "pad_blob",
+            "restore_backend",
         ] {
             assert!(!s.contains(key), "None {key} must be omitted: {s}");
         }
@@ -784,5 +842,149 @@ mod tests {
         ] {
             assert!(!e.contains(key), "None {key} must be omitted: {e}");
         }
+    }
+
+    fn skip_exact_jar() -> Jar {
+        let mut jar = sample_manifest().jars[0].clone();
+        jar.entries.clear();
+        jar.tail_blob = None;
+        jar.raw_zip_blob = None;
+        jar
+    }
+
+    fn store_file(name: &str) -> Entry {
+        Entry {
+            name: name.into(),
+            blob: Some("aa".repeat(32)),
+            method: "stored".into(),
+            method_code: 0,
+            uncompressed_size: 4,
+            compressed_size: 4,
+            local_header_hex: Some("504b0304".into()),
+            local_header_offset: Some(0),
+            offsetheader: Some(0),
+            ..Entry::default()
+        }
+    }
+
+    #[test]
+    fn restore_backend_raw_zip_is_exact() {
+        let mut jar = skip_exact_jar();
+        jar.raw_zip_blob = Some("aa".repeat(32));
+        assert_eq!(jar.restore_backend(), "exact");
+    }
+
+    #[test]
+    fn restore_backend_tail_store_is_exact() {
+        let mut jar = skip_exact_jar();
+        jar.tail_blob = Some("aa".repeat(32));
+        jar.entries.push(store_file("a.txt"));
+        assert!(jar.bit_identical_restore());
+        assert_eq!(jar.restore_backend(), "exact");
+    }
+
+    #[test]
+    fn restore_backend_tail_miss_is_rebuild() {
+        let mut jar = skip_exact_jar();
+        jar.tail_blob = Some("aa".repeat(32));
+        jar.entries.push(Entry {
+            name: "miss.bin".into(),
+            blob: Some("bb".repeat(32)),
+            method: "deflated".into(),
+            method_code: 8,
+            uncompressed_size: 8,
+            compressed_size: 12,
+            local_header_hex: Some("504b0304".into()),
+            local_header_offset: Some(0),
+            offsetheader: Some(0),
+            ..Entry::default()
+        });
+        assert!(jar.metadata_rebuild());
+        assert_eq!(jar.restore_backend(), "rebuild");
+    }
+
+    #[test]
+    fn skip_exact_arm_empty_entries_is_stencil_seek() {
+        let jar = skip_exact_jar();
+        assert_eq!(jar.skip_exact_arm(), SkipExactArm::StencilSeekSyntheticCd);
+        assert_eq!(jar.restore_backend(), "skip_exact_seek_synthetic_cd");
+    }
+
+    #[test]
+    fn skip_exact_arm_headers_and_store_is_stencil_seek() {
+        let mut jar = skip_exact_jar();
+        jar.entries.push(store_file("a.txt"));
+        assert!(Jar::has_captured_local_header(&jar.entries[0]));
+        assert!(jar.slot_resolves_at_recorded_csize(&jar.entries[0]));
+        assert_eq!(jar.skip_exact_arm(), SkipExactArm::StencilSeekSyntheticCd);
+        assert_eq!(jar.restore_backend(), "skip_exact_seek_synthetic_cd");
+    }
+
+    #[test]
+    fn skip_exact_arm_missing_header_is_zipwriter() {
+        let mut jar = skip_exact_jar();
+        let mut e = store_file("a.txt");
+        e.local_header_hex = None;
+        jar.entries.push(e);
+        assert_eq!(jar.skip_exact_arm(), SkipExactArm::ZipWriterStore);
+        assert_eq!(jar.restore_backend(), "skip_exact_zipwriter");
+    }
+
+    #[test]
+    fn skip_exact_arm_dir_without_header_is_zipwriter() {
+        let mut jar = skip_exact_jar();
+        jar.entries.push(store_file("a.txt"));
+        jar.entries.push(Entry {
+            name: "d/".into(),
+            is_dir: true,
+            ..Entry::default()
+        });
+        assert_eq!(jar.skip_exact_arm(), SkipExactArm::ZipWriterStore);
+        assert_eq!(jar.restore_backend(), "skip_exact_zipwriter");
+    }
+
+    #[test]
+    fn skip_exact_arm_method8_miss_is_concat_arm() {
+        let mut jar = skip_exact_jar();
+        jar.entries.push(store_file("a.txt"));
+        jar.entries.push(Entry {
+            name: "miss.bin".into(),
+            blob: Some("bb".repeat(32)),
+            method: "deflated".into(),
+            method_code: 8,
+            uncompressed_size: 8,
+            compressed_size: 12,
+            local_header_hex: Some("504b0304".into()),
+            local_header_offset: Some(40),
+            offsetheader: Some(40),
+            ..Entry::default()
+        });
+        assert!(!jar.slot_resolves_at_recorded_csize(&jar.entries[1]));
+        assert_eq!(jar.skip_exact_arm(), SkipExactArm::RebuildConcatSyntheticCd);
+        assert_eq!(jar.restore_backend(), "skip_exact_concat_synthetic_cd");
+    }
+
+    #[test]
+    fn skip_exact_arm_zip_index_csize_mismatch_is_concat_arm() {
+        let mut jar = skip_exact_jar();
+        jar.nestedindexes.push(NestedIndex {
+            tail_blob: Some("cc".repeat(32)),
+            entries: vec![store_file("n.txt")],
+            ..NestedIndex::default()
+        });
+        jar.entries.push(Entry {
+            name: "lib/inner.jar".into(),
+            zip_index: Some(0),
+            uncompressed_size: 10,
+            compressed_size: 9,
+            local_header_hex: Some("504b0304".into()),
+            local_header_offset: Some(0),
+            offsetheader: Some(0),
+            ..Entry::default()
+        });
+        assert!(jar.slot_exact(&jar.entries[0]));
+        assert!(!jar.slot_resolves_at_recorded_csize(&jar.entries[0]));
+        assert_eq!(jar.skip_exact_arm(), SkipExactArm::RebuildConcatSyntheticCd);
+        assert_eq!(jar.restore_backend(), "skip_exact_concat_synthetic_cd");
     }
 }

@@ -9,8 +9,12 @@ use std::path::Path;
 
 use assert_cmd::Command;
 use ayzenpack::format::{read_ayz_file, write_ayz_file, Record};
-use ayzenpack::Manifest;
-use fixtures::write_jar;
+use ayzenpack::{list, Manifest};
+use fixtures::{
+    write_jar, write_leading_pad_pk_decoy_truncated_cd_zip, write_range_overlap_local_zip,
+    write_stored_zip, write_truncated_cd_overlap_unknown_deflate_sibling,
+    write_unknown_deflate_zip,
+};
 use predicates::prelude::*;
 
 fn ayzenpack() -> Command {
@@ -339,6 +343,10 @@ fn list_json_stdout_deserializes_as_full_manifest() {
     assert_eq!(m.jars[0].name, "a.jar");
     assert!(!m.blobs.is_empty());
     assert_eq!(m.stats.unique_blob_count, m.blobs.len() as u64);
+    assert!(
+        !s.contains("restore_backend"),
+        "list --json must stay the Manifest (no restore_backend key): {s}"
+    );
 }
 
 fn flip_first_blob_payload(path: &Path) {
@@ -380,4 +388,187 @@ fn cli_verify_missing_file_exits_1() {
         .assert()
         .failure()
         .code(1);
+}
+
+fn pack_one(dir: &Path, jar: &Path) -> std::path::PathBuf {
+    let out = dir.join("out.ayz");
+    ayzenpack()
+        .arg("dehydrate")
+        .arg("-o")
+        .arg(&out)
+        .arg(jar)
+        .assert()
+        .success();
+    out
+}
+
+fn assert_list_restore(out: &Path, want: &str) {
+    let m = list(out).unwrap();
+    assert_eq!(m.jars[0].restore_backend(), want, "{}", m.jars[0].name);
+    let stdout = String::from_utf8(
+        ayzenpack()
+            .arg("list")
+            .arg("-i")
+            .arg(out)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        stdout.contains("RESTORE") && stdout.contains("M8MISS"),
+        "human list must have RESTORE and M8MISS columns: {stdout}"
+    );
+    assert!(
+        stdout.contains(want),
+        "human list must print {want}: {stdout}"
+    );
+}
+
+fn rehydrate_stderr(out: &Path, dest: &Path, extra: &[&str]) -> String {
+    let mut cmd = ayzenpack();
+    for a in extra {
+        cmd.arg(a);
+    }
+    let output = cmd
+        .arg("rehydrate")
+        .arg("-i")
+        .arg(out)
+        .arg("-d")
+        .arg(dest)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .get_output()
+        .clone();
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn list_restore_store_is_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("store.jar");
+    write_stored_zip(
+        &jar,
+        &[("x.txt", b"hello".as_slice(), crc32fast::hash(b"hello"))],
+    );
+    let out = pack_one(dir.path(), &jar);
+    assert_list_restore(&out, "exact");
+}
+
+#[test]
+fn list_restore_unknown_deflate_with_tail_is_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("miss.jar");
+    write_unknown_deflate_zip(&jar, "a.txt", &vec![b'a'; 256]);
+    let out = pack_one(dir.path(), &jar);
+    assert_list_restore(&out, "rebuild");
+}
+
+#[test]
+fn list_restore_truncated_cd_leading_pad_is_skip_exact_seek() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("lead-trunc.jar");
+    write_leading_pad_pk_decoy_truncated_cd_zip(&jar, "a.txt", b"leading-pad-plain");
+    let out = pack_one(dir.path(), &jar);
+    assert_list_restore(&out, "skip_exact_seek_synthetic_cd");
+}
+
+#[test]
+fn list_restore_method8_miss_without_tail_is_skip_exact_concat() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("trunc-overlap-miss.jar");
+    write_truncated_cd_overlap_unknown_deflate_sibling(&jar);
+    let out = pack_one(dir.path(), &jar);
+    assert_list_restore(&out, "skip_exact_concat_synthetic_cd");
+}
+
+#[test]
+fn list_restore_range_overlap_is_skip_exact_zipwriter() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("range-overlap.jar");
+    write_range_overlap_local_zip(&jar);
+    let out = pack_one(dir.path(), &jar);
+    assert_list_restore(&out, "skip_exact_zipwriter");
+}
+
+#[test]
+fn list_restore_dup_txt_is_skip_exact_zipwriter() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("dup.jar");
+    let first = b"first-payload".as_slice();
+    let second = b"second-payload".as_slice();
+    write_stored_zip(
+        &jar,
+        &[
+            ("dup.txt", first, crc32fast::hash(first)),
+            ("dup.txt", second, crc32fast::hash(second)),
+        ],
+    );
+    let out = pack_one(dir.path(), &jar);
+    assert_list_restore(&out, "skip_exact_zipwriter");
+}
+
+#[test]
+fn rehydrate_default_prints_rebuild_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("miss.jar");
+    write_unknown_deflate_zip(&jar, "a.txt", &vec![b'a'; 256]);
+    let out = pack_one(dir.path(), &jar);
+    let dest = dir.path().join("restored");
+    let err = rehydrate_stderr(&out, &dest, &[]);
+    assert!(
+        err.contains("ayzenpack: restoring miss.jar (rebuild)"),
+        "default rehydrate must notice rebuild: {err}"
+    );
+}
+
+#[test]
+fn rehydrate_default_is_silent_for_exact_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("store.jar");
+    write_stored_zip(
+        &jar,
+        &[("x.txt", b"hello".as_slice(), crc32fast::hash(b"hello"))],
+    );
+    let out = pack_one(dir.path(), &jar);
+    let dest = dir.path().join("restored");
+    let err = rehydrate_stderr(&out, &dest, &[]);
+    assert!(
+        !err.contains("restoring"),
+        "exact STORE must stay silent by default: {err}"
+    );
+}
+
+#[test]
+fn rehydrate_quiet_suppresses_rebuild_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("miss.jar");
+    write_unknown_deflate_zip(&jar, "a.txt", &vec![b'a'; 256]);
+    let out = pack_one(dir.path(), &jar);
+    let dest = dir.path().join("restored");
+    let err = rehydrate_stderr(&out, &dest, &["-q"]);
+    assert!(
+        !err.contains("restoring"),
+        "--quiet must suppress the rebuild notice: {err}"
+    );
+}
+
+#[test]
+fn rehydrate_verbose_still_prints_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("store.jar");
+    write_stored_zip(
+        &jar,
+        &[("x.txt", b"hello".as_slice(), crc32fast::hash(b"hello"))],
+    );
+    let out = pack_one(dir.path(), &jar);
+    let dest = dir.path().join("restored");
+    let err = rehydrate_stderr(&out, &dest, &["-v"]);
+    assert!(
+        err.contains("ayzenpack: restoring store.jar (exact)"),
+        "--verbose must still print exact: {err}"
+    );
 }

@@ -243,26 +243,23 @@ fn restore_jars(opts: &RehydrateOptions, manifest: &Manifest, cas_dir: &Path) ->
             }
         }
         let apply_prefix_chmod = !(opts.restore_paths && jar.restore_mode.is_some());
-        if jar.bit_identical_restore() {
-            log_restore(opts, jar, "exact");
-            write_exact_jar(jar, cas_dir, &dest, apply_prefix_chmod)?;
-        } else if jar.metadata_rebuild() {
-            log_restore(opts, jar, "rebuild");
-            write_rebuilt_jar(jar, cas_dir, &dest, apply_prefix_chmod)?;
-        } else {
-            match skip_exact_arm(jar) {
-                SkipExactArm::StencilSeekSyntheticCd => {
-                    log_restore(opts, jar, "skip_exact_seek_synthetic_cd");
-                    write_skip_exact_seek(jar, cas_dir, &dest, apply_prefix_chmod)?;
-                }
-                SkipExactArm::RebuildConcatSyntheticCd => {
-                    log_restore(opts, jar, "skip_exact_concat_synthetic_cd");
-                    write_skip_exact_concat(jar, cas_dir, &dest, apply_prefix_chmod)?;
-                }
-                SkipExactArm::ZipWriterStore => {
-                    log_restore(opts, jar, "skip_exact_zipwriter");
-                    write_jar(opts, jar, cas_dir, &dest, apply_prefix_chmod)?;
-                }
+        let backend = jar.restore_backend();
+        log_restore(opts, jar, backend);
+        match backend {
+            "exact" => write_exact_jar(jar, cas_dir, &dest, apply_prefix_chmod)?,
+            "rebuild" => write_rebuilt_jar(jar, cas_dir, &dest, apply_prefix_chmod)?,
+            "skip_exact_seek_synthetic_cd" => {
+                write_skip_exact_seek(jar, cas_dir, &dest, apply_prefix_chmod)?
+            }
+            "skip_exact_concat_synthetic_cd" => {
+                write_skip_exact_concat(jar, cas_dir, &dest, apply_prefix_chmod)?
+            }
+            "skip_exact_zipwriter" => write_jar(opts, jar, cas_dir, &dest, apply_prefix_chmod)?,
+            _ => {
+                return Err(AyzenpackError::FormatOwned(format!(
+                    "unknown restore backend {backend} for {}",
+                    jar.name
+                )));
             }
         }
         if opts.restore_paths {
@@ -504,46 +501,6 @@ fn create_restore_tmp(dest: &Path) -> Result<(PendingRestore, File)> {
     })?;
     maybe_inject_restore_tmp_failure()?;
     Ok((pending, file))
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SkipExactArm {
-    /// Headers + every slot keeps recorded csize. Seek + synthetic CD.
-    StencilSeekSyntheticCd,
-    /// Headers, but at least one slot would change csize.
-    RebuildConcatSyntheticCd,
-    /// No captured headers (range overlap / ZipArchive count mismatch / slice Err).
-    ZipWriterStore,
-}
-
-fn has_captured_local_header(e: &Entry) -> bool {
-    e.local_header_hex.is_some() || e.local_header_blob.is_some()
-}
-
-/// Closed predicate. Do not call `resolve_cdata(..., false)` on a miss.
-fn slot_resolves_at_recorded_csize(jar: &Jar, e: &Entry) -> bool {
-    if !jar.slot_exact(e) {
-        return false;
-    }
-    if e.zip_index.is_some() {
-        return e.compressed_size == e.uncompressed_size;
-    }
-    true
-}
-
-fn skip_exact_arm(jar: &Jar) -> SkipExactArm {
-    debug_assert!(jar.tail_blob.is_none() && jar.raw_zip_blob.is_none());
-    if !jar.entries.iter().all(has_captured_local_header) {
-        return SkipExactArm::ZipWriterStore;
-    }
-    if jar
-        .entries
-        .iter()
-        .all(|e| slot_resolves_at_recorded_csize(jar, e))
-    {
-        return SkipExactArm::StencilSeekSyntheticCd;
-    }
-    SkipExactArm::RebuildConcatSyntheticCd
 }
 
 /// Synthetic CD file name from the listing when it differs from the aliased local.
@@ -1428,7 +1385,10 @@ fn log_restore(opts: &RehydrateOptions, jar: &Jar, backend: &str) {
         }));
         return;
     }
-    if opts.verbose {
+    if opts.quiet {
+        return;
+    }
+    if opts.verbose || !jar.bit_identical_restore() {
         eprintln!("ayzenpack: restoring {} ({backend})", jar.name);
     }
 }
@@ -1458,99 +1418,6 @@ mod tests {
         check_jar_name("a.jar").unwrap();
         check_jar_name("lib__2.jar").unwrap();
         check_jar_name("foo..bar.jar").unwrap();
-    }
-
-    fn store_file(name: &str) -> Entry {
-        Entry {
-            name: name.into(),
-            blob: Some("aa".repeat(32)),
-            method_code: 0,
-            uncompressed_size: 4,
-            compressed_size: 4,
-            local_header_hex: Some("504b0304".into()),
-            local_header_offset: Some(0),
-            offsetheader: Some(0),
-            ..Entry::default()
-        }
-    }
-
-    #[test]
-    fn skip_exact_arm_empty_entries_is_stencil_seek() {
-        let jar = jar_restore("/abs/a.jar");
-        assert_eq!(skip_exact_arm(&jar), SkipExactArm::StencilSeekSyntheticCd);
-    }
-
-    #[test]
-    fn skip_exact_arm_headers_and_store_is_stencil_seek() {
-        let mut jar = jar_restore("/abs/a.jar");
-        jar.entries.push(store_file("a.txt"));
-        assert!(has_captured_local_header(&jar.entries[0]));
-        assert!(slot_resolves_at_recorded_csize(&jar, &jar.entries[0]));
-        assert_eq!(skip_exact_arm(&jar), SkipExactArm::StencilSeekSyntheticCd);
-    }
-
-    #[test]
-    fn skip_exact_arm_missing_header_is_zipwriter() {
-        let mut jar = jar_restore("/abs/a.jar");
-        let mut e = store_file("a.txt");
-        e.local_header_hex = None;
-        jar.entries.push(e);
-        assert_eq!(skip_exact_arm(&jar), SkipExactArm::ZipWriterStore);
-    }
-
-    #[test]
-    fn skip_exact_arm_dir_without_header_is_zipwriter() {
-        let mut jar = jar_restore("/abs/a.jar");
-        jar.entries.push(store_file("a.txt"));
-        jar.entries.push(Entry {
-            name: "d/".into(),
-            is_dir: true,
-            ..Entry::default()
-        });
-        assert_eq!(skip_exact_arm(&jar), SkipExactArm::ZipWriterStore);
-    }
-
-    #[test]
-    fn skip_exact_arm_method8_miss_is_concat_arm() {
-        let mut jar = jar_restore("/abs/a.jar");
-        jar.entries.push(store_file("a.txt"));
-        jar.entries.push(Entry {
-            name: "miss.bin".into(),
-            blob: Some("bb".repeat(32)),
-            method: "deflated".into(),
-            method_code: 8,
-            uncompressed_size: 8,
-            compressed_size: 12,
-            local_header_hex: Some("504b0304".into()),
-            local_header_offset: Some(40),
-            offsetheader: Some(40),
-            ..Entry::default()
-        });
-        assert!(!slot_resolves_at_recorded_csize(&jar, &jar.entries[1]));
-        assert_eq!(skip_exact_arm(&jar), SkipExactArm::RebuildConcatSyntheticCd);
-    }
-
-    #[test]
-    fn skip_exact_arm_zip_index_csize_mismatch_is_concat_arm() {
-        let mut jar = jar_restore("/abs/a.jar");
-        jar.nestedindexes.push(crate::manifest::NestedIndex {
-            tail_blob: Some("cc".repeat(32)),
-            entries: vec![store_file("n.txt")],
-            ..crate::manifest::NestedIndex::default()
-        });
-        jar.entries.push(Entry {
-            name: "lib/inner.jar".into(),
-            zip_index: Some(0),
-            uncompressed_size: 10,
-            compressed_size: 9,
-            local_header_hex: Some("504b0304".into()),
-            local_header_offset: Some(0),
-            offsetheader: Some(0),
-            ..Entry::default()
-        });
-        assert!(jar.slot_exact(&jar.entries[0]));
-        assert!(!slot_resolves_at_recorded_csize(&jar, &jar.entries[0]));
-        assert_eq!(skip_exact_arm(&jar), SkipExactArm::RebuildConcatSyntheticCd);
     }
 
     #[test]

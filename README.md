@@ -40,7 +40,7 @@ ayzenpack verify -i libs.ayz
 ayzenpack: 12 jars, 8401 entries, 912 unique blobs, 148.2 MiB → 41.7 MiB unique, zstd 18.4 MiB (0.124 of jar bytes)
 ```
 
-Progress and that stats line go to **stderr**. stdout stays quiet on success, so the binary is pipe-safe. `-q` silences progress. `--json-logs` writes one JSON object per event on stderr.
+Progress and that stats line go to **stderr**. stdout stays quiet on success, so the binary is pipe-safe. `-q` silences progress. `--json-logs` writes one JSON object per event on stderr. Default `rehydrate` prints one line per jar that is not bit-identical (`ayzenpack: restoring {name} ({backend})`); `--quiet` suppresses; `--verbose` still prints every jar including `exact`.
 
 ---
 
@@ -265,7 +265,7 @@ ayzenpack list -i libs.ayz --json
 ayzenpack verify -i libs.ayz
 ```
 
-`list` prints a table (name, entries, signed, size). `--json` prints the full pretty MANIFEST on stdout.
+`list` prints a table (name, entries, signed, size, `RESTORE` backend, method-8 file miss count). Restore tokens match rehydrate: `exact` / `rebuild` / `skip_exact_seek_synthetic_cd` / `skip_exact_concat_synthetic_cd` / `skip_exact_zipwriter`. `--json` prints the full pretty MANIFEST on stdout (no `restore_backend` key).
 
 `verify` re-hashes blobs and checks the manifest. Integrity mismatches exit **3**; unreadable / not-an-archive errors exit **1**.
 

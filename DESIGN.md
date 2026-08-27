@@ -238,6 +238,8 @@ Per jar: `tail_blob` / `tail_size` is the CD-through-EOF index blob (structural,
 | No captured headers: overlap / ZipArchive count mismatch / slice `Err` (**arm 3**) | ZipWriter STORE | valid ZIP, same size league | **may change** |
 | 0.1.x archive, no tail | ZipWriter | functional identity | **may change** |
 
+`Jar::restore_backend()` is the single dispatch for rehydrate and human `list`. Tokens match `log_restore` / `--verbose`: `exact`, `rebuild`, `skip_exact_seek_synthetic_cd`, `skip_exact_concat_synthetic_cd`, `skip_exact_zipwriter`. Human `list` prints a `RESTORE` column (that token) plus method-8 **file** miss count (outer listing, `!is_dir && method_code == 8`, no `cdata_codec`). `list --json` remains the Manifest (no stored `restore_backend` key). No inspect subcommand. Default `rehydrate` prints `ayzenpack: restoring {name} ({backend})` for each `!bit_identical_restore()` jar; `--quiet` suppresses; `--verbose` still prints every jar including `exact`. Dest bytes are unchanged.
+
 **Bit-identical means walking the stencil**, not a second encoding:
 
 ```
