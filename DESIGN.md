@@ -333,7 +333,17 @@ Leftover-junk is **not** the synthetic-CD path after 0.2.5. Do not restage lefto
 
 ### Corpus lucene/jackson `source_*`
 
-Already implemented and **env-gated**: [`tests/corpus.rs`](https://github.com/hilather/ayzenpack/blob/main/tests/corpus.rs) `corpus_lucene_jackson_source_identity_only_when_every_slot_hits` skips unless `AYZENPACK_CORPUS_DIR` is set. It prints per-jar `method8` / `flate2` / `zlib` / `stored` / `miss` / `exact`, and asserts whole-file hashes **only** when `jar.bit_identical_restore()`.
+Already implemented and **env-gated**: [`tests/corpus.rs`](https://github.com/hilather/ayzenpack/blob/main/tests/corpus.rs) `corpus_lucene_jackson_source_identity_only_when_every_slot_hits` skips unless `AYZENPACK_CORPUS_DIR` is set. It prints per-jar `method8` / `flate2` / `zlib` / `stored` / `miss` / `exact`, and asserts whole-file hashes **only** when `jar.bit_identical_restore()`. Mix `corpus_mix_regular_and_spring_whole_file_hashes` uses the same env gate.
+
+**What CI requires:**
+
+| Workflow | Command | `AYZENPACK_CORPUS_DIR` | `source_*` / whole-file hash |
+|---|---|---|---|
+| [`.github/workflows/ci.yml`](https://github.com/hilather/ayzenpack/blob/main/.github/workflows/ci.yml) `linux-test` / `windows-test` | `cargo test --locked` with only `CARGO_NET_OFFLINE` | **not set** (the workflow never assigns it; it does not `unset` it) | Mix and lucene/jackson tests **skip** when the env is absent (`corpus_dir()`). A runner that injected the var would run them. Always-on hash gates are synthetic fixtures in [`tests/roundtrip.rs`](https://github.com/hilather/ayzenpack/blob/main/tests/roundtrip.rs) (zlib-rs bitstream, STORE zip-A, leftover-junk, codec-hit zip-crate, Maven empty DEFLATE dir, etc.). |
+| [`.github/workflows/ci.yml`](https://github.com/hilather/ayzenpack/blob/main/.github/workflows/ci.yml) `msrv` | `cargo +1.80 check` | not set | No restore hashes. |
+| [`.github/workflows/corpus.yml`](https://github.com/hilather/ayzenpack/blob/main/.github/workflows/corpus.yml) | `cargo test --locked --test corpus -- --nocapture` | **set** to `.corpus` after `ci/download-corpus.sh` | Mix: `hashes_eq` **required iff** `jar.bit_identical_restore()`; `hash_mismatch_proven_miss` **allowed**. Lucene/jackson: print per-jar `method8/flate2/zlib/stored/miss/exact`; assert hashes **only when** `bit_identical_restore()`. CLI overlap: `verify` + `rehydrate` only — **no** dest vs original file hash. |
+
+Default `cargo test` (the job developers run and `ci.yml` linux/windows) **does not require original-file hashes on Maven JARs.** `.github/workflows/ci.yml` does **not set** `AYZENPACK_CORPUS_DIR`. Those tests skip when the env is absent. Do **not** claim CI requires original-file hashes on every jar. It requires them on `bit_identical_restore` jars and on the synthetic Zip64 mix fat. [`.github/workflows/corpus.yml`](https://github.com/hilather/ayzenpack/blob/main/.github/workflows/corpus.yml) already caches `.corpus` on `hashFiles('ci/corpus.lock.json')`.
 
 **How to enable (operators / agents):**
 
@@ -348,7 +358,48 @@ AYZENPACK_CORPUS_DIR=/path/to/corpus cargo test --test corpus \
 
 [`ci/download-corpus.sh`](https://github.com/hilather/ayzenpack/blob/main/ci/download-corpus.sh) verifies SHA-256 from [`ci/corpus.lock.json`](https://github.com/hilather/ayzenpack/blob/main/ci/corpus.lock.json). Promote those jars into always-on CI `source_*` **only when every printed line has `miss=0` and `exact=true`** (100% measured method-8 hits, every slot STORE/codec/`zip_index`). Until then: keep the env gate; do not fail default `cargo test` on a remaining zlib-3 / zopfli miss. Mix `proven_miss` already allows sibling codecs.
 
-**Last measured (2026-08-27, after `deflate-raw:zlib:{1,3,6,9}`):** skipped. `AYZENPACK_CORPUS_DIR` was unset and lockfile lucene/jackson JARs were not on disk (`.corpus/` is gitignored; this crate does not fetch). Default `cargo test` still skips `corpus_lucene_jackson_source_identity_only_when_every_slot_hits`. Do not drop the env gate. Do not promote always-on until an operator paste of that test is 100% `miss=0` / `exact=true`. This stack does not add a GH Actions corpus cache.
+**Last measured (GitHub Actions corpus run `33098832157`, crate 0.2.7 / `70bcd73`, 2026-08-27, after `deflate-raw:zlib:{1,3,6,9}`):** corpus.yml **did** run. A local machine with `AYZENPACK_CORPUS_DIR` unset is not the source of truth.
+
+Mix (`corpus_mix_regular_and_spring_whole_file_hashes`):
+
+| Jar | `identical` | `bit_identical` | `rebuild` | `raw_zip` |
+|---|---|---|---|---|
+| `plain-failureaccess.jar` (Maven `failureaccess-1.0.2`) | false | false | **true** | false |
+| `plain-slf4j.jar` (Maven `slf4j-api-2.0.16`) | false | false | **true** | false |
+| `plain-jackson-annotations.jar` (Maven `jackson-annotations-2.17.2`) | false | false | **true** | false |
+| `spring-jackson-core.jar` (launcher + jackson-core) | false | false | **true** | false |
+| `spring-zipa-slf4j.jar` (zip -A launcher + slf4j) | false | false | **true** | false |
+| `spring-zip64-nested.jar` (zip-crate Zip64 fat) | **true** | **true** | false | false |
+
+```
+mix stats jars=6 bytes_in_jars=835025 unique_blob_count=378
+bytes_unique_blobs=1497510 ayz=592946 ratio=0.7101
+codec_hit=226 codec_miss=207 cdata_blob=0
+hash_match=1 hash_mismatch_proven_miss=5
+```
+
+`codec_hit` / `codec_miss` count **method-8 file entries on the outer listing only** (`tests/corpus.rs` skips `e.is_dir || e.method_code != 8` before incrementing). Maven empty DEFLATE dirs (`03 00`) and nested `zip_index` child slots are not in `226` / `207`. Mix Zip64 nested is opaque DEFLATE, so this mix is fine.
+
+Gate check: `592946 <= 569539 * 115/100` (`654969`). Mix `cdata_blob == 0`. The five Maven/Spring wraps are `rebuild=true` — **`tail_blob` is present**. Capture stored the stencil. Restore did not ZipWriter them. Hashes changed because at least one method-8 slot missed the closed codec set.
+
+Lucene/jackson (`corpus_lucene_jackson_source_identity_only_when_every_slot_hits`), same run — **every line `exact=false`**, so **no** whole-file hash assert fired:
+
+| Jar | method8 | flate2 | zlib | stored | miss | exact |
+|---|---:|---:|---:|---:|---:|---|
+| jackson-annotations-2.17.2.jar | 79 | 0 | 57 | 0 | 22 | false |
+| jackson-core-2.17.2.jar | 227 | 0 | 105 | 0 | 122 | false |
+| jackson-databind-2.17.2.jar | 791 | 1 | 260 | 0 | 530 | false |
+| lucene-analysis-common-9.11.1.jar | 680 | 1 | 218 | 0 | 461 | false |
+| lucene-backward-codecs-9.11.1.jar | 407 | 0 | 204 | 0 | 203 | false |
+| lucene-codecs-9.11.1.jar | 217 | 0 | 69 | 0 | 148 | false |
+| lucene-core-9.11.1.jar | 2513 | 1 | 1042 | 0 | 1470 | false |
+| lucene-highlighter-9.11.1.jar | 172 | 0 | 68 | 0 | 104 | false |
+| lucene-queryparser-9.11.1.jar | 256 | 0 | 93 | 0 | 163 | false |
+| lucene-suggest-9.11.1.jar | 126 | 0 | 51 | 0 | 75 | false |
+
+Hit rate is real (zlib-rs matches a large minority / majority depending on the jar) and **insufficient for whole-file identity**. One miss poisons `bit_identical_restore` for the whole jar. jackson-annotations is 57/79 zlib hits and still `exact=false` because of 22 misses.
+
+Default `cargo test` still skips `corpus_lucene_jackson_source_identity_only_when_every_slot_hits` when `AYZENPACK_CORPUS_DIR` is unset. Do not drop the env gate. Do not promote always-on until an operator paste of that test is 100% `miss=0` / `exact=true`.
 
 Do **not** buy lucene/jackson hashes with `cdata_blob` or Java `Deflater`. Mix gates stay: `cdata_blob == 0`; `output_len <= 569539 * 115 / 100`; unique content not doubled; no inner-zip CAS on `zip_index`.
 

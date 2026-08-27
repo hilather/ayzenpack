@@ -408,6 +408,55 @@ fn docs_lock_synthetic_cd_hash_policy_fileabs_and_corpus() {
 }
 
 #[test]
+fn docs_lock_ci_hash_policy_and_last_measured_corpus_paste() {
+    // Full sentences, not keyword soup. An inverted stub must fail.
+    assert!(
+        DESIGN.contains("`.github/workflows/ci.yml` does **not set** `AYZENPACK_CORPUS_DIR`")
+            && DESIGN.contains("`hashes_eq` **required iff** `jar.bit_identical_restore()`")
+            && DESIGN.contains(
+                "https://github.com/hilather/ayzenpack/blob/main/.github/workflows/ci.yml"
+            )
+            && DESIGN.contains(
+                "https://github.com/hilather/ayzenpack/blob/main/.github/workflows/corpus.yml"
+            ),
+        "DESIGN.md must state ci.yml does not set AYZENPACK_CORPUS_DIR and corpus.yml requires hashes iff bit_identical_restore"
+    );
+    assert!(
+        DESIGN.contains("corpus run `33098832157`")
+            && DESIGN.contains("hash_match=1")
+            && DESIGN.contains("hash_mismatch_proven_miss=5")
+            && DESIGN.contains("codec_hit=226")
+            && DESIGN.contains("codec_miss=207")
+            && DESIGN.contains("method-8 file entries on the outer listing only")
+            && DESIGN.contains("every line `exact=false`")
+            && !DESIGN.contains(":** skipped. `AYZENPACK_CORPUS_DIR` was unset")
+            && !DESIGN.contains("This stack does not add a GH Actions corpus cache"),
+        "DESIGN.md last-measured must paste corpus run 33098832157 (mix 1/6 hash_match, method-8-file hit/miss footnote), not a local skip"
+    );
+    assert!(
+        README.contains("Typical Maven / Spring JARs usually miss")
+            && README.contains("mix is 5/6 `hash_mismatch_proven_miss`")
+            && README.contains("does **not set** `AYZENPACK_CORPUS_DIR`")
+            && README.contains("requires `source_*` iff `bit_identical_restore`")
+            && README.contains("Do not treat default `ci.yml` as always-on lucene/jackson")
+            && README.contains(
+                "https://github.com/hilather/ayzenpack/blob/main/.github/workflows/ci.yml"
+            )
+            && README.contains(
+                "https://github.com/hilather/ayzenpack/blob/main/.github/workflows/corpus.yml"
+            ),
+        "README Reconstruction must say typical Maven dest hashes may change, CI mix 5/6, and ci.yml is not always-on lucene/jackson source_*"
+    );
+    assert!(
+        LIBRARY.contains("Typical Maven dest hashes may change")
+            && LIBRARY.contains("corpus.yml mix 5/6")
+            && LIBRARY.contains("does **not set** `AYZENPACK_CORPUS_DIR`")
+            && LIBRARY.contains("requires `source_*` iff `bit_identical_restore`"),
+        "docs/library.md must not imply always-on Maven hashes; mix 5/6 and ci.yml env gate"
+    );
+}
+
+#[test]
 fn signed_jar_docs_do_not_claim_rebuild_breaks_jarsigner() {
     assert!(
         !DESIGN.contains("rebuild will break the signature")
