@@ -13,7 +13,6 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime, ZipWriter};
 
 use crate::cas;
-use crate::deflate;
 use crate::error::{AyzenpackError, Result};
 use crate::exact::{
     detect_offset_mode, encode_offset, patch_central_directory, patch_data_descriptor,
@@ -22,7 +21,7 @@ use crate::exact::{
 use crate::format::{decode_payload, open_ayz_layout, read_record, Record};
 use crate::hashutil::{blake3_bytes, hash_reader, hex_lower, parse_blake3_hex, parse_hex};
 use crate::manifest::{Entry, Jar, Manifest, MANIFEST_FORMAT};
-use crate::reconstruct::reconstruct_child_zip;
+use crate::reconstruct::{load_header, reconstruct_child_zip, resolve_slot_cdata, write_slot};
 use crate::scan::ZipView;
 
 const DEFAULT_DEFLATE_LEVEL: i32 = 6;
@@ -546,95 +545,39 @@ fn write_exact_entry(
     dest: &Path,
     prefix_len: u64,
 ) -> Result<()> {
-    let header = load_local_header(jar, e, cas_dir)?;
     let cdata = resolve_cdata(jar, e, cas_dir, false)?;
-    let desc = match &e.data_descriptor_hex {
-        Some(h) => parse_hex(h)?,
-        None => Vec::new(),
-    };
-
-    let pos = if let Some(oh) = e.offsetheader {
-        oh
-    } else {
-        let off = e.local_header_offset.ok_or_else(|| {
-            AyzenpackError::FormatOwned(format!(
-                "missing local_header_offset for {}!{}",
-                jar.name, e.name
-            ))
-        })?;
-        prefix_len.checked_add(off).ok_or_else(|| {
-            AyzenpackError::FormatOwned(format!("{}!{} seek overflow", jar.name, e.name))
-        })?
-    };
-    file.seek(SeekFrom::Start(pos))
-        .map_err(|source| AyzenpackError::Io {
+    write_slot(
+        file,
+        e,
+        prefix_len,
+        &mut |hex| read_named_blob(cas_dir, hex, &format!("{}!{}", jar.name, e.name)),
+        &cdata,
+    )
+    .map_err(|err| match err {
+        AyzenpackError::Io { source, path: None } => AyzenpackError::Io {
             source,
             path: Some(dest.to_path_buf()),
-        })?;
-    file.write_all(&header)
-        .map_err(|source| AyzenpackError::Io {
-            source,
-            path: Some(dest.to_path_buf()),
-        })?;
-    file.write_all(&cdata)
-        .map_err(|source| AyzenpackError::Io {
-            source,
-            path: Some(dest.to_path_buf()),
-        })?;
-    file.write_all(&desc).map_err(|source| AyzenpackError::Io {
-        source,
-        path: Some(dest.to_path_buf()),
-    })?;
-    write_pad(file, jar, e, cas_dir, dest)?;
-    Ok(())
+        },
+        other => other,
+    })
 }
 
-/// `allow_rebuild` is never true on the exact splice path (step 4 is jar-level).
+/// `allow_rebuild` is never true on the exact splice path (jar-level rebuild).
 fn resolve_cdata(jar: &Jar, e: &Entry, cas_dir: &Path, allow_rebuild: bool) -> Result<Vec<u8>> {
-    if let Some(hex) = &e.cdata_blob {
-        return read_named_blob(cas_dir, hex, &format!("{}!{} cdata", jar.name, e.name));
+    if e.blob.is_some() && e.zip_index.is_some() {
+        return Err(AyzenpackError::FormatOwned(format!(
+            "{}!{} has both blob and zip_index",
+            jar.name, e.name
+        )));
     }
-    if let Some(codec) = &e.cdata_codec {
-        if !(allow_rebuild && e.is_dir) {
-            let spec = deflate::parse_codec(codec)?;
-            // Empty DEFLATE directories have no content blob; encode `[]` at the recorded codec.
-            let bytes = if e.is_dir && e.blob.is_none() {
-                Vec::new()
-            } else {
-                read_entry_content(jar, e, cas_dir)?
-            };
-            let out = deflate::encode_codec(spec, &bytes)?;
-            if out.len() as u64 != e.compressed_size {
-                return Err(AyzenpackError::HashMismatch(format!(
-                    "{}!{} cdata_codec size: recorded {} computed {}",
-                    jar.name,
-                    e.name,
-                    e.compressed_size,
-                    out.len()
-                )));
-            }
-            return Ok(out);
-        }
-        // Miss-jar rebuild may ignore dir codecs (hash may change). Exact jars
-        // take allow_rebuild=false and use the recorded codec.
-    }
-    if e.is_dir {
-        if allow_rebuild && e.method_code == 8 && e.uncompressed_size == 0 {
-            return deflate::deflate_raw(&[], deflate::rebuild_level());
-        }
-        return Ok(Vec::new());
-    }
-    if e.method_code == 0 {
+    if e.zip_index.is_some() {
         return read_entry_content(jar, e, cas_dir);
     }
-    if allow_rebuild {
-        let bytes = read_entry_content(jar, e, cas_dir)?;
-        return deflate::deflate_raw(&bytes, deflate::rebuild_level());
-    }
-    Err(AyzenpackError::FormatOwned(format!(
-        "missing cdata for {}!{} (no cdata_blob/cdata_codec)",
-        jar.name, e.name
-    )))
+    resolve_slot_cdata(
+        e,
+        &mut |hex| read_named_blob(cas_dir, hex, &format!("{}!{} cdata", jar.name, e.name)),
+        allow_rebuild,
+    )
 }
 
 /// Header fields after rebuild. Class-4 / leftover-csize / exotic dirs become empty STORE.
@@ -790,55 +733,13 @@ fn write_rebuilt_jar(
 }
 
 fn load_local_header(jar: &Jar, e: &Entry, cas_dir: &Path) -> Result<Vec<u8>> {
-    match (&e.local_header_hex, &e.local_header_blob) {
-        (Some(hex), None) => parse_hex(hex),
-        (None, Some(blob)) => read_named_blob(
+    load_header(e, &mut |hex| {
+        read_named_blob(
             cas_dir,
-            blob,
+            hex,
             &format!("{}!{} local_header", jar.name, e.name),
-        ),
-        (None, None) => Err(AyzenpackError::FormatOwned(format!(
-            "missing local header for {}!{}",
-            jar.name, e.name
-        ))),
-        (Some(_), Some(_)) => Err(AyzenpackError::FormatOwned(format!(
-            "local_header_hex and local_header_blob both set on {}!{}",
-            jar.name, e.name
-        ))),
-    }
-}
-
-fn write_pad(file: &mut File, jar: &Jar, e: &Entry, cas_dir: &Path, dest: &Path) -> Result<()> {
-    match (e.pad_zeros, &e.pad_blob) {
-        (Some(_), Some(_)) => Err(AyzenpackError::FormatOwned(format!(
-            "pad_zeros and pad_blob both set on {}!{}",
-            jar.name, e.name
-        ))),
-        (Some(n), None) => write_zeros(file, n, dest),
-        (None, Some(hex)) => {
-            let bytes = read_named_blob(cas_dir, hex, &format!("{}!{} pad", jar.name, e.name))?;
-            file.write_all(&bytes).map_err(|source| AyzenpackError::Io {
-                source,
-                path: Some(dest.to_path_buf()),
-            })
-        }
-        (None, None) => Ok(()),
-    }
-}
-
-fn write_zeros(file: &mut File, n: u64, dest: &Path) -> Result<()> {
-    let buf = [0u8; 4096];
-    let mut left = n;
-    while left > 0 {
-        let chunk = left.min(4096) as usize;
-        file.write_all(&buf[..chunk])
-            .map_err(|source| AyzenpackError::Io {
-                source,
-                path: Some(dest.to_path_buf()),
-            })?;
-        left -= chunk as u64;
-    }
-    Ok(())
+        )
+    })
 }
 
 fn finish_exact(dest: &Path, jar: &Jar, prefix_len: u64, apply_prefix_chmod: bool) -> Result<()> {
