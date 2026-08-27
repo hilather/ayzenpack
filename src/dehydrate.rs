@@ -1433,8 +1433,8 @@ mod tests {
 
     #[test]
     fn classify_inflate_cap_is_min_of_listing_and_max() {
-        let plain = vec![b'z'; 8];
-        let bomb = crate::deflate::deflate_raw(&vec![b'x'; 64 * 1024], 6).unwrap();
+        let plain = vec![b'x'; 64 * 1024];
+        let cdata = crate::deflate::deflate_raw(&plain, 6).unwrap();
         let mut header = vec![0u8; 30];
         header[0..4].copy_from_slice(b"PK\x03\x04");
         header[8..10].copy_from_slice(&8u16.to_le_bytes());
@@ -1446,20 +1446,25 @@ mod tests {
             method: "deflated".into(),
             method_code: 8,
             uncompressed_size: plain.len() as u64,
-            compressed_size: bomb.len() as u64,
+            compressed_size: cdata.len() as u64,
             utf8_flag: true,
             ..Entry::default()
         };
         let local = ExactLocal {
             zip_rel_offset: 0,
-            header,
-            cdata: bomb,
+            header: header.clone(),
+            cdata: cdata.clone(),
             descriptor: None,
             pad: Vec::new(),
         };
         assert_eq!(
-            classify_local(&entry, &local, 2 * 1024 * 1024 * 1024),
-            LocalClass::Unreproducible
+            classify_local(&entry, &local, plain.len() as u64),
+            LocalClass::DeflateHit(crate::deflate::CdataCodec::Flate2(6))
+        );
+        assert_eq!(
+            classify_local(&entry, &local, 8),
+            LocalClass::Unreproducible,
+            "inflate_cap below listing must not fully inflate a hit bitstream"
         );
     }
 

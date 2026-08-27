@@ -849,6 +849,29 @@ pub fn write_homemade_none_listed_zip(path: &Path) {
     std::fs::write(path, buf).unwrap();
 }
 
+/// STORE zip with GPBF bit 0 set so rust zip reports `encrypted()`.
+pub fn write_encrypted_store_zip(path: &Path) {
+    write_stored_zip(path, &[("secret.txt", b"hi", crc32fast::hash(b"hi"))]);
+    let mut buf = std::fs::read(path).unwrap();
+    buf[6] |= 1;
+    let eocd = {
+        let mut i = buf.len() - 22;
+        loop {
+            if buf[i..i + 4] == *b"PK\x05\x06" {
+                let comment_len = u16::from_le_bytes([buf[i + 20], buf[i + 21]]) as usize;
+                if i + 22 + comment_len == buf.len() {
+                    break i;
+                }
+            }
+            assert!(i > 0);
+            i -= 1;
+        }
+    };
+    let cd_off = u32::from_le_bytes(buf[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+    buf[cd_off + 8] |= 1;
+    std::fs::write(path, buf).unwrap();
+}
+
 /// Overlap (same local offset, two names) plus one STORE listable inner zip.
 pub fn write_overlapping_local_plus_store_nested(path: &Path) {
     let inner_tmp = path.with_extension("inner.jar");

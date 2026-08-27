@@ -18,7 +18,7 @@ use fixtures::{
     write_data_descriptor_zip, write_deflate_miss_plus_dir_cdata,
     write_deflate_miss_plus_empty_deflate_dir, write_fat_spring_store_nested_jar,
     write_fat_spring_store_nested_zipa_jar, write_fat_spring_zip64_zipa_jar,
-    write_homemade_none_listed_zip, write_jar,
+    write_encrypted_store_zip, write_homemade_none_listed_zip, write_jar,
     write_jar_entries, write_jar_with_comment, write_leading_pad_pk_decoy_zip,
     write_non_utf8_name_zip, write_overlapping_local_plus_store_nested, write_overlapping_local_zip,
     write_padded_locals_zip, write_signed_looking_jar, write_store_file_plus_dir_cdata,
@@ -2603,7 +2603,14 @@ fn skip_exact_outer_explodes_store_inner() {
     verify(&out).unwrap();
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
-    assert!(dest.join("overlap-nested.jar").is_file());
+    let restored = dest.join("overlap-nested.jar");
+    let mut z = ZipArchive::new(File::open(&restored).unwrap()).unwrap();
+    let mut got_inner = Vec::new();
+    z.by_name("lib/inner.jar")
+        .unwrap()
+        .read_to_end(&mut got_inner)
+        .unwrap();
+    assert_eq!(got_inner, inner);
 }
 
 #[test]
@@ -2709,6 +2716,60 @@ fn prefixed_store_nested_records_child_prefix() {
     .unwrap();
     assert_eq!(got, inner);
     verify(&out).unwrap();
+}
+
+#[test]
+fn encrypted_child_store_stays_opaque() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner_path = dir.path().join("enc.jar");
+    write_encrypted_store_zip(&inner_path);
+    let inner = fs::read(&inner_path).unwrap();
+    {
+        let mut z = ZipArchive::new(File::open(&inner_path).unwrap()).unwrap();
+        assert!(
+            z.by_index(0).unwrap().encrypted(),
+            "fixture must be an encrypted listing"
+        );
+    }
+    let jar = dir.path().join("outer.jar");
+    write_jar_entries(
+        &jar,
+        &[
+            JarEntry::File {
+                name: "lib/enc.jar",
+                data: &inner,
+                method: CompressionMethod::Stored,
+            },
+            JarEntry::File {
+                name: "App.class",
+                data: b"app",
+                method: CompressionMethod::Stored,
+            },
+        ],
+    );
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let records = read_archive(&out).2;
+    let m = manifest_from_records(&records);
+    let e = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.name == "lib/enc.jar")
+        .expect("enc");
+    assert!(e.zip_index.is_none(), "encrypted child must stay opaque");
+    let inner_hex = ayzenpack::hashutil::hex_lower(&blake3_bytes(&inner));
+    assert_eq!(e.blob.as_deref(), Some(inner_hex.as_str()));
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    verify(&out).unwrap();
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let mut z = ZipArchive::new(File::open(dest.join("outer.jar")).unwrap()).unwrap();
+    let mut got = Vec::new();
+    z.by_name("lib/enc.jar")
+        .unwrap()
+        .read_to_end(&mut got)
+        .unwrap();
+    assert_eq!(got, inner);
 }
 
 #[test]
