@@ -335,12 +335,12 @@ fn docs_lock_synthetic_cd_hash_policy_fileabs_and_corpus() {
         "DESIGN.md must document AYZENPACK_CORPUS_DIR enablement with absolute HTTPS links; not always-on until 100% hits"
     );
     assert!(
-        AGENTS.contains("Crate **0.2.7** / format **v2**")
+        AGENTS.contains("Crate **0.2.8** / format **v2**")
             && AGENTS.contains("locals-region identity + FileAbs listing")
             && AGENTS.contains("`AYZENPACK_CORPUS_DIR`; not always-on until 100% hits")
             && AGENTS.contains("Equal-offset last-wins with matching homemade count is exact splice")
-            && !AGENTS.contains("Crate **0.2.6** / format **v2**"),
-        "AGENTS.md current-tree must be crate 0.2.7 with homemade-None locals-region + FileAbs listing"
+            && !AGENTS.contains("Crate **0.2.7** / format **v2**"),
+        "AGENTS.md current-tree must be crate 0.2.8 with homemade-None locals-region + FileAbs listing"
     );
     assert!(
         DESIGN.contains(
