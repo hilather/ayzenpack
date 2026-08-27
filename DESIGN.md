@@ -348,6 +348,8 @@ AYZENPACK_CORPUS_DIR=/path/to/corpus cargo test --test corpus \
 
 [`ci/download-corpus.sh`](https://github.com/hilather/ayzenpack/blob/main/ci/download-corpus.sh) verifies SHA-256 from [`ci/corpus.lock.json`](https://github.com/hilather/ayzenpack/blob/main/ci/corpus.lock.json). Promote those jars into always-on CI `source_*` **only when every printed line has `miss=0` and `exact=true`** (100% measured method-8 hits, every slot STORE/codec/`zip_index`). Until then: keep the env gate; do not fail default `cargo test` on a remaining zlib-3 / zopfli miss. Mix `proven_miss` already allows sibling codecs.
 
+**Last measured (2026-08-27, after `deflate-raw:zlib:{1,3,6,9}`):** skipped. `AYZENPACK_CORPUS_DIR` was unset and lockfile lucene/jackson JARs were not on disk (`.corpus/` is gitignored; this crate does not fetch). Default `cargo test` still skips `corpus_lucene_jackson_source_identity_only_when_every_slot_hits`. Do not drop the env gate. Do not promote always-on until an operator paste of that test is 100% `miss=0` / `exact=true`. This stack does not add a GH Actions corpus cache.
+
 Do **not** buy lucene/jackson hashes with `cdata_blob` or Java `Deflater`. Mix gates stay: `cdata_blob == 0`; `output_len <= 569539 * 115 / 100`; unique content not doubled; no inner-zip CAS on `zip_index`.
 
 ---
