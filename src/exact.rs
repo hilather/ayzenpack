@@ -7,7 +7,7 @@
 //! walker; dehydrate must not consume `Raw`.
 
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use zip::ZipArchive;
@@ -39,7 +39,13 @@ pub(crate) struct ExactLocal {
 #[derive(Debug, Clone)]
 pub(crate) struct ExactSlice {
     pub locals: Vec<ExactLocal>,
-    pub tail: Vec<u8>,
+    /// Present only when homemade CD parse succeeded (`homemade_ok`).
+    pub tail: Option<Vec<u8>>,
+    pub homemade_ok: bool,
+    /// Bytes `[0, first zip-rel local)` when `prefix_len == 0` and first local ≠ 0.
+    pub leading_pad: Vec<u8>,
+    /// Executable / decoy prefix (`layout.prefix_len`), if any.
+    pub prefix: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -91,21 +97,52 @@ fn capture_zip_exact_using(
 /// Locals from the same `ZipArchive` listing scan uses. Never returns a whole-zip `Raw`.
 ///
 /// Store-tail is valid only when homemade `parse_central_directory` yields the same
-/// count as `ZipArchive::len()`. Overlap, first-local ≠ 0, parse `None`, or a
-/// count mismatch is `Err` so dehydrate can skip exact attach.
+/// count as `ZipArchive::len()`. Overlap or a homemade count mismatch is `Err`.
+/// Homemade parse `None` is `Ok` with `homemade_ok == false` and `tail == None`.
+/// A PK-start hole (`prefix_len == 0`, first local ≠ 0) is `leading_pad`.
 pub(crate) fn slice_from_archive(path: &Path) -> Result<ExactSlice> {
-    let layout = {
-        let mut file = File::open(path).map_err(|source| io_at(source, path))?;
-        detect_zip_layout(path, &mut file)?
+    let mut file = File::open(path).map_err(|source| io_at(source, path))?;
+    slice_from_reader(path, &mut file)
+}
+
+/// Slice an in-memory STORE ZIP (child probe). Encrypted / unlistable stay `Err`.
+pub(crate) fn slice_from_bytes(bytes: &[u8]) -> Result<ExactSlice> {
+    let path = Path::new("<bytes>");
+    let mut cur = Cursor::new(bytes);
+    slice_from_reader(path, &mut cur)
+}
+
+fn slice_from_reader<R: Read + Seek>(path: &Path, file: &mut R) -> Result<ExactSlice> {
+    let layout = detect_zip_layout(path, file)?;
+    let prefix = if layout.prefix_len > 0 {
+        file.seek(SeekFrom::Start(0))
+            .map_err(|source| io_at(source, path))?;
+        let mut p = vec![0u8; usize_from_u64(layout.prefix_len, path)?];
+        file.read_exact(&mut p)
+            .map_err(|source| io_at(source, path))?;
+        p
+    } else {
+        Vec::new()
     };
-    let recs = archive_local_records(path, &layout)?;
+    let recs = archive_local_records(path, &layout, &mut *file)?;
+    let mut leading_pad = Vec::new();
     if !recs.is_empty() {
         let min_off = recs.iter().map(|r| r.zip_rel_offset).min().unwrap();
         if min_off != 0 {
-            return Err(slice_fail(
-                path,
-                "first local header is not at zip offset 0",
-            ));
+            if layout.prefix_len != 0 {
+                return Err(slice_fail(
+                    path,
+                    "first local header is not at zip offset 0",
+                ));
+            }
+            leading_pad = {
+                file.seek(SeekFrom::Start(0))
+                    .map_err(|source| io_at(source, path))?;
+                let mut pad = vec![0u8; usize_from_u64(min_off, path)?];
+                file.read_exact(&mut pad)
+                    .map_err(|source| io_at(source, path))?;
+                pad
+            };
         }
         let mut ordered: Vec<u64> = recs.iter().map(|r| r.zip_rel_offset).collect();
         ordered.sort_unstable();
@@ -116,7 +153,6 @@ pub(crate) fn slice_from_archive(path: &Path) -> Result<ExactSlice> {
         }
     }
 
-    let mut file = File::open(path).map_err(|source| io_at(source, path))?;
     let file_len = file
         .seek(SeekFrom::End(0))
         .map_err(|source| io_at(source, path))?;
@@ -124,7 +160,7 @@ pub(crate) fn slice_from_archive(path: &Path) -> Result<ExactSlice> {
         return Err(slice_fail(path, "prefix longer than file"));
     }
     let (cd_struct_off, cd_size, _recorded_cd, _entry_count) =
-        find_cd_bounds(path, &mut file, file_len)?;
+        find_cd_bounds(path, file, file_len)?;
     let phys_cd = cd_struct_off
         .checked_sub(cd_size)
         .ok_or_else(|| slice_fail(path, "central directory offset underflow"))?;
@@ -141,11 +177,14 @@ pub(crate) fn slice_from_archive(path: &Path) -> Result<ExactSlice> {
     if tail.len() < cd_n {
         return Err(slice_fail(path, "central directory truncated in tail"));
     }
-    let homemade = parse_central_directory(&tail[..cd_n], &layout)
-        .ok_or_else(|| slice_fail(path, "central directory parse failed"))?;
-    if homemade.len() != recs.len() {
-        return Err(slice_fail(path, "central directory entry count mismatch"));
-    }
+    let homemade = parse_central_directory(&tail[..cd_n], &layout);
+    let homemade_ok = match &homemade {
+        Some(h) if h.len() == recs.len() => true,
+        Some(_) => {
+            return Err(slice_fail(path, "central directory entry count mismatch"));
+        }
+        None => false,
+    };
 
     let mut locals = Vec::with_capacity(recs.len());
     for rec in &recs {
@@ -161,13 +200,22 @@ pub(crate) fn slice_from_archive(path: &Path) -> Result<ExactSlice> {
                 "local header offset at or past central directory",
             ));
         }
-        locals.push(read_local(path, &mut file, &layout, rec, next)?);
+        locals.push(read_local(path, file, &layout, rec, next)?);
     }
-    Ok(ExactSlice { locals, tail })
+    Ok(ExactSlice {
+        locals,
+        tail: if homemade_ok { Some(tail) } else { None },
+        homemade_ok,
+        leading_pad,
+        prefix,
+    })
 }
 
-fn archive_local_records(path: &Path, layout: &ZipLayout) -> Result<Vec<CdRecord>> {
-    let file = File::open(path).map_err(|source| io_at(source, path))?;
+fn archive_local_records<R: Read + Seek>(
+    path: &Path,
+    layout: &ZipLayout,
+    file: R,
+) -> Result<Vec<CdRecord>> {
     let reader = BufReader::new(ZipView::new(file, layout.view_shift));
     let mut archive = ZipArchive::new(reader).map_err(|err| archive_open_err(err, path))?;
     let mut recs = Vec::with_capacity(archive.len());
@@ -332,7 +380,10 @@ fn slice_zip_using(
     if records.is_empty() {
         return Ok(ExactSlice {
             locals: Vec::new(),
-            tail,
+            tail: Some(tail),
+            homemade_ok: true,
+            leading_pad: Vec::new(),
+            prefix: Vec::new(),
         });
     }
 
@@ -367,7 +418,13 @@ fn slice_zip_using(
         locals.push(read_local(path, &mut file, &layout, rec, next)?);
     }
 
-    Ok(ExactSlice { locals, tail })
+    Ok(ExactSlice {
+        locals,
+        tail: Some(tail),
+        homemade_ok: true,
+        leading_pad: Vec::new(),
+        prefix: Vec::new(),
+    })
 }
 
 #[cfg(test)]
@@ -527,7 +584,7 @@ fn take_u32(data: &[u8]) -> Option<(u32, &[u8])> {
 
 pub(crate) fn read_local(
     path: &Path,
-    file: &mut File,
+    file: &mut (impl Read + Seek),
     layout: &ZipLayout,
     rec: &CdRecord,
     next_zip_rel: u64,
@@ -1167,7 +1224,7 @@ mod tests {
                     }
                     out.extend_from_slice(&loc.pad);
                 }
-                out.extend_from_slice(&slice.tail);
+                out.extend_from_slice(slice.tail.as_ref().expect("sliced tail"));
                 assert_eq!(out, src);
             }
             ZipExact::Raw(_) => panic!("ZipWriter jar must slice cleanly"),
@@ -1238,7 +1295,7 @@ mod tests {
         match capture_zip_exact(&path).unwrap() {
             ZipExact::Sliced(slice) => {
                 assert!(slice.locals.is_empty());
-                assert_eq!(slice.tail, zip);
+                assert_eq!(slice.tail.as_deref(), Some(zip.as_slice()));
             }
             ZipExact::Raw(_) => panic!("empty zip must slice as tail"),
         }
@@ -1247,7 +1304,7 @@ mod tests {
         assert_eq!(arch, 0);
         let sliced = slice_from_archive(&path).unwrap();
         assert!(sliced.locals.is_empty());
-        assert!(!sliced.tail.is_empty());
+        assert!(!sliced.tail.as_ref().unwrap().is_empty());
     }
 
     fn write_stored_named(path: &Path, files: &[(&str, &[u8])]) {

@@ -4,7 +4,7 @@
 //! `for_each_jar_entry` and dropped before the next entry is inflated.
 
 use std::fs::File;
-use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -131,6 +131,90 @@ where
         |_| {},
         |meta, payload| f(meta, payload.as_deref()),
     )
+}
+
+/// In-memory ZIP listing for depth-1 child probe. Encrypted / unlistable stay `Err`.
+pub(crate) struct ScannedByteEntry {
+    pub meta: ScannedEntry,
+    pub payload: Option<Vec<u8>>,
+}
+
+pub(crate) fn scan_from_bytes(bytes: &[u8], max_entry: u64) -> Result<Vec<ScannedByteEntry>> {
+    let path = Path::new("<bytes>");
+    let mut cur = Cursor::new(bytes);
+    let layout = detect_zip_layout(path, &mut cur)?;
+    cur.seek(SeekFrom::Start(0))
+        .map_err(|source| io_at(source, path))?;
+    let reader = BufReader::with_capacity(ZIP_BUF, ZipView::new(cur, layout.view_shift));
+    let mut archive = ZipArchive::new(reader).map_err(|err| map_archive_open_err(err, path))?;
+    let mut out = Vec::with_capacity(archive.len());
+    for i in 0..archive.len() {
+        let mut zf = archive
+            .by_index(i)
+            .map_err(|err| map_entry_err(err, path))?;
+        if zf.encrypted() {
+            return Err(AyzenpackError::Encrypted {
+                path: path.to_path_buf(),
+            });
+        }
+        let name = zf.name().to_string();
+        let (method, method_code) = method_label_and_code(zf.compression());
+        let (dos_date, dos_time) = match zf.last_modified() {
+            Some(dt) => (dt.datepart(), dt.timepart()),
+            None => (0, 0),
+        };
+        let name_raw_hex = match std::str::from_utf8(zf.name_raw()) {
+            Ok(_) => None,
+            Err(_) => Some(hex_lower(zf.name_raw())),
+        };
+        let meta = ScannedEntry {
+            is_dir: zf.is_dir(),
+            crc32: zf.crc32(),
+            method,
+            method_code,
+            uncompressed_size: zf.size(),
+            compressed_size: zf.compressed_size(),
+            dos_date,
+            dos_time,
+            unix_mode: zf.unix_mode(),
+            utf8_flag: zf.get_metadata().is_utf8,
+            name_raw_hex,
+            name,
+        };
+        if meta.is_dir {
+            drop(zf);
+            out.push(ScannedByteEntry {
+                meta,
+                payload: None,
+            });
+            continue;
+        }
+        if meta.uncompressed_size > max_entry {
+            return Err(AyzenpackError::EntryTooLarge {
+                path: path.to_path_buf(),
+                name: meta.name,
+                size: meta.uncompressed_size,
+                max: max_entry,
+            });
+        }
+        let mut buf = Vec::with_capacity(meta.uncompressed_size as usize);
+        io::copy(&mut zf, &mut buf).map_err(|source| io_at(source, path))?;
+        drop(zf);
+        if buf.len() as u64 != meta.uncompressed_size {
+            return Err(AyzenpackError::FormatOwned(format!(
+                "uncompressed size mismatch for {}!{}: header {}, read {}",
+                path.display(),
+                meta.name,
+                meta.uncompressed_size,
+                buf.len()
+            )));
+        }
+        out.push(ScannedByteEntry {
+            meta,
+            payload: Some(buf),
+        });
+    }
+    Ok(out)
 }
 
 /// Same as [`for_each_jar_entry`], then `on_len(archive.len())` before the first entry.

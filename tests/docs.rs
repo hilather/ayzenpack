@@ -116,8 +116,11 @@ fn agents_md_locks_single_cas_and_zstd_blocks() {
         "AGENTS.md must say the manifest is a ZIP-slot index, not a second copy"
     );
     assert!(
-        AGENTS.contains("Do **not** add a Java/zlib deflater, `cdata_blob` for misses, or `raw_zip` of healthy jars"),
-        "AGENTS.md must forbid Java-zlib, cdata_blob-for-misses, and raw_zip of healthy jars"
+        AGENTS.contains("Do not add a Java subprocess / vendor `Deflater`")
+            && AGENTS.contains("do not add `cdata_blob` for misses")
+            && AGENTS.contains("do not `raw_zip` a listed jar")
+            && AGENTS.contains("In-process zlib-rs raw-deflate hits are the 0.2.4 path"),
+        "AGENTS.md must forbid Java subprocess / cdata_blob-for-misses / raw_zip of a listed jar; zlib-rs is the 0.2.4 path"
     );
     assert!(
         AGENTS.contains("but **never write** that shape again"),
@@ -149,10 +152,10 @@ fn agents_md_locks_single_cas_and_zstd_blocks() {
         "DESIGN.md must not treat metadata-only exact as the north star"
     );
     assert!(
-        PLAN.contains("# PLAN: do not latch ZipArchive onto nested STORE jars (crate 0.2.3)")
-            && PLAN.contains("`zip_archive_opens` must accept only the outer listing")
-            && PLAN.contains("rust zip may latch onto a STORE nested EOCD"),
-        "PLAN.md must be the 0.2.3 no-nested-STORE-latch plan"
+        PLAN.contains("# PLAN: 0.2.4 stencil restore (ratarmount zip_index + codec recipes)")
+            && PLAN.contains("ratarmount zip_index + codec recipes")
+            && PLAN.contains("first local is not at ZIP offset 0"),
+        "PLAN.md must be the 0.2.4 stencil restore plan"
     );
     assert!(
         !README.contains("## Reconstruction guarantee")

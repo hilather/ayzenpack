@@ -1,8 +1,8 @@
 # PLAN-coverage: in-place restore-paths fat + classic (crate 0.2.3)
 
-Base: PR `cursor/fix-rehydrate-fat-jar-8517` (detector fix already in tree). Do not merge. Do not tag. Do not restage #36 / #37.
+Superseded as the product plan by [`PLAN.md`](PLAN.md) (crate **0.2.4** stencil restore). This file remains the **0.2.3** coverage note for Matt’s locked in-place tests. Do not merge. Do not tag. Do not restage #36 / #37.
 
-This file is the **coverage plan** for Matt’s locked tests. Product fix (no ZipArchive latch on STORE nested EOCD) stays in `PLAN.md`. These tests must be small, named after the failure, and use in-tree fixtures. No new size-cap constants. No `output_len * 115/100`. No corpus unless files are already present.
+Base: PR `cursor/fix-rehydrate-fat-jar-8517` (detector fix already in tree). The 0.2.3 latch product fix shipped in `21e73bb`. These tests must be small, named after the failure, and use in-tree fixtures. No new size-cap constants. No `output_len * 115/100`. No corpus unless files are already present.
 
 Origin `matt-brewer/agent-skills` is not reachable. Skeptic loops use fresh adversarial Task subagents. Never skip sweep 1. Fresh skeptic each sweep. Cap 3, then BLOCKED.
 

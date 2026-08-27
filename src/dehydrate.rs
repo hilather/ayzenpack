@@ -14,11 +14,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 use crate::error::{AyzenpackError, Result};
-use crate::exact::{slice_from_archive, ExactLocal};
+use crate::exact::{slice_from_archive, slice_from_bytes, ExactLocal};
 use crate::format::{verify_finished_ayz, AyzWriter, FileHeader};
 use crate::hashutil::{hash_both, hex_lower};
-use crate::manifest::{Blob, Entry, Jar, Manifest, Stats, MANIFEST_FORMAT};
-use crate::scan::{for_each_jar_entry_with_len, ScannedEntry};
+use crate::manifest::{Blob, Entry, Jar, Manifest, NestedIndex, Stats, MANIFEST_FORMAT};
+use crate::scan::{for_each_jar_entry_with_len, scan_from_bytes, ScannedEntry};
+
+/// Depth-1 child file-entry cap. Overflow stays opaque.
+pub(crate) const NESTED_MAX_FILE_ENTRIES: usize = 65_535;
+
+pub(crate) fn nested_file_count_over_cap(n: usize) -> bool {
+    n > NESTED_MAX_FILE_ENTRIES
+}
 use crate::stats::{dedup_ratio, json_event, PackProgress};
 
 /// Inline hex for local headers / descriptors under this size; larger values become CAS blobs.
@@ -110,6 +117,21 @@ struct BlobSink<'a> {
 enum Sequenced {
     Dir(ScannedEntry),
     File(HashedFile),
+    Exploded(ExplodedReady),
+}
+
+struct PendingBlob {
+    bytes: Vec<u8>,
+    b3: [u8; 32],
+    s256: [u8; 32],
+}
+
+struct ExplodedReady {
+    seq: u64,
+    inflight: u64,
+    outer: ScannedEntry,
+    nested: NestedIndex,
+    blobs: Vec<PendingBlob>,
 }
 
 struct HashedFile {
@@ -164,6 +186,16 @@ impl HashPipeline {
         let seq = self.next_seq;
         self.next_seq += 1;
         self.pending.insert(seq, Sequenced::Dir(meta));
+        Ok(self.take_in_order())
+    }
+
+    fn push_exploded(&mut self, mut ready: ExplodedReady) -> Result<Vec<Sequenced>> {
+        self.try_recv_all()?;
+        ready.seq = self.next_seq;
+        self.next_seq += 1;
+        self.inflight_bytes += ready.inflight;
+        self.peak_inflight_bytes = self.peak_inflight_bytes.max(self.inflight_bytes);
+        self.pending.insert(ready.seq, Sequenced::Exploded(ready));
         Ok(self.take_in_order())
     }
 
@@ -270,8 +302,15 @@ impl HashPipeline {
     fn take_in_order(&mut self) -> Vec<Sequenced> {
         let mut out = Vec::new();
         while let Some(item) = self.pending.remove(&self.next_emit) {
-            if let Sequenced::File(ref f) = item {
-                self.inflight_bytes = self.inflight_bytes.saturating_sub(f.payload.len() as u64);
+            match &item {
+                Sequenced::File(f) => {
+                    self.inflight_bytes =
+                        self.inflight_bytes.saturating_sub(f.payload.len() as u64);
+                }
+                Sequenced::Exploded(ex) => {
+                    self.inflight_bytes = self.inflight_bytes.saturating_sub(ex.inflight);
+                }
+                Sequenced::Dir(_) => {}
             }
             self.next_emit += 1;
             out.push(item);
@@ -315,6 +354,7 @@ fn apply_sequenced(
     path: &Path,
     sink: &mut BlobSink<'_>,
     jar_entries: &mut Vec<Entry>,
+    nestedindexes: &mut Vec<NestedIndex>,
     items: Vec<Sequenced>,
 ) -> Result<()> {
     for item in items {
@@ -332,6 +372,9 @@ fn apply_sequenced(
                     file.sha256,
                     jar_entries,
                 )?;
+            }
+            Sequenced::Exploded(ready) => {
+                apply_exploded(sink, jar_entries, nestedindexes, ready)?;
             }
         }
     }
@@ -472,6 +515,7 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
             let jar_name = unique_basename(path, &mut used_names)?;
             verbose(opts, &format!("{}", path.display()));
             let mut jar_entries = Vec::new();
+            let mut nestedindexes = Vec::new();
             let scanned = for_each_jar_entry_with_len(
                 path,
                 opts.max_entry_bytes,
@@ -486,6 +530,7 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
                                 path,
                                 &mut sink,
                                 &mut jar_entries,
+                                &mut nestedindexes,
                                 pipe.push_dir(meta.clone())?,
                             )?;
                         } else {
@@ -511,23 +556,68 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
                         )));
                     }
 
+                    let exploded = probe_explode(opts, path, meta, &buf)?;
                     if let Some(pipe) = pipeline.as_mut() {
-                        let n = buf.len() as u64;
-                        loop {
-                            let ready = pipe.wait_admit(n)?;
-                            if ready.is_empty() {
-                                break;
+                        if let Some(ready) = exploded {
+                            let n = ready.inflight;
+                            loop {
+                                let drained = pipe.wait_admit(n)?;
+                                if drained.is_empty() {
+                                    break;
+                                }
+                                apply_sequenced(
+                                    opts,
+                                    path,
+                                    &mut sink,
+                                    &mut jar_entries,
+                                    &mut nestedindexes,
+                                    drained,
+                                )?;
                             }
-                            apply_sequenced(opts, path, &mut sink, &mut jar_entries, ready)?;
+                            apply_sequenced(
+                                opts,
+                                path,
+                                &mut sink,
+                                &mut jar_entries,
+                                &mut nestedindexes,
+                                pipe.push_exploded(ready)?,
+                            )?;
+                            apply_sequenced(
+                                opts,
+                                path,
+                                &mut sink,
+                                &mut jar_entries,
+                                &mut nestedindexes,
+                                pipe.drain_nonblocking()?,
+                            )?;
+                        } else {
+                            let n = buf.len() as u64;
+                            loop {
+                                let ready = pipe.wait_admit(n)?;
+                                if ready.is_empty() {
+                                    break;
+                                }
+                                apply_sequenced(
+                                    opts,
+                                    path,
+                                    &mut sink,
+                                    &mut jar_entries,
+                                    &mut nestedindexes,
+                                    ready,
+                                )?;
+                            }
+                            pipe.spawn_file(meta.clone(), buf);
+                            apply_sequenced(
+                                opts,
+                                path,
+                                &mut sink,
+                                &mut jar_entries,
+                                &mut nestedindexes,
+                                pipe.drain_nonblocking()?,
+                            )?;
                         }
-                        pipe.spawn_file(meta.clone(), buf);
-                        apply_sequenced(
-                            opts,
-                            path,
-                            &mut sink,
-                            &mut jar_entries,
-                            pipe.drain_nonblocking()?,
-                        )?;
+                    } else if let Some(ready) = exploded {
+                        apply_exploded(&mut sink, &mut jar_entries, &mut nestedindexes, ready)?;
                     } else {
                         let recomputed = crc32fast::hash(&buf);
                         check_crc(opts, path, meta, recomputed)?;
@@ -538,7 +628,14 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
                 },
             )?;
             if let Some(pipe) = pipeline.as_mut() {
-                apply_sequenced(opts, path, &mut sink, &mut jar_entries, pipe.finish_jar()?)?;
+                apply_sequenced(
+                    opts,
+                    path,
+                    &mut sink,
+                    &mut jar_entries,
+                    &mut nestedindexes,
+                    pipe.finish_jar()?,
+                )?;
             }
             progress.finish_jar(&jar_name, scanned.entries.len() as u64);
 
@@ -580,6 +677,9 @@ pub fn dehydrate(opts: &DehydrateOptions) -> Result<DehydrateSummary> {
                 tail_size: None,
                 raw_zip_blob: None,
                 raw_zip_size: None,
+                leading_pad_blob: None,
+                leading_pad_size: None,
+                nestedindexes,
                 entries: jar_entries,
             };
             attach_exact(&mut sink, path, &mut jar)?;
@@ -814,36 +914,49 @@ fn entry_from_scan(meta: &ScannedEntry, blob: Option<String>, sha256: Option<Str
         data_descriptor_hex: None,
         pad_zeros: None,
         pad_blob: None,
+        offsetheader: None,
+        data_start: None,
+        zip_index: None,
     }
 }
 
 fn attach_exact(sink: &mut BlobSink<'_>, path: &Path, jar: &mut Jar) -> Result<()> {
-    // Listed jars never store raw_zip. Encrypted still errors. Any other slice
-    // failure (count mismatch, overlap, homemade parse None) is skip-exact.
+    // Listed jars never store raw_zip. Encrypted still errors. Overlap / count
+    // mismatch is skip-exact. Homemade parse None is Ok without tail_blob.
     match slice_from_archive(path) {
         Ok(slice) => {
             if slice.locals.len() != jar.entries.len() {
                 return Ok(());
             }
+            let prefix = jar.prefix_size.unwrap_or(0);
             let classes: Vec<LocalClass> = jar
                 .entries
                 .iter()
                 .zip(slice.locals.iter())
-                .map(|(entry, local)| classify_local(entry, local))
+                .map(|(entry, local)| classify_local(entry, local, opts_max_from_entry(entry)))
                 .collect();
-            let policy = jar_store_policy(&classes);
             for ((entry, local), class) in jar
                 .entries
                 .iter_mut()
                 .zip(slice.locals.iter())
                 .zip(classes.iter())
             {
-                fill_exact_entry(sink, entry, local, policy, *class)?;
+                fill_exact_entry(sink, entry, local, prefix, *class)?;
             }
-            let (b3, s256) = hash_both(&slice.tail);
-            remember_blob(sink, &slice.tail, b3, s256)?;
-            jar.tail_blob = Some(hex_lower(&b3));
-            jar.tail_size = Some(slice.tail.len() as u64);
+            if !slice.leading_pad.is_empty() {
+                let (b3, s256) = hash_both(&slice.leading_pad);
+                remember_blob(sink, &slice.leading_pad, b3, s256)?;
+                jar.leading_pad_blob = Some(hex_lower(&b3));
+                jar.leading_pad_size = Some(slice.leading_pad.len() as u64);
+            }
+            if slice.homemade_ok {
+                if let Some(tail) = slice.tail {
+                    let (b3, s256) = hash_both(&tail);
+                    remember_blob(sink, &tail, b3, s256)?;
+                    jar.tail_blob = Some(hex_lower(&b3));
+                    jar.tail_size = Some(tail.len() as u64);
+                }
+            }
             Ok(())
         }
         Err(AyzenpackError::Encrypted { .. }) => Err(AyzenpackError::Encrypted {
@@ -853,31 +966,29 @@ fn attach_exact(sink: &mut BlobSink<'_>, path: &Path, jar: &mut Jar) -> Result<(
     }
 }
 
+fn opts_max_from_entry(entry: &Entry) -> u64 {
+    entry.uncompressed_size.max(1)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LocalClass {
     EmptyDir,
     Store,
-    DeflateHit(u32),
+    ZipIndex,
+    DeflateHit(crate::deflate::CdataCodec),
     DeflateMiss,
     Unreproducible,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StorePolicy {
-    /// STORE + empty-dir + codec hits only. `cdata_codec` on hits. No `cdata_blob`.
-    CleanExact,
-    /// Any DEFLATE miss or unreproducible sibling: rebuild the jar. No `cdata_blob` / no codec.
-    CleanMiss,
-}
-
-fn classify_local(entry: &Entry, local: &ExactLocal) -> LocalClass {
+fn classify_local(entry: &Entry, local: &ExactLocal, inflate_cap: u64) -> LocalClass {
+    if entry.zip_index.is_some() {
+        return LocalClass::ZipIndex;
+    }
     if entry.is_dir {
         if local.cdata.is_empty() {
             return LocalClass::EmptyDir;
         }
         // Maven/Java commonly DEFLATE empty directories (`03 00`, usize 0).
-        // That is not exotic payload — trial-encode like a file. A directory
-        // with actual uncompressed bytes stays unreproducible (class 4).
         if entry.uncompressed_size != 0 || entry.method_code != 8 {
             return LocalClass::Unreproducible;
         }
@@ -894,7 +1005,8 @@ fn classify_local(entry: &Entry, local: &ExactLocal) -> LocalClass {
     if entry.method_code != 8 {
         return LocalClass::Unreproducible;
     }
-    let Ok(plain) = crate::deflate::inflate_raw(&local.cdata) else {
+    let cap = entry.uncompressed_size.max(1).min(inflate_cap);
+    let Ok(plain) = crate::deflate::inflate_raw_capped(&local.cdata, cap) else {
         return LocalClass::Unreproducible;
     };
     if plain.len() as u64 != entry.uncompressed_size || crc32fast::hash(&plain) != entry.crc32 {
@@ -905,20 +1017,9 @@ fn classify_local(entry: &Entry, local: &ExactLocal) -> LocalClass {
     }
     let flags = u16::from_le_bytes([local.header[6], local.header[7]]);
     match crate::deflate::match_deflate(&plain, &local.cdata, flags) {
-        Ok(Some(level)) => LocalClass::DeflateHit(level),
+        Ok(Some(codec)) => LocalClass::DeflateHit(codec),
         Ok(None) => LocalClass::DeflateMiss,
         Err(_) => LocalClass::Unreproducible,
-    }
-}
-
-fn jar_store_policy(classes: &[LocalClass]) -> StorePolicy {
-    if classes
-        .iter()
-        .any(|c| matches!(c, LocalClass::DeflateMiss | LocalClass::Unreproducible))
-    {
-        StorePolicy::CleanMiss
-    } else {
-        StorePolicy::CleanExact
     }
 }
 
@@ -926,10 +1027,16 @@ fn fill_exact_entry(
     sink: &mut BlobSink<'_>,
     entry: &mut Entry,
     local: &ExactLocal,
-    policy: StorePolicy,
+    prefix: u64,
     class: LocalClass,
 ) -> Result<()> {
     entry.local_header_offset = Some(local.zip_rel_offset);
+    entry.offsetheader = Some(prefix.saturating_add(local.zip_rel_offset));
+    entry.data_start = Some(
+        prefix
+            .saturating_add(local.zip_rel_offset)
+            .saturating_add(local.header.len() as u64),
+    );
     if local.header.len() <= HEX_INLINE_MAX {
         entry.local_header_hex = Some(hex_lower(&local.header));
     } else {
@@ -937,8 +1044,8 @@ fn fill_exact_entry(
         remember_blob(sink, &local.header, b3, s256)?;
         entry.local_header_blob = Some(hex_lower(&b3));
     }
-    if let (StorePolicy::CleanExact, LocalClass::DeflateHit(level)) = (policy, class) {
-        entry.cdata_codec = Some(crate::deflate::codec_string(level));
+    if let LocalClass::DeflateHit(codec) = class {
+        entry.cdata_codec = Some(codec.as_str());
     }
     if let Some(desc) = &local.descriptor {
         entry.data_descriptor_hex = Some(hex_lower(desc));
@@ -948,6 +1055,160 @@ fn fill_exact_entry(
     } else if !local.pad.is_empty() {
         let (b3, s256) = hash_both(&local.pad);
         remember_blob(sink, &local.pad, b3, s256)?;
+        entry.pad_blob = Some(hex_lower(&b3));
+    }
+    Ok(())
+}
+
+fn apply_exploded(
+    sink: &mut BlobSink<'_>,
+    jar_entries: &mut Vec<Entry>,
+    nestedindexes: &mut Vec<NestedIndex>,
+    ready: ExplodedReady,
+) -> Result<()> {
+    for b in &ready.blobs {
+        remember_blob(sink, &b.bytes, b.b3, b.s256)?;
+    }
+    let mut outer = entry_from_scan(&ready.outer, None, None);
+    outer.zip_index = Some(nestedindexes.len());
+    nestedindexes.push(ready.nested);
+    jar_entries.push(outer);
+    Ok(())
+}
+
+/// Probe a STORE member. `Some` means explode (never CAS the combined ZIP).
+fn probe_explode(
+    opts: &DehydrateOptions,
+    path: &Path,
+    meta: &ScannedEntry,
+    buf: &[u8],
+) -> Result<Option<ExplodedReady>> {
+    if meta.method_code != 0 {
+        return Ok(None);
+    }
+    let crc = crc32fast::hash(buf);
+    if crc != meta.crc32 {
+        check_crc(opts, path, meta, crc)?;
+        return Ok(None);
+    }
+    let scanned = match scan_from_bytes(buf, opts.max_entry_bytes) {
+        Ok(s) => s,
+        Err(AyzenpackError::Encrypted { .. })
+        | Err(AyzenpackError::EntryTooLarge { .. })
+        | Err(AyzenpackError::NotZip { .. })
+        | Err(_) => return Ok(None),
+    };
+    if scanned.is_empty() {
+        return Ok(None);
+    }
+    let file_n = scanned.iter().filter(|e| !e.meta.is_dir).count();
+    if nested_file_count_over_cap(file_n) {
+        return Ok(None);
+    }
+    let slice = match slice_from_bytes(buf) {
+        Ok(s) => s,
+        Err(AyzenpackError::Encrypted { .. }) | Err(_) => return Ok(None),
+    };
+    if !slice.homemade_ok || slice.tail.is_none() || slice.locals.len() != scanned.len() {
+        return Ok(None);
+    }
+    let tail = slice.tail.as_ref().unwrap();
+    let mut nested = NestedIndex::default();
+    let mut blobs = Vec::new();
+    let mut inflight = 0u64;
+    for (sc, local) in scanned.iter().zip(slice.locals.iter()) {
+        let mut entry = entry_from_scan(&sc.meta, None, None);
+        if !sc.meta.is_dir {
+            let Some(plain) = sc.payload.as_deref() else {
+                return Ok(None);
+            };
+            if sc.meta.uncompressed_size > opts.max_entry_bytes {
+                return Ok(None);
+            }
+            let (b3, s256) = hash_both(plain);
+            entry.blob = Some(hex_lower(&b3));
+            entry.sha256 = Some(hex_lower(&s256));
+            queue_pending(&mut blobs, plain.to_vec(), b3, s256);
+            inflight += plain.len() as u64;
+        }
+        let class = classify_local(&entry, local, opts.max_entry_bytes);
+        match class {
+            LocalClass::EmptyDir | LocalClass::Store | LocalClass::DeflateHit(_) => {}
+            _ => return Ok(None),
+        }
+        fill_child_entry(
+            &mut entry,
+            local,
+            slice.prefix.len() as u64,
+            class,
+            &mut blobs,
+        )?;
+        nested.entries.push(entry);
+    }
+    if !slice.prefix.is_empty() {
+        let (b3, s256) = hash_both(&slice.prefix);
+        queue_pending(&mut blobs, slice.prefix.clone(), b3, s256);
+        nested.prefix_blob = Some(hex_lower(&b3));
+        nested.prefix_size = Some(slice.prefix.len() as u64);
+    }
+    if !slice.leading_pad.is_empty() {
+        let (b3, s256) = hash_both(&slice.leading_pad);
+        queue_pending(&mut blobs, slice.leading_pad.clone(), b3, s256);
+        nested.leading_pad_blob = Some(hex_lower(&b3));
+        nested.leading_pad_size = Some(slice.leading_pad.len() as u64);
+    }
+    let (b3, s256) = hash_both(tail);
+    queue_pending(&mut blobs, tail.clone(), b3, s256);
+    nested.tail_blob = Some(hex_lower(&b3));
+    nested.tail_size = Some(tail.len() as u64);
+    Ok(Some(ExplodedReady {
+        seq: 0,
+        inflight,
+        outer: meta.clone(),
+        nested,
+        blobs,
+    }))
+}
+
+fn queue_pending(blobs: &mut Vec<PendingBlob>, bytes: Vec<u8>, b3: [u8; 32], s256: [u8; 32]) {
+    if blobs.iter().any(|b| b.b3 == b3) {
+        return;
+    }
+    blobs.push(PendingBlob { bytes, b3, s256 });
+}
+
+fn fill_child_entry(
+    entry: &mut Entry,
+    local: &ExactLocal,
+    prefix: u64,
+    class: LocalClass,
+    blobs: &mut Vec<PendingBlob>,
+) -> Result<()> {
+    entry.local_header_offset = Some(local.zip_rel_offset);
+    entry.offsetheader = Some(prefix.saturating_add(local.zip_rel_offset));
+    entry.data_start = Some(
+        prefix
+            .saturating_add(local.zip_rel_offset)
+            .saturating_add(local.header.len() as u64),
+    );
+    if local.header.len() <= HEX_INLINE_MAX {
+        entry.local_header_hex = Some(hex_lower(&local.header));
+    } else {
+        let (b3, s256) = hash_both(&local.header);
+        queue_pending(blobs, local.header.clone(), b3, s256);
+        entry.local_header_blob = Some(hex_lower(&b3));
+    }
+    if let LocalClass::DeflateHit(codec) = class {
+        entry.cdata_codec = Some(codec.as_str());
+    }
+    if let Some(desc) = &local.descriptor {
+        entry.data_descriptor_hex = Some(hex_lower(desc));
+    }
+    if local.pad.iter().all(|&b| b == 0) && !local.pad.is_empty() {
+        entry.pad_zeros = Some(local.pad.len() as u64);
+    } else if !local.pad.is_empty() {
+        let (b3, s256) = hash_both(&local.pad);
+        queue_pending(blobs, local.pad.clone(), b3, s256);
         entry.pad_blob = Some(hex_lower(&b3));
     }
     Ok(())
@@ -1164,22 +1425,46 @@ mod tests {
     use std::io::{Seek, SeekFrom};
 
     #[test]
-    fn jar_store_policy_miss_or_exotic_is_clean_miss() {
+    fn nested_file_count_cap_predicate() {
+        assert!(!nested_file_count_over_cap(NESTED_MAX_FILE_ENTRIES));
+        assert!(nested_file_count_over_cap(NESTED_MAX_FILE_ENTRIES + 1));
+        assert!(nested_file_count_over_cap(65_536));
+    }
+
+    #[test]
+    fn classify_inflate_cap_is_min_of_listing_and_max() {
+        let plain = vec![b'x'; 64 * 1024];
+        let cdata = crate::deflate::deflate_raw(&plain, 6).unwrap();
+        let mut header = vec![0u8; 30];
+        header[0..4].copy_from_slice(b"PK\x03\x04");
+        header[8..10].copy_from_slice(&8u16.to_le_bytes());
+        let entry = Entry {
+            name: "a.txt".into(),
+            is_dir: false,
+            blob: Some("unused".into()),
+            crc32: crc32fast::hash(&plain),
+            method: "deflated".into(),
+            method_code: 8,
+            uncompressed_size: plain.len() as u64,
+            compressed_size: cdata.len() as u64,
+            utf8_flag: true,
+            ..Entry::default()
+        };
+        let local = ExactLocal {
+            zip_rel_offset: 0,
+            header: header.clone(),
+            cdata: cdata.clone(),
+            descriptor: None,
+            pad: Vec::new(),
+        };
         assert_eq!(
-            jar_store_policy(&[LocalClass::Store, LocalClass::DeflateHit(6)]),
-            StorePolicy::CleanExact
+            classify_local(&entry, &local, plain.len() as u64),
+            LocalClass::DeflateHit(crate::deflate::CdataCodec::Flate2(6))
         );
         assert_eq!(
-            jar_store_policy(&[LocalClass::DeflateHit(6), LocalClass::Unreproducible]),
-            StorePolicy::CleanMiss
-        );
-        assert_eq!(
-            jar_store_policy(&[LocalClass::DeflateHit(6), LocalClass::DeflateMiss]),
-            StorePolicy::CleanMiss
-        );
-        assert_eq!(
-            jar_store_policy(&[LocalClass::DeflateMiss, LocalClass::Unreproducible]),
-            StorePolicy::CleanMiss
+            classify_local(&entry, &local, 8),
+            LocalClass::Unreproducible,
+            "inflate_cap below listing must not fully inflate a hit bitstream"
         );
     }
 
@@ -1212,6 +1497,9 @@ mod tests {
             data_descriptor_hex: None,
             pad_zeros: None,
             pad_blob: None,
+            offsetheader: None,
+            data_start: None,
+            zip_index: None,
         };
         let local = ExactLocal {
             zip_rel_offset: 0,
@@ -1220,7 +1508,10 @@ mod tests {
             descriptor: None,
             pad: Vec::new(),
         };
-        assert_eq!(classify_local(&entry, &local), LocalClass::DeflateHit(6));
+        assert_eq!(
+            classify_local(&entry, &local, 1),
+            LocalClass::DeflateHit(crate::deflate::CdataCodec::Zlib(6))
+        );
     }
 
     #[test]
@@ -1254,6 +1545,9 @@ mod tests {
             data_descriptor_hex: None,
             pad_zeros: None,
             pad_blob: None,
+            offsetheader: None,
+            data_start: None,
+            zip_index: None,
         };
         let local = ExactLocal {
             zip_rel_offset: 0,
@@ -1262,7 +1556,10 @@ mod tests {
             descriptor: None,
             pad: Vec::new(),
         };
-        assert_eq!(classify_local(&entry, &local), LocalClass::DeflateHit(6));
+        assert_eq!(
+            classify_local(&entry, &local, 1),
+            LocalClass::DeflateHit(crate::deflate::CdataCodec::Zlib(6))
+        );
     }
 
     #[test]
@@ -1290,6 +1587,9 @@ mod tests {
             data_descriptor_hex: None,
             pad_zeros: None,
             pad_blob: None,
+            offsetheader: None,
+            data_start: None,
+            zip_index: None,
         };
         let local = ExactLocal {
             zip_rel_offset: 0,
@@ -1298,11 +1598,14 @@ mod tests {
             descriptor: None,
             pad: Vec::new(),
         };
-        assert_eq!(classify_local(&entry, &local), LocalClass::Unreproducible);
+        assert_eq!(
+            classify_local(&entry, &local, 4),
+            LocalClass::Unreproducible
+        );
     }
 
     #[test]
-    fn classify_stored_block_deflate_is_miss() {
+    fn classify_stored_block_deflate_is_stored_codec_hit() {
         let plain = vec![b'a'; 256];
         let cdata = {
             let len = u16::try_from(plain.len()).unwrap();
@@ -1338,6 +1641,9 @@ mod tests {
             data_descriptor_hex: None,
             pad_zeros: None,
             pad_blob: None,
+            offsetheader: None,
+            data_start: None,
+            zip_index: None,
         };
         let local = ExactLocal {
             zip_rel_offset: 0,
@@ -1346,7 +1652,10 @@ mod tests {
             descriptor: None,
             pad: Vec::new(),
         };
-        assert_eq!(classify_local(&entry, &local), LocalClass::DeflateMiss);
+        assert_eq!(
+            classify_local(&entry, &local, plain.len() as u64),
+            LocalClass::DeflateHit(crate::deflate::CdataCodec::Stored)
+        );
     }
 
     #[test]

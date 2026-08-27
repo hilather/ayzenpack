@@ -46,6 +46,12 @@ pub struct Jar {
     pub raw_zip_blob: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_zip_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leading_pad_blob: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leading_pad_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nestedindexes: Vec<NestedIndex>,
     pub entries: Vec<Entry>,
 }
 
@@ -63,7 +69,29 @@ impl Jar {
         if self.tail_blob.is_none() {
             return false;
         }
-        self.entries.iter().all(Entry::can_exact_cdata)
+        self.entries.iter().all(|e| self.slot_exact(e))
+    }
+
+    pub fn slot_exact(&self, e: &Entry) -> bool {
+        if e.blob.is_some() && e.zip_index.is_some() {
+            return false;
+        }
+        if let Some(i) = e.zip_index {
+            return self
+                .nestedindexes
+                .get(i)
+                .is_some_and(NestedIndex::bit_identical_restore);
+        }
+        e.can_exact_cdata()
+    }
+
+    pub fn nested_index(&self, i: usize) -> Result<&NestedIndex, crate::error::AyzenpackError> {
+        self.nestedindexes.get(i).ok_or_else(|| {
+            crate::error::AyzenpackError::FormatOwned(format!(
+                "zip_index {i} out of range for {}",
+                self.name
+            ))
+        })
     }
 
     /// Sliced metadata is present but at least one DEFLATE entry has no cdata copy/codec.
@@ -73,7 +101,14 @@ impl Jar {
 }
 
 impl Entry {
-    fn can_exact_cdata(&self) -> bool {
+    pub(crate) fn can_exact_cdata(&self) -> bool {
+        if self.blob.is_some() && self.zip_index.is_some() {
+            return false;
+        }
+        if self.zip_index.is_some() {
+            // Jar-level: look up nestedindexes[i].
+            return false;
+        }
         if self.cdata_blob.is_some() || self.cdata_codec.is_some() {
             return true;
         }
@@ -84,9 +119,40 @@ impl Entry {
             // A method-8 empty DEFLATE dir (`03 00`) needs `cdata_codec` or rebuild.
             return self.uncompressed_size == 0 && self.compressed_size == 0;
         }
-        // STORE splice only when local cdata length is the payload.
-        // An Unreproducible STORE file (csize != uncomp) is not exact.
-        self.method_code == 0 && self.compressed_size == self.uncompressed_size
+        // STORE splice only when local cdata length is the payload and we have
+        // the uncompressed bytes. zip_index slots are handled on the Jar.
+        self.method_code == 0
+            && self.blob.is_some()
+            && self.compressed_size == self.uncompressed_size
+    }
+}
+
+/// Depth-1 child ZIP stencil (Jar fields minus `nestedindexes`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NestedIndex {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_blob: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leading_pad_blob: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leading_pad_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail_blob: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail_size: Option<u64>,
+    #[serde(default)]
+    pub entries: Vec<Entry>,
+}
+
+impl NestedIndex {
+    pub fn bit_identical_restore(&self) -> bool {
+        self.tail_blob.is_some()
+            && self
+                .entries
+                .iter()
+                .all(|e| e.zip_index.is_none() && e.can_exact_cdata())
     }
 }
 
@@ -145,6 +211,47 @@ pub struct Entry {
     pub pad_zeros: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pad_blob: Option<String>,
+    /// File-absolute local header offset (ratarmount `offsetheader`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offsetheader: Option<u64>,
+    /// File-absolute payload start (ratarmount `data_start`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_start: Option<u64>,
+    /// Index into `jars[].nestedindexes[]`. JSON `blob` is null when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zip_index: Option<usize>,
+}
+
+impl Default for Entry {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            is_dir: false,
+            blob: None,
+            sha256: None,
+            crc32: 0,
+            method: "stored".into(),
+            method_code: 0,
+            uncompressed_size: 0,
+            compressed_size: 0,
+            dos_date: 0,
+            dos_time: 0,
+            unix_mode: None,
+            utf8_flag: true,
+            name_raw_hex: None,
+            cdata_blob: None,
+            cdata_codec: None,
+            local_header_offset: None,
+            local_header_hex: None,
+            local_header_blob: None,
+            data_descriptor_hex: None,
+            pad_zeros: None,
+            pad_blob: None,
+            offsetheader: None,
+            data_start: None,
+            zip_index: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -187,6 +294,9 @@ mod tests {
             data_descriptor_hex: None,
             pad_zeros: None,
             pad_blob: None,
+            offsetheader: None,
+            data_start: None,
+            zip_index: None,
         }
     }
 
@@ -216,6 +326,9 @@ mod tests {
                 tail_size: None,
                 raw_zip_blob: None,
                 raw_zip_size: None,
+                leading_pad_blob: None,
+                leading_pad_size: None,
+                nestedindexes: Vec::new(),
                 entries: vec![sample_file_entry()],
             }],
             blobs: vec![Blob {
@@ -288,8 +401,16 @@ mod tests {
         assert!(SCHEMA_JSON.contains("raw_zip_blob"));
         assert!(SCHEMA_JSON.contains("cdata_blob"));
         assert!(SCHEMA_JSON.contains("cdata_codec"));
+        assert!(SCHEMA_JSON.contains("deflate-raw:(flate2:[1369]|zlib:[169]|stored)"));
         assert!(SCHEMA_JSON.contains("local_header_hex"));
         assert!(SCHEMA_JSON.contains("local_header_offset"));
+        assert!(SCHEMA_JSON.contains("offsetheader"));
+        assert!(SCHEMA_JSON.contains("data_start"));
+        assert!(SCHEMA_JSON.contains("zip_index"));
+        assert!(SCHEMA_JSON.contains("leading_pad_blob"));
+        assert!(SCHEMA_JSON.contains("nestedindexes"));
+        assert!(SCHEMA_JSON.contains("\"nestedindex\""));
+        assert!(!SCHEMA_JSON.contains("oneOf"), "schema must not use oneOf");
         assert!(!SCHEMA_JSON.contains("jded"));
         assert_eq!(m.version, 1);
         assert_eq!(m.hash_algo, "blake3");
@@ -463,6 +584,9 @@ mod tests {
             data_descriptor_hex: None,
             pad_zeros: None,
             pad_blob: None,
+            offsetheader: None,
+            data_start: None,
+            zip_index: None,
         };
         let s = serde_json::to_string(&e).unwrap();
         assert_compact(&s);

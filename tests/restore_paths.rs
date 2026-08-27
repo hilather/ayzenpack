@@ -68,6 +68,11 @@ fn file_content_blobs(m: &Manifest) -> BTreeSet<String> {
                 .iter()
                 .filter(|e| !e.is_dir)
                 .filter_map(|e| e.blob.clone())
+                .chain(
+                    j.nestedindexes
+                        .iter()
+                        .flat_map(|n| n.entries.iter().filter_map(|e| e.blob.clone())),
+                )
         })
         .collect()
 }
@@ -88,13 +93,27 @@ fn assert_listed_no_dual(jar: &ayzenpack::manifest::Jar) {
     assert_eq!(jar.raw_zip_size.unwrap_or(0), 0);
     for e in &jar.entries {
         assert!(e.cdata_blob.is_none(), "{}!{} cdata_blob", jar.name, e.name);
-        if !e.is_dir {
+        assert!(
+            !(e.blob.is_some() && e.zip_index.is_some()),
+            "{}!{} both blob and zip_index",
+            jar.name,
+            e.name
+        );
+        if !e.is_dir && e.zip_index.is_none() {
             assert!(
                 e.blob.is_some(),
-                "{}!{} file entry must have a content blob",
+                "{}!{} file entry must have a content blob or zip_index",
                 jar.name,
                 e.name
             );
+        }
+        if e.zip_index.is_some() {
+            assert!(e.blob.is_none());
+        }
+    }
+    for nested in &jar.nestedindexes {
+        for e in &nested.entries {
+            assert!(e.cdata_blob.is_none(), "nested {} cdata_blob", e.name);
         }
     }
 }
@@ -516,6 +535,10 @@ fn in_place_restore_paths_two_fats_share_nested_lib_blobs() {
         file_entries
     );
     let want = hex_lower(&blake3_bytes(&shared));
+    assert!(
+        !m.blobs.iter().any(|b| b.blake3 == want),
+        "blake3(inner zip) must not be a CAS blob after explode"
+    );
     for jar in &m.jars {
         assert_listed_no_dual(jar);
         let e = jar
@@ -523,7 +546,8 @@ fn in_place_restore_paths_two_fats_share_nested_lib_blobs() {
             .iter()
             .find(|e| e.name == "BOOT-INF/lib/lib0.jar")
             .expect("planted lib0");
-        assert_eq!(e.blob.as_deref(), Some(want.as_str()));
+        assert!(e.blob.is_none());
+        assert!(e.zip_index.is_some());
     }
 
     rehydrate_restore_paths_only(&pack);
