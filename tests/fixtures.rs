@@ -902,6 +902,29 @@ pub fn write_codec_hit_plus_unknown_deflate(
     );
 }
 
+/// Non-PK 32-byte hole between a Spring launcher and the first CD local.
+pub const BASH_TO_FIRST_LOCAL_HOLE: [u8; 32] = [0xBB; 32];
+
+/// `[spring_boot_launch_script][32-byte hole][stored zip]`.
+///
+/// CD local offsets are file-absolute at the real first local so
+/// `find_cd_first_local` sets `prefix_len` to launcher+hole (the hole is
+/// inside `prefix_blob`, not `leading_pad` and not arm 3 ZipWriter).
+pub fn write_bash_hole_stored_zip(path: &Path, name: &str, data: &[u8]) {
+    let tmp = path.with_extension("inner.jar");
+    write_stored_zip(&tmp, &[(name, data, crc32fast::hash(data))]);
+    let zip = std::fs::read(&tmp).unwrap();
+    std::fs::remove_file(&tmp).unwrap();
+    let launcher = spring_boot_launch_script();
+    let mut out = Vec::with_capacity(launcher.len() + BASH_TO_FIRST_LOCAL_HOLE.len() + zip.len());
+    out.extend_from_slice(launcher);
+    out.extend_from_slice(&BASH_TO_FIRST_LOCAL_HOLE);
+    out.extend_from_slice(&zip);
+    let delta = u32::try_from(launcher.len() + BASH_TO_FIRST_LOCAL_HOLE.len()).unwrap();
+    adjust_self_extracting_offsets(&mut out, delta);
+    std::fs::write(path, out).unwrap();
+}
+
 /// File starts with `PK\x03\x04` garbage; first CD local is after that decoy.
 pub fn write_leading_pad_pk_decoy_zip(path: &Path, name: &str, data: &[u8]) {
     let tmp = path.with_extension("inner.jar");

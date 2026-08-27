@@ -15,13 +15,13 @@ use ayzenpack::manifest::Manifest;
 use ayzenpack::{dehydrate, rehydrate, verify, DehydrateOptions, RehydrateOptions};
 use fixtures::{
     matt_dehydrate, matt_rehydrate, pk_start_unadjusted_store_nested_latch_bytes,
-    spring_boot_launch_script, write_codec_hit_plus_unknown_deflate, write_data_descriptor_zip,
-    write_deflate_miss_plus_dir_cdata, write_deflate_miss_plus_empty_deflate_dir,
-    write_encrypted_store_zip, write_fat_spring_store_nested_jar,
-    write_fat_spring_store_nested_zipa_jar, write_fat_spring_zip64_zipa_jar, write_jar,
-    write_jar_entries, write_jar_with_comment, write_leading_pad_pk_decoy_truncated_cd_zip,
-    write_leading_pad_pk_decoy_zip, write_leftover_junk_listed_zip,
-    write_leftover_junk_plus_store_nested, write_non_utf8_name_zip,
+    spring_boot_launch_script, write_bash_hole_stored_zip, write_codec_hit_plus_unknown_deflate,
+    write_data_descriptor_zip, write_deflate_miss_plus_dir_cdata,
+    write_deflate_miss_plus_empty_deflate_dir, write_encrypted_store_zip,
+    write_fat_spring_store_nested_jar, write_fat_spring_store_nested_zipa_jar,
+    write_fat_spring_zip64_zipa_jar, write_jar, write_jar_entries, write_jar_with_comment,
+    write_leading_pad_pk_decoy_truncated_cd_zip, write_leading_pad_pk_decoy_zip,
+    write_leftover_junk_listed_zip, write_leftover_junk_plus_store_nested, write_non_utf8_name_zip,
     write_overlapping_local_plus_store_nested, write_overlapping_local_zip,
     write_padded_locals_zip, write_range_overlap_local_zip, write_signed_looking_jar,
     write_store_file_plus_dir_cdata, write_store_file_plus_empty_deflate_dir,
@@ -31,7 +31,7 @@ use fixtures::{
     write_truncated_cd_plus_store_nested_unadjusted, write_truncated_cd_zip64_listed_zip,
     write_unknown_deflate_wrapped, write_unknown_deflate_zip, write_wrapped_jar,
     write_wrapped_jar_adjusted, write_wrapped_zip64_jar, write_zlib_deflate_zip, zip64_jar_bytes,
-    JarEntry, SPRING_LAUNCHER,
+    JarEntry, BASH_TO_FIRST_LOCAL_HOLE, SPRING_LAUNCHER,
 };
 use zip::{CompressionMethod, DateTime, ZipArchive};
 
@@ -4007,10 +4007,90 @@ fn v023_tiny_pack_still_reads() {
 }
 
 #[test]
+fn bash_to_first_local_hole_is_prefix_blob_not_arm3() {
+    // (A) [launcher][hole][stored zip]: hole is inside prefix_blob, not leading_pad
+    // and not arm 3 ZipWriter (which would drop the hole if prefix were launcher-only).
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("bash-hole.jar");
+    let payload = b"prefix-hole-payload";
+    write_bash_hole_stored_zip(&jar, "a.txt", payload);
+    let src = fs::read(&jar).unwrap();
+    let launcher = spring_boot_launch_script();
+    let prefix_len = launcher.len() + BASH_TO_FIRST_LOCAL_HOLE.len();
+    assert!(src.starts_with(launcher));
+    assert_eq!(
+        &src[launcher.len()..prefix_len],
+        BASH_TO_FIRST_LOCAL_HOLE.as_slice()
+    );
+    assert_eq!(&src[prefix_len..prefix_len + 4], b"PK\x03\x04");
+    let listed = ZipArchive::new(File::open(&jar).unwrap()).unwrap().len();
+    assert_eq!(listed, 1, "fixture must stay listable");
+
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert_eq!(
+        m.jars[0].prefix_size,
+        Some(prefix_len as u64),
+        "prefix_size must include launcher + hole (absorption, not arm 3)"
+    );
+    assert_ne!(
+        m.jars[0].prefix_size,
+        Some(launcher.len() as u64),
+        "do not accept prefix_size == launcher && leading_pad_size == hole"
+    );
+    assert!(
+        m.jars[0].leading_pad_blob.is_none(),
+        "hole is inside prefix_blob, not leading_pad"
+    );
+    assert_eq!(m.jars[0].leading_pad_size.unwrap_or(0), 0);
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    assert!(
+        m.jars[0].tail_blob.is_some(),
+        "healthy stored zip must slice (not skip-exact arm 3)"
+    );
+    assert!(m.jars[0].bit_identical_restore());
+    for e in &m.jars[0].entries {
+        assert!(e.cdata_blob.is_none(), "{} cdata_blob", e.name);
+    }
+    assert_eq!(content_blob_ids(&m).len(), 1);
+    let prefix_hex = m.jars[0].prefix_blob.as_deref().expect("prefix_blob");
+    let prefix_blob = m
+        .blobs
+        .iter()
+        .find(|b| b.blake3 == prefix_hex)
+        .expect("prefix blob in catalog");
+    assert_eq!(prefix_blob.size, prefix_len as u64);
+    assert_eq!(
+        m.jars[0].entries[0].offsetheader,
+        Some(prefix_len as u64),
+        "first local sits at prefix_len (hole absorbed)"
+    );
+
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("bash-hole.jar");
+    let got = fs::read(&restored).unwrap();
+    assert_eq!(
+        &got[..prefix_len],
+        &src[..prefix_len],
+        "dest must keep launcher+hole (arm 3 ZipWriter with prefix=launcher would drop the hole)"
+    );
+    assert_eq!(got, src, "absorbed prefix is exact splice, not ZipWriter");
+    let mut z = ZipArchive::new(File::open(&restored).unwrap()).unwrap();
+    let mut buf = Vec::new();
+    z.by_name("a.txt")
+        .expect("dest listing must include a.txt")
+        .read_to_end(&mut buf)
+        .unwrap();
+    assert_eq!(buf, payload);
+}
+
+#[test]
 fn leading_pad_pk_decoy_truncated_cd_restores_hole() {
-    // Prefix+hole (prefix_len > 0 && min(zip_rel) != 0) stays slice Err / arm 3.
-    // This fixture is prefix_len == 0 PK-start hole + homemade-None (arm 1).
-    // ZipWriter would drop the decoy; dest-starts-with-0xAA fails if arm 1 is skipped.
+    // PK-start hole (prefix_len == 0, min(zip_rel) != 0) is leading_pad + homemade-None (arm 1).
+    // Class (A) bash+hole is prefix_blob; class (B) prefix_len>0 && min(zip_rel)!=0 stays the
+    // dead defensive Err. ZipWriter would drop the decoy; dest-starts-with-0xAA fails if arm 1 is skipped.
     let dir = tempfile::tempdir().unwrap();
     let jar = dir.path().join("lead-trunc.jar");
     write_leading_pad_pk_decoy_truncated_cd_zip(&jar, "a.txt", b"leading-pad-plain");

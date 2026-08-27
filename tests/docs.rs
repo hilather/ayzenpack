@@ -195,15 +195,17 @@ fn docs_lock_leftover_junk_hash_policy_and_class_dedup() {
             "Remaining homemade-`None` (true parse failure, truncated/malformed CD) **never** gets `tail_blob`"
         ) && DESIGN.contains("Never attach tail while homemade parse is `None`")
             && DESIGN.contains(
-                "Range overlap, ZipArchive count mismatch, prefix+hole, and slice `Err` are other skip-exact reasons"
+                "Range overlap, ZipArchive count mismatch, and slice `Err` are other skip-exact reasons"
             )
             && DESIGN.contains(
                 "Equal-offset last-wins with matching homemade count is exact splice"
             )
             && !DESIGN.contains(
                 "Remaining homemade-`None` (true parse failure, truncated/malformed CD, overlap, prefix+hole)"
-            ),
-        "DESIGN.md must say remaining homemade-None never gets tail_blob; range overlap/count mismatch/prefix+hole are other skip-exact; equal-offset last-wins is exact splice"
+            )
+            && !DESIGN.contains("Overlap, prefix+hole, and slice `Err` are other skip-exact reasons")
+            && !DESIGN.contains("prefix+hole stays skip-exact"),
+        "DESIGN.md must say remaining homemade-None never gets tail_blob; range overlap/count mismatch are other skip-exact; equal-offset last-wins is exact splice; prefix+hole is not skip-exact (A)"
     );
     assert!(
         DESIGN.contains(
@@ -234,7 +236,7 @@ fn docs_lock_leftover_junk_hash_policy_and_class_dedup() {
             && DESIGN.contains("write_skip_exact_concat")
             && DESIGN.contains("Never put recorded `offsetheader`")
             && DESIGN.contains(
-                "Arm 3 (no captured headers: range overlap / ZipArchive count mismatch / prefix+hole / slice `Err`) uses `write_jar` ZipWriter that STOREs `method_code == 0` / `zip_index` over uncompressed payload (`read_entry_content` / `reconstruct_child_zip`); never `resolve_cdata`"
+                "Arm 3 (no captured headers: overlap / ZipArchive count mismatch / slice `Err`) uses `write_jar` ZipWriter that STOREs `method_code == 0` / `zip_index` over uncompressed payload (`read_entry_content` / `reconstruct_child_zip`); never `resolve_cdata`"
             )
             && DESIGN.contains("Skip-exact arm 1")
             && DESIGN.contains("stencil seek + synthetic CD")
@@ -331,6 +333,23 @@ fn docs_lock_synthetic_cd_hash_policy_fileabs_and_corpus() {
             && AGENTS.contains("Equal-offset last-wins with matching homemade count is exact splice")
             && !AGENTS.contains("Crate **0.2.6** / format **v2**"),
         "AGENTS.md current-tree must be crate 0.2.7 with homemade-None locals-region + FileAbs listing"
+    );
+    assert!(
+        DESIGN.contains(
+            "Prefix+hole **(A)** `[non-PK prefix][hole][first CD local]` is already `prefix_blob` covering bash+hole (`find_cd_first_local`); not skip-exact"
+        ) && DESIGN.contains(
+            "Prefix+hole **(B)** `prefix_len > 0 && min(zip_rel) != 0` after convert is a dead defensive `Err`"
+        ) && DESIGN.contains("do not call (B) absorbed")
+            && DESIGN.contains("Do not extend `prefix_len` on PK-start files")
+            && DESIGN.contains("Do not invent a bash-vs-hole splitter")
+            && AGENTS.contains(
+                "Prefix+hole **(A)** `[non-PK prefix][hole][first CD local]` is already `prefix_blob` covering bash+hole (`find_cd_first_local`); not skip-exact; do not split bash vs hole"
+            )
+            && AGENTS.contains(
+                "Prefix+hole **(B)** `prefix_len > 0 && min(zip_rel) != 0` after convert is a dead defensive `Err` at first-local-not-at-0; keep it; do not call (B) absorbed"
+            )
+            && !AGENTS.contains("prefix+hole stays skip-exact arm 3"),
+        "DESIGN/AGENTS must split prefix+hole (A) absorbed prefix_blob vs (B) kept dead Err"
     );
     assert!(
         README.contains("locals-region identity")
