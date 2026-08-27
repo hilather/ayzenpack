@@ -568,7 +568,7 @@ fn corpus_mix_regular_and_spring_whole_file_hashes() {
             }
         }
         for e in &jar.entries {
-            if let Some(_) = e.zip_index {
+            if e.zip_index.is_some() {
                 assert!(e.blob.is_none());
                 let src_jar = PathBuf::from(&jar.source_path);
                 let mut z = ZipArchive::new(File::open(&src_jar).unwrap()).unwrap();

@@ -66,10 +66,6 @@ pub fn deflate_raw(data: &[u8], level: u32) -> Result<Vec<u8>> {
     enc.finish().map_err(io_err)
 }
 
-pub fn inflate_raw(data: &[u8]) -> Result<Vec<u8>> {
-    inflate_raw_capped(data, u64::MAX)
-}
-
 /// Inflate raw DEFLATE, refusing to grow the output past `max` bytes.
 pub fn inflate_raw_capped(data: &[u8], max: u64) -> Result<Vec<u8>> {
     let cap = usize::try_from(max).unwrap_or(usize::MAX);
@@ -247,7 +243,7 @@ mod tests {
         let plain = vec![b'a'; 64];
         let c = deflate_raw(&plain, 6).unwrap();
         assert_ne!(c, plain);
-        assert_eq!(inflate_raw(&c).unwrap(), plain);
+        assert_eq!(inflate_raw_capped(&c, u64::MAX).unwrap(), plain);
         assert_eq!(
             match_deflate(&plain, &c, 0).unwrap(),
             Some(CdataCodec::Flate2(6))
@@ -258,7 +254,7 @@ mod tests {
     fn stored_block_is_stored_codec_hit() {
         let plain = vec![b'a'; 256];
         let stored = stored_deflate(&plain);
-        assert_eq!(inflate_raw(&stored).unwrap(), plain);
+        assert_eq!(inflate_raw_capped(&stored, u64::MAX).unwrap(), plain);
         assert_eq!(match_flate2(&plain, &stored, 0).unwrap(), None);
         assert_eq!(
             match_deflate(&plain, &stored, 0).unwrap(),
@@ -270,7 +266,7 @@ mod tests {
     fn stored_deflate_multi_block_over_u16() {
         let plain = vec![b'b'; 70_000];
         let stored = stored_deflate(&plain);
-        assert_eq!(inflate_raw(&stored).unwrap(), plain);
+        assert_eq!(inflate_raw_capped(&stored, u64::MAX).unwrap(), plain);
         assert_eq!(
             match_deflate(&plain, &stored, 0).unwrap(),
             Some(CdataCodec::Stored)
@@ -289,7 +285,10 @@ mod tests {
     fn unknown_deflate_prefix_is_miss() {
         let plain = b"unknown-deflate sibling miss payload".repeat(8);
         let cdata = unknown_deflate_prefix(&plain).unwrap();
-        assert_eq!(inflate_raw(&cdata).unwrap(), plain.as_slice());
+        assert_eq!(
+            inflate_raw_capped(&cdata, u64::MAX).unwrap(),
+            plain.as_slice()
+        );
         assert_eq!(match_flate2(&plain, &cdata, 0).unwrap(), None);
         assert_eq!(
             match_deflate(&plain, &cdata, 0).unwrap(),
@@ -302,7 +301,10 @@ mod tests {
     fn zlib_raw_is_flate2_miss_and_zlib_hit() {
         let plain = b"zlib-rs classic fixture payload for 0.2.4".repeat(8);
         let cdata = zlib_raw_deflate(&plain, 6).unwrap();
-        assert_eq!(inflate_raw(&cdata).unwrap(), plain.as_slice());
+        assert_eq!(
+            inflate_raw_capped(&cdata, u64::MAX).unwrap(),
+            plain.as_slice()
+        );
         assert_eq!(
             match_flate2(&plain, &cdata, 0).unwrap(),
             None,

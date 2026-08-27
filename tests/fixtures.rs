@@ -844,8 +844,7 @@ pub fn write_homemade_none_listed_zip(path: &Path) {
     let junk = [0xABu8, 0xCD, 0xEF, 0x01];
     buf.splice(eocd..eocd, junk);
     let new_eocd = eocd + junk.len();
-    buf[new_eocd + 12..new_eocd + 16]
-        .copy_from_slice(&(cd_size + junk.len() as u32).to_le_bytes());
+    buf[new_eocd + 12..new_eocd + 16].copy_from_slice(&(cd_size + junk.len() as u32).to_le_bytes());
     std::fs::write(path, buf).unwrap();
 }
 
@@ -892,11 +891,7 @@ pub fn write_overlapping_local_plus_store_nested(path: &Path) {
         &[
             ("a.txt", same.as_slice(), crc32fast::hash(same)),
             ("b.txt", same.as_slice(), crc32fast::hash(same)),
-            (
-                "lib/inner.jar",
-                inner.as_slice(),
-                crc32fast::hash(&inner),
-            ),
+            ("lib/inner.jar", inner.as_slice(), crc32fast::hash(&inner)),
         ],
     );
     let mut buf = std::fs::read(path).unwrap();

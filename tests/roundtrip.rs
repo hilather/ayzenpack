@@ -14,13 +14,14 @@ use ayzenpack::hashutil::blake3_bytes;
 use ayzenpack::manifest::Manifest;
 use ayzenpack::{dehydrate, rehydrate, verify, DehydrateOptions, RehydrateOptions};
 use fixtures::{
-    matt_dehydrate, matt_rehydrate, spring_boot_launch_script, write_codec_hit_plus_unknown_deflate,
-    write_data_descriptor_zip, write_deflate_miss_plus_dir_cdata,
-    write_deflate_miss_plus_empty_deflate_dir, write_fat_spring_store_nested_jar,
+    matt_dehydrate, matt_rehydrate, spring_boot_launch_script,
+    write_codec_hit_plus_unknown_deflate, write_data_descriptor_zip,
+    write_deflate_miss_plus_dir_cdata, write_deflate_miss_plus_empty_deflate_dir,
+    write_encrypted_store_zip, write_fat_spring_store_nested_jar,
     write_fat_spring_store_nested_zipa_jar, write_fat_spring_zip64_zipa_jar,
-    write_encrypted_store_zip, write_homemade_none_listed_zip, write_jar,
-    write_jar_entries, write_jar_with_comment, write_leading_pad_pk_decoy_zip,
-    write_non_utf8_name_zip, write_overlapping_local_plus_store_nested, write_overlapping_local_zip,
+    write_homemade_none_listed_zip, write_jar, write_jar_entries, write_jar_with_comment,
+    write_leading_pad_pk_decoy_zip, write_non_utf8_name_zip,
+    write_overlapping_local_plus_store_nested, write_overlapping_local_zip,
     write_padded_locals_zip, write_signed_looking_jar, write_store_file_plus_dir_cdata,
     write_store_file_plus_empty_deflate_dir, write_store_file_plus_leftover_csize_dir,
     write_stored_block_deflate_zip, write_stored_jar_dos_zero, write_stored_zip,
@@ -1100,13 +1101,20 @@ fn store_nested_zipa_fat_is_outer_listing_tail_no_raw_zip() {
         .collect();
     assert_eq!(libs.len(), 2, "outer listing must keep both nested libs");
     for e in &libs {
-        assert!(e.blob.is_none(), "{} must be zip_index not opaque CAS", e.name);
+        assert!(
+            e.blob.is_none(),
+            "{} must be zip_index not opaque CAS",
+            e.name
+        );
         assert!(e.zip_index.is_some());
         assert!(e.cdata_blob.is_none());
     }
     assert_eq!(m.jars[0].nestedindexes.len(), 2);
     for nested in &m.jars[0].nestedindexes {
-        assert!(nested.tail_blob.is_some(), "child stencil must have tail_blob");
+        assert!(
+            nested.tail_blob.is_some(),
+            "child stencil must have tail_blob"
+        );
     }
     assert!(m.jars[0].bit_identical_restore());
     let records = read_archive(&out).2;
@@ -1133,7 +1141,10 @@ fn store_nested_zipa_fat_is_outer_listing_tail_no_raw_zip() {
             },
         )
         .unwrap();
-        assert_eq!(got, inner, "reconstruct_child_zip must equal original inner ZIP");
+        assert_eq!(
+            got, inner,
+            "reconstruct_child_zip must equal original inner ZIP"
+        );
     }
     verify(&out).unwrap();
     let dest = dir.path().join("restored");
@@ -1265,6 +1276,15 @@ fn nested_jar_not_exploded() {
     assert!(
         !m.jars[0].entries.iter().any(|e| e.name.contains("Inner")),
         "nested jar must stay opaque, got {names:?}"
+    );
+    let inner_ent = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.name == "lib/inner.jar")
+        .expect("inner");
+    assert!(
+        inner_ent.zip_index.is_none(),
+        "DEFLATE nested must stay opaque"
     );
 
     let dest = dir.path().join("restored");
