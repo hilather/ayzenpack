@@ -2965,7 +2965,6 @@ fn listed_true_homemade_none_has_no_tail_blob() {
 }
 
 #[test]
-<<<<<<< HEAD
 fn truncated_cd_store_nested_unadjusted_fileabs_lists_outer() {
     // Homemade-None + STORE nested + unadjusted prefix: dest FileAbs CD so
     // ZipArchive::new(File) lists outer names. Source ZipArchive latches; scan_jar
@@ -3000,30 +2999,11 @@ fn truncated_cd_store_nested_unadjusted_fileabs_lists_outer() {
     matt_dehydrate(&pack, &jars);
     let records = read_archive(&pack).2;
     let m = manifest_from_records(&records);
-=======
-fn leading_pad_pk_decoy_truncated_cd_restores_hole() {
-    // Prefix+hole (prefix_len > 0 && min(zip_rel) != 0) stays slice Err / arm 3.
-    // This fixture is prefix_len == 0 PK-start hole + homemade-None (arm 1).
-    // ZipWriter would drop the decoy; dest-starts-with-0xAA fails if arm 1 is skipped.
-    let dir = tempfile::tempdir().unwrap();
-    let jar = dir.path().join("lead-trunc.jar");
-    write_leading_pad_pk_decoy_truncated_cd_zip(&jar, "a.txt", b"leading-pad-plain");
-    let listed = ZipArchive::new(File::open(&jar).unwrap()).unwrap().len();
-    assert!(listed >= 1, "fixture must stay listable");
-    let src = fs::read(&jar).unwrap();
-    assert_eq!(&src[..4], b"PK\x03\x04");
-    assert_eq!(&src[4..32], &[0xAA; 28]);
-    let src_len = src.len() as u64;
-    let out = dir.path().join("out.ayz");
-    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
-    let m = manifest_from_records(&read_archive(&out).2);
->>>>>>> 2930041 (Test leading_pad_blob is restored on homemade-None synthetic-CD seek)
     assert!(
         m.jars[0].tail_blob.is_none(),
         "remaining homemade-None must never get tail_blob"
     );
     assert!(m.jars[0].raw_zip_blob.is_none());
-<<<<<<< HEAD
     assert!(!m.jars[0].bit_identical_restore());
     assert!(!m.jars[0].metadata_rebuild());
     assert_eq!(
@@ -3031,16 +3011,6 @@ fn leading_pad_pk_decoy_truncated_cd_restores_hole() {
         Some(SPRING_LAUNCHER.len() as u64),
         "unadjusted launcher must be prefix"
     );
-=======
-    assert_eq!(
-        m.jars[0].prefix_size.unwrap_or(0),
-        0,
-        "do not extend prefix_len to swallow the PK-start hole"
-    );
-    assert!(m.jars[0].leading_pad_blob.is_some());
-    assert!(!m.jars[0].bit_identical_restore());
-    assert!(!m.jars[0].metadata_rebuild());
->>>>>>> 2930041 (Test leading_pad_blob is restored on homemade-None synthetic-CD seek)
     for e in &m.jars[0].entries {
         assert!(e.cdata_blob.is_none(), "{} cdata_blob", e.name);
         assert!(
@@ -3049,7 +3019,6 @@ fn leading_pad_pk_decoy_truncated_cd_restores_hole() {
             e.name
         );
     }
-<<<<<<< HEAD
     for nested in &m.jars[0].nestedindexes {
         for e in &nested.entries {
             assert!(e.cdata_blob.is_none(), "nested {} cdata_blob", e.name);
@@ -3094,20 +3063,11 @@ fn leading_pad_pk_decoy_truncated_cd_restores_hole() {
 
     matt_rehydrate(&pack);
     let got = fs::read(&jar).unwrap();
-=======
-    let first_oh = m.jars[0].entries[0].offsetheader.expect("offsetheader");
-    assert_eq!(m.jars[0].leading_pad_size, Some(first_oh));
-    let dest = dir.path().join("restored");
-    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
-    let restored = dest.join("lead-trunc.jar");
-    let got = fs::read(&restored).unwrap();
->>>>>>> 2930041 (Test leading_pad_blob is restored on homemade-None synthetic-CD seek)
     let got_len = got.len() as u64;
     assert!(
         got_len * 2 >= src_len,
         "restored {got_len} must stay in the same league as source {src_len}"
     );
-<<<<<<< HEAD
     assert!(
         got.starts_with(SPRING_LAUNCHER),
         "prefix bytes must be unchanged"
@@ -3159,36 +3119,6 @@ fn leading_pad_pk_decoy_truncated_cd_restores_hole() {
         let mode = fs::metadata(&jar).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "prefixed dest must be executable");
     }
-=======
-    assert_eq!(
-        &got[..32],
-        &src[..32],
-        "dest must start with leading-pad decoy (ZipWriter drops the hole)"
-    );
-    let mut z = ZipArchive::new(File::open(&restored).unwrap()).unwrap();
-    assert!(
-        z.by_name("a.txt").is_ok(),
-        "dest ZipArchive::new(File) must list outer a.txt"
-    );
-    drop(z);
-    let phys_cd = classic_eocd_cd_offset(&src);
-    let cd_start = classic_eocd_cd_offset(&got);
-    assert!(
-        (phys_cd as usize) > 32,
-        "locals-region identity must include the decoy"
-    );
-    assert_eq!(
-        &got[..cd_start as usize],
-        &src[..phys_cd as usize],
-        "arm 1 locals-region identity includes the hole"
-    );
-    assert_functional_identity(&jar, &restored);
-    assert_eq!(
-        entry_compression(&restored, "a.txt"),
-        CompressionMethod::Stored,
-        "method-0 files must STORE on skip-exact arm 1"
-    );
->>>>>>> 2930041 (Test leading_pad_blob is restored on homemade-None synthetic-CD seek)
 }
 
 #[test]
@@ -3571,4 +3501,84 @@ fn v023_tiny_pack_still_reads() {
     for jar in &m.jars {
         assert!(dir.path().join(&jar.name).is_file());
     }
+}
+
+
+#[test]
+fn leading_pad_pk_decoy_truncated_cd_restores_hole() {
+    // Prefix+hole (prefix_len > 0 && min(zip_rel) != 0) stays slice Err / arm 3.
+    // This fixture is prefix_len == 0 PK-start hole + homemade-None (arm 1).
+    // ZipWriter would drop the decoy; dest-starts-with-0xAA fails if arm 1 is skipped.
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("lead-trunc.jar");
+    write_leading_pad_pk_decoy_truncated_cd_zip(&jar, "a.txt", b"leading-pad-plain");
+    let listed = ZipArchive::new(File::open(&jar).unwrap()).unwrap().len();
+    assert!(listed >= 1, "fixture must stay listable");
+    let src = fs::read(&jar).unwrap();
+    assert_eq!(&src[..4], b"PK\x03\x04");
+    assert_eq!(&src[4..32], &[0xAA; 28]);
+    let src_len = src.len() as u64;
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert!(
+        m.jars[0].tail_blob.is_none(),
+        "remaining homemade-None must never get tail_blob"
+    );
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    assert_eq!(
+        m.jars[0].prefix_size.unwrap_or(0),
+        0,
+        "do not extend prefix_len to swallow the PK-start hole"
+    );
+    assert!(m.jars[0].leading_pad_blob.is_some());
+    assert!(!m.jars[0].bit_identical_restore());
+    assert!(!m.jars[0].metadata_rebuild());
+    for e in &m.jars[0].entries {
+        assert!(e.cdata_blob.is_none(), "{} cdata_blob", e.name);
+        assert!(
+            e.local_header_hex.is_some() || e.local_header_blob.is_some(),
+            "{} must capture a local header",
+            e.name
+        );
+    }
+    let first_oh = m.jars[0].entries[0].offsetheader.expect("offsetheader");
+    assert_eq!(m.jars[0].leading_pad_size, Some(first_oh));
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("lead-trunc.jar");
+    let got = fs::read(&restored).unwrap();
+    let got_len = got.len() as u64;
+    assert!(
+        got_len * 2 >= src_len,
+        "restored {got_len} must stay in the same league as source {src_len}"
+    );
+    assert_eq!(
+        &got[..32],
+        &src[..32],
+        "dest must start with leading-pad decoy (ZipWriter drops the hole)"
+    );
+    let mut z = ZipArchive::new(File::open(&restored).unwrap()).unwrap();
+    assert!(
+        z.by_name("a.txt").is_ok(),
+        "dest ZipArchive::new(File) must list outer a.txt"
+    );
+    drop(z);
+    let phys_cd = classic_eocd_cd_offset(&src);
+    let cd_start = classic_eocd_cd_offset(&got);
+    assert!(
+        (phys_cd as usize) > 32,
+        "locals-region identity must include the decoy"
+    );
+    assert_eq!(
+        &got[..cd_start as usize],
+        &src[..phys_cd as usize],
+        "arm 1 locals-region identity includes the hole"
+    );
+    assert_functional_identity(&jar, &restored);
+    assert_eq!(
+        entry_compression(&restored, "a.txt"),
+        CompressionMethod::Stored,
+        "method-0 files must STORE on skip-exact arm 1"
+    );
 }

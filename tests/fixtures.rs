@@ -910,7 +910,6 @@ pub fn write_truncated_cd_listed_zip(path: &Path) {
     std::fs::write(path, buf).unwrap();
 }
 
-<<<<<<< HEAD
 /// Truncated-CD homemade-`None` STORE zip with `lib/inner.jar` (`n.txt` inside),
 /// then unadjusted Spring launcher (`zip_a = false`). Source
 /// `ZipArchive::new(File)` can latch the nested EOCD; `scan_jar` is the listing
@@ -939,15 +938,6 @@ pub fn write_truncated_cd_plus_store_nested_unadjusted(path: &Path) -> Vec<u8> {
     splice_trailing_cd_junk(&mut buf, &magic_but_short_cd_header());
     std::fs::write(path, prepend_launcher(&buf, SPRING_LAUNCHER, false)).unwrap();
     inner
-=======
-/// PK-start leading pad plus truncated/malformed CD (homemade-`None`).
-/// `prefix_size` stays 0 (do not swallow the hole); never leftover-junk.
-pub fn write_leading_pad_pk_decoy_truncated_cd_zip(path: &Path, name: &str, data: &[u8]) {
-    write_leading_pad_pk_decoy_zip(path, name, data);
-    let mut buf = std::fs::read(path).unwrap();
-    splice_trailing_cd_junk(&mut buf, &magic_but_short_cd_header());
-    std::fs::write(path, buf).unwrap();
->>>>>>> 2930041 (Test leading_pad_blob is restored on homemade-None synthetic-CD seek)
 }
 
 /// Leftover-junk CD plus a STORE listable nested zip (`lib/inner.jar`).
@@ -1234,4 +1224,14 @@ pub fn write_deflate_miss_plus_dir_cdata(path: &Path, name: &str, data: &[u8]) {
             },
         ],
     );
+}
+
+
+/// PK-start leading pad plus truncated/malformed CD (homemade-`None`).
+/// `prefix_size` stays 0 (do not swallow the hole); never leftover-junk.
+pub fn write_leading_pad_pk_decoy_truncated_cd_zip(path: &Path, name: &str, data: &[u8]) {
+    write_leading_pad_pk_decoy_zip(path, name, data);
+    let mut buf = std::fs::read(path).unwrap();
+    splice_trailing_cd_junk(&mut buf, &magic_but_short_cd_header());
+    std::fs::write(path, buf).unwrap();
 }
