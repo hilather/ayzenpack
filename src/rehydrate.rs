@@ -475,18 +475,20 @@ fn maybe_inject_restore_tmp_failure() -> Result<()> {
     Ok(())
 }
 
-fn create_restore_tmp(dest: &Path) -> Result<(File, PendingRestore)> {
+/// Open dest's sibling tmp. Pending is first in the return so callers drop the
+/// File before Drop-unlink (Windows cannot remove an open file).
+fn create_restore_tmp(dest: &Path) -> Result<(PendingRestore, File)> {
     let pending = PendingRestore::prepare(dest);
     let file = File::create(&pending.tmp).map_err(|source| AyzenpackError::Io {
         source,
         path: Some(pending.tmp.clone()),
     })?;
     maybe_inject_restore_tmp_failure()?;
-    Ok((file, pending))
+    Ok((pending, file))
 }
 
 fn write_exact_jar(jar: &Jar, cas_dir: &Path, dest: &Path, apply_prefix_chmod: bool) -> Result<()> {
-    let (mut file, pending) = create_restore_tmp(dest)?;
+    let (pending, mut file) = create_restore_tmp(dest)?;
     let prefix_len = write_prefix(jar, cas_dir, dest, &mut file)?;
     if let Some(hex) = &jar.leading_pad_blob {
         let pad = read_named_blob(cas_dir, hex, &format!("{} leading_pad", jar.name))?;
@@ -661,7 +663,7 @@ fn write_rebuilt_jar(
     dest: &Path,
     apply_prefix_chmod: bool,
 ) -> Result<()> {
-    let (mut file, pending) = create_restore_tmp(dest)?;
+    let (pending, mut file) = create_restore_tmp(dest)?;
     let prefix_len = write_prefix(jar, cas_dir, dest, &mut file)?;
 
     let tail = match (&jar.tail_blob, jar.tail_size) {
@@ -840,7 +842,7 @@ fn write_jar(
     dest: &Path,
     apply_prefix_chmod: bool,
 ) -> Result<()> {
-    let (mut file, pending) = create_restore_tmp(dest)?;
+    let (pending, mut file) = create_restore_tmp(dest)?;
     let prefix_len = write_prefix(jar, cas_dir, dest, &mut file)?;
     let mut writer = ZipWriter::new(ZipView::new(file, prefix_len));
     if !jar.comment.is_empty() {
@@ -1244,5 +1246,56 @@ mod tests {
         })
         .unwrap_err();
         assert_injected_restore_keeps_dest(err, &jar, &orig);
+    }
+
+    #[test]
+    fn writer_error_after_tmp_open_unlinks_tmp_keeps_dest() {
+        // Missing tail / blob after the tmp File is bound: File must drop before
+        // PendingRestore so Windows can unlink dest.jar.tmp.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("a.jar");
+        let orig = b"source-bytes-must-remain";
+        let cas = dir.path().join("cas");
+        fs::create_dir(&cas).unwrap();
+        let jar = jar_restore(dest.to_str().unwrap());
+        let opts = RehydrateOptions {
+            quiet: true,
+            ..RehydrateOptions::default()
+        };
+
+        for backend in ["exact", "rebuild", "zipwriter"] {
+            fs::write(&dest, orig).unwrap();
+            let err = match backend {
+                "exact" => write_exact_jar(&jar, &cas, &dest, false),
+                "rebuild" => write_rebuilt_jar(&jar, &cas, &dest, false),
+                "zipwriter" => {
+                    let mut skip = jar.clone();
+                    skip.entries.push(Entry {
+                        name: "x.txt".into(),
+                        blob: Some("aa".repeat(32)),
+                        ..Entry::default()
+                    });
+                    write_jar(&opts, &skip, &cas, &dest, false)
+                }
+                _ => unreachable!(),
+            }
+            .unwrap_err();
+            match backend {
+                "exact" | "rebuild" => assert!(
+                    matches!(err, AyzenpackError::FormatOwned(ref s) if s.contains("missing tail")),
+                    "backend {backend}: {err:?}"
+                ),
+                "zipwriter" => assert!(
+                    matches!(err, AyzenpackError::HashMismatch(ref s) if s.contains("missing blob")),
+                    "backend {backend}: {err:?}"
+                ),
+                _ => unreachable!(),
+            }
+            assert_eq!(fs::read(&dest).unwrap(), orig, "backend {backend}");
+            assert!(
+                !sibling_tmp_path(&dest).exists(),
+                "backend {backend} tmp leftover"
+            );
+        }
     }
 }
