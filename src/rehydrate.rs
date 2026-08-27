@@ -4,9 +4,10 @@
 //! reproduced bitstream (`cdata_codec` / STORE / legacy `cdata_blob`) or rebuild
 //! a valid ZIP with patched sizes. Skip-exact homemade-`None` with captured
 //! headers seeks locals and writes a synthetic CD when every slot keeps recorded
-//! `compressed_size`. Overlap / prefix+hole and csize-changing misses (until
-//! concat) keep `ZipWriter` (STORE `method_code == 0` / `zip_index`; never
-//! `resolve_cdata`). Prefix bytes are always bit-exact.
+//! `compressed_size`. Headers-present csize-changing misses concatenate patched
+//! locals and synthesize a CD. Overlap / prefix+hole keep `ZipWriter` (STORE
+//! `method_code == 0` / `zip_index`; never `resolve_cdata`). Prefix bytes are
+//! always bit-exact.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -254,9 +255,8 @@ fn restore_jars(opts: &RehydrateOptions, manifest: &Manifest, cas_dir: &Path) ->
                     write_skip_exact_seek(jar, cas_dir, &dest, apply_prefix_chmod)?;
                 }
                 SkipExactArm::RebuildConcatSyntheticCd => {
-                    // Concat + synthetic CD is a later PR; ZipWriter STORE until then.
-                    log_restore(opts, jar, "skip_exact_zipwriter");
-                    write_jar(opts, jar, cas_dir, &dest, apply_prefix_chmod)?;
+                    log_restore(opts, jar, "skip_exact_concat_synthetic_cd");
+                    write_skip_exact_concat(jar, cas_dir, &dest, apply_prefix_chmod)?;
                 }
                 SkipExactArm::ZipWriterStore => {
                     log_restore(opts, jar, "skip_exact_zipwriter");
@@ -708,6 +708,113 @@ fn write_skip_exact_seek(
     let cd = write_synthetic_cd(&cd_entries, cd_start, jar.comment.as_bytes())?;
     debug_assert!(cd.bytes.len() as u64 >= cd.cd_size);
     file.seek(SeekFrom::Start(cd_start))
+        .map_err(|source| AyzenpackError::Io {
+            source,
+            path: Some(dest.to_path_buf()),
+        })?;
+    file.write_all(&cd.bytes)
+        .map_err(|source| AyzenpackError::Io {
+            source,
+            path: Some(dest.to_path_buf()),
+        })?;
+    let total = cd_start.checked_add(cd.bytes.len() as u64).ok_or_else(|| {
+        AyzenpackError::FormatOwned(format!("{} synthetic CD overflow", jar.name))
+    })?;
+    file.set_len(total).map_err(|source| AyzenpackError::Io {
+        source,
+        path: Some(dest.to_path_buf()),
+    })?;
+    drop(file);
+    if prefix_len > 0 && apply_prefix_chmod {
+        chmod_executable(&pending.tmp)?;
+    }
+    pending.commit()
+}
+
+fn arm2_cd_local_offset(prefix_len: u64, zip_rel: u64, jar_name: &str) -> Result<u64> {
+    if prefix_len > 0 {
+        prefix_len.checked_add(zip_rel).ok_or_else(|| {
+            AyzenpackError::FormatOwned(format!("{jar_name} concat local offset overflow"))
+        })
+    } else {
+        Ok(zip_rel)
+    }
+}
+
+/// Homemade-`None` miss path: CD-order concat of patched locals, then a specified CD.
+/// Recorded `offsetheader` is invalid after a csize change; never copy it.
+/// Drop leading_pad and per-slot pads (same as `write_rebuilt_jar`).
+fn write_skip_exact_concat(
+    jar: &Jar,
+    cas_dir: &Path,
+    dest: &Path,
+    apply_prefix_chmod: bool,
+) -> Result<()> {
+    let (pending, mut file) = create_restore_tmp(dest)?;
+    let prefix_len = write_prefix(jar, cas_dir, dest, &mut file)?;
+
+    let mut locals = Vec::new();
+    let mut cd_entries = Vec::with_capacity(jar.entries.len());
+    for e in &jar.entries {
+        if entry_has_dotdot(&e.name) {
+            return Err(AyzenpackError::FormatOwned(format!(
+                "synthetic CD: name contains .. ({})",
+                e.name
+            )));
+        }
+        let mut header = load_local_header(jar, e, cas_dir)?;
+        let (name, gpbf) = name_and_gpbf_from_local_header(&header)?;
+        if name.split(|&b| b == b'/' || b == b'\\').any(|c| c == b"..") {
+            return Err(AyzenpackError::FormatOwned(format!(
+                "synthetic CD: name contains .. ({})",
+                e.name
+            )));
+        }
+        let cdata = resolve_cdata(jar, e, cas_dir, true)?;
+        let (method, crc, uncomp) = rebuild_index_fields(e);
+        patch_local_rebuild_fields(
+            &mut header,
+            method,
+            crc,
+            cdata.len() as u64,
+            uncomp,
+            &jar.name,
+        )?;
+        let desc = match &e.data_descriptor_hex {
+            Some(h) => Some(patch_data_descriptor(
+                &parse_hex(h)?,
+                crc,
+                cdata.len() as u64,
+                uncomp,
+                &jar.name,
+            )?),
+            None => None,
+        };
+        let zip_rel = locals.len() as u64;
+        locals.extend_from_slice(&header);
+        locals.extend_from_slice(&cdata);
+        if let Some(d) = &desc {
+            locals.extend_from_slice(d);
+        }
+        cd_entries.push(SyntheticCdEntry {
+            name,
+            method,
+            gpbf,
+            dos_time: e.dos_time,
+            dos_date: e.dos_date,
+            crc,
+            compressed_size: cdata.len() as u64,
+            uncompressed_size: uncomp,
+            local_offset: arm2_cd_local_offset(prefix_len, zip_rel, &jar.name)?,
+            unix_mode: e.unix_mode,
+        });
+    }
+
+    let cd_start = prefix_len
+        .checked_add(locals.len() as u64)
+        .ok_or_else(|| AyzenpackError::FormatOwned(format!("{} concat overflow", jar.name)))?;
+    let cd = write_synthetic_cd(&cd_entries, cd_start, jar.comment.as_bytes())?;
+    file.write_all(&locals)
         .map_err(|source| AyzenpackError::Io {
             source,
             path: Some(dest.to_path_buf()),
@@ -1562,7 +1669,13 @@ mod tests {
             ..RehydrateOptions::default()
         };
 
-        for backend in ["exact", "rebuild", "zipwriter", "skip_exact_seek"] {
+        for backend in [
+            "exact",
+            "rebuild",
+            "zipwriter",
+            "skip_exact_seek",
+            "skip_exact_concat",
+        ] {
             fs::write(&dest, orig).unwrap();
             FAIL_AFTER_RESTORE_TMP_OPEN.with(|c| c.set(true));
             let err = match backend {
@@ -1570,6 +1683,7 @@ mod tests {
                 "rebuild" => write_rebuilt_jar(&jar, &cas, &dest, false),
                 "zipwriter" => write_jar(&opts, &jar, &cas, &dest, false),
                 "skip_exact_seek" => write_skip_exact_seek(&jar, &cas, &dest, false),
+                "skip_exact_concat" => write_skip_exact_concat(&jar, &cas, &dest, false),
                 _ => unreachable!(),
             }
             .unwrap_err();

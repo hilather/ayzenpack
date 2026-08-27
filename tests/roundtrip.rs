@@ -2881,6 +2881,38 @@ fn first_cd_local_header_offset(buf: &[u8]) -> u64 {
         assert!(i > 0, "EOCD");
         i -= 1;
     }
+
+fn first_cd_local_offset(buf: &[u8]) -> u64 {
+    let cd = classic_eocd_cd_offset(buf) as usize;
+    assert!(cd + 46 <= buf.len(), "CD record");
+    assert_eq!(&buf[cd..cd + 4], b"PK\x01\x02");
+    u32::from_le_bytes(buf[cd + 42..cd + 46].try_into().unwrap()) as u64
+}
+
+/// Compressed payload after the named local header (no data-descriptor fixtures).
+fn local_cdata(buf: &[u8], name: &str) -> Vec<u8> {
+    let want = name.as_bytes();
+    let mut i = 0usize;
+    while i + 30 <= buf.len() {
+        if buf[i..i + 4] != *b"PK\x03\x04" {
+            i += 1;
+            continue;
+        }
+        let csize = u32::from_le_bytes(buf[i + 18..i + 22].try_into().unwrap()) as usize;
+        let name_len = u16::from_le_bytes([buf[i + 26], buf[i + 27]]) as usize;
+        let extra_len = u16::from_le_bytes([buf[i + 28], buf[i + 29]]) as usize;
+        if i + 30 + name_len + extra_len + csize > buf.len() {
+            break;
+        }
+        let n = &buf[i + 30..i + 30 + name_len];
+        let data_off = i + 30 + name_len + extra_len;
+        if n == want {
+            return buf[data_off..data_off + csize].to_vec();
+        }
+        i = data_off + csize;
+    }
+    panic!("local header missing {name}");
+ (Headers-present csize-changing skip-exact concatenates locals and synthesizes CD)
 }
 
 fn splice_truncated_cd_stub(path: &Path) {
@@ -3297,8 +3329,9 @@ fn truncated_cd_store_nested_unadjusted_fileabs_lists_outer() {
 }
 
 #[test]
-fn truncated_cd_unknown_deflate_sibling_is_arm2_zipwriter() {
+fn truncated_cd_unknown_deflate_sibling_is_arm2_concat() {
     // Arm 1 must not classify a miss as a hit (resolve_cdata false would miss cdata).
+    // Arm 2 concat must keep sibling codec-hit cdata (ZipWriter would re-deflate it).
     let dir = tempfile::tempdir().unwrap();
     let jar = dir.path().join("trunc-miss.jar");
     write_codec_hit_plus_unknown_deflate(
@@ -3311,7 +3344,9 @@ fn truncated_cd_unknown_deflate_sibling_is_arm2_zipwriter() {
     splice_truncated_cd_stub(&jar);
     let listed = ZipArchive::new(File::open(&jar).unwrap()).unwrap().len();
     assert_eq!(listed, 2, "fixture must stay listable");
-    let src_len = fs::metadata(&jar).unwrap().len();
+    let src = fs::read(&jar).unwrap();
+    let src_len = src.len() as u64;
+    let src_hit = local_cdata(&src, "hit.bin");
     let out = dir.path().join("out.ayz");
     dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
     let m = manifest_from_records(&read_archive(&out).2);
@@ -3327,6 +3362,15 @@ fn truncated_cd_unknown_deflate_sibling_is_arm2_zipwriter() {
             e.name
         );
     }
+    let hit = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.name == "hit.bin")
+        .expect("hit");
+    assert!(
+        hit.cdata_codec.is_some(),
+        "sibling codec hit must keep cdata_codec"
+    );
     let miss = m.jars[0]
         .entries
         .iter()
@@ -3340,12 +3384,110 @@ fn truncated_cd_unknown_deflate_sibling_is_arm2_zipwriter() {
     let dest = dir.path().join("restored");
     rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
     let restored = dest.join("trunc-miss.jar");
-    let got_len = fs::metadata(&restored).unwrap().len();
+    let got = fs::read(&restored).unwrap();
+    let got_len = got.len() as u64;
     assert!(
         got_len * 2 >= src_len,
         "restored {got_len} must stay in the same league as source {src_len}"
     );
     assert_functional_identity(&jar, &restored);
+    assert_eq!(
+        local_cdata(&got, "hit.bin"),
+        src_hit,
+        "arm 2 sibling codec hits must emit original cdata"
+    );
+}
+
+#[test]
+fn truncated_cd_method8_miss_prefix_fileabs_concat() {
+    // Prefixed arm 2 dest is FileAbs using concat zip_rel, not recorded offsetheader.
+    let dir = tempfile::tempdir().unwrap();
+    let inner = dir.path().join("inner.jar");
+    write_codec_hit_plus_unknown_deflate(
+        &inner,
+        "hit.bin",
+        b"hit-payload-aaaa",
+        "miss.bin",
+        b"miss-payload-bbbb",
+    );
+    splice_truncated_cd_stub(&inner);
+    let jar = dir.path().join("trunc-miss-prefix.jar");
+    let prefixed = fixtures::prepend_launcher(&fs::read(&inner).unwrap(), SPRING_LAUNCHER, false);
+    fs::write(&jar, &prefixed).unwrap();
+    let prefix_len = SPRING_LAUNCHER.len() as u64;
+    let src_len = prefixed.len() as u64;
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert!(m.jars[0].tail_blob.is_none());
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    assert!(!m.jars[0].bit_identical_restore());
+    assert!(!m.jars[0].metadata_rebuild());
+    assert_eq!(m.jars[0].prefix_size, Some(prefix_len));
+    for e in &m.jars[0].entries {
+        assert!(e.cdata_blob.is_none(), "{} cdata_blob", e.name);
+        assert!(
+            e.local_header_hex.is_some() || e.local_header_blob.is_some(),
+            "{} must capture a local header",
+            e.name
+        );
+    }
+    let first = &m.jars[0].entries[0];
+    let recorded_oh = first.offsetheader.expect("offsetheader");
+    let miss = m.jars[0]
+        .entries
+        .iter()
+        .find(|e| e.name == "miss.bin")
+        .expect("miss");
+    assert_eq!(miss.method_code, 8);
+    assert!(miss.cdata_codec.is_none());
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("trunc-miss-prefix.jar");
+    let got = fs::read(&restored).unwrap();
+    let got_len = got.len() as u64;
+    assert!(
+        got_len * 2 >= src_len,
+        "restored {got_len} must stay in the same league as source {src_len}"
+    );
+    assert_eq!(&got[..prefix_len as usize], SPRING_LAUNCHER);
+    let mut z = ZipArchive::new(File::open(&restored).unwrap()).unwrap();
+    assert!(
+        z.by_name("hit.bin").is_ok() && z.by_name("miss.bin").is_ok(),
+        "dest ZipArchive::new(File) must list outer names, not a nested latch"
+    );
+    drop(z);
+    let dest_first = first_cd_local_offset(&got);
+    assert_eq!(
+        dest_first, prefix_len,
+        "arm 2 FileAbs first local is prefix_len + zip_rel 0"
+    );
+    assert_ne!(
+        dest_first, 0,
+        "prefixed concat dest must not emit zip-rel CD offsets"
+    );
+    assert_ne!(
+        dest_first,
+        first.local_header_offset.unwrap_or(0),
+        "must not copy zip-rel local_header_offset into the synthetic CD"
+    );
+    assert_ne!(
+        dest_first,
+        miss.offsetheader.expect("miss offsetheader"),
+        "arm 2 must not copy a later slot's recorded offsetheader into the first CD record"
+    );
+    if recorded_oh != prefix_len {
+        assert_ne!(
+            dest_first, recorded_oh,
+            "arm 2 must not copy recorded offsetheader"
+        );
+    }
+    let src_hit = local_cdata(&prefixed, "hit.bin");
+    assert_eq!(
+        local_cdata(&got, "hit.bin"),
+        src_hit,
+        "prefixed arm 2 sibling codec hits must emit original cdata"
+    );
 }
 
 #[test]

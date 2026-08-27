@@ -227,12 +227,17 @@ fn docs_lock_leftover_junk_hash_policy_and_class_dedup() {
         "DESIGN.md must keep mix gates and gated corpus lucene/jackson source_*"
     );
     assert!(
-        DESIGN.contains(
-            "Arm 3 / arm 2-until-concat uses `write_jar` ZipWriter that STOREs `method_code == 0` / `zip_index` over uncompressed payload (`read_entry_content` / `reconstruct_child_zip`); never `resolve_cdata`"
-        ) && DESIGN.contains("Skip-exact arm 1")
+        DESIGN.contains("Skip-exact arm 2")
+            && DESIGN.contains("write_skip_exact_concat")
+            && DESIGN.contains("Never put recorded `offsetheader`")
+            && DESIGN.contains(
+                "Arm 3 (no captured headers: overlap / prefix+hole / slice `Err`) uses `write_jar` ZipWriter that STOREs `method_code == 0` / `zip_index` over uncompressed payload (`read_entry_content` / `reconstruct_child_zip`); never `resolve_cdata`"
+            )
+            && DESIGN.contains("Skip-exact arm 1")
             && DESIGN.contains("stencil seek + synthetic CD")
-            && !DESIGN.contains("Remaining skip-exact uses `write_jar` ZipWriter"),
-        "DESIGN.md must document arm 1 synthetic CD and ZipWriter as arm 3 / arm 2-until-concat, never resolve_cdata"
+            && !DESIGN.contains("Remaining skip-exact uses `write_jar` ZipWriter")
+            && !DESIGN.contains("arm 2-until-concat"),
+        "DESIGN.md must document arm 1 seek, arm 2 concat + synthetic CD, and ZipWriter as arm 3 never resolve_cdata"
     );
     assert!(
         README.contains("Priorities: (1) lean pack (2) complete rehydrate (3) class-level dedup")
@@ -243,7 +248,8 @@ fn docs_lock_leftover_junk_hash_policy_and_class_dedup() {
             )
             && README.contains("Remaining homemade-`None` never gets `tail_blob`")
             && README.contains("Arm 1 homemade-`None` with captured headers is stencil seek + synthetic CD")
-            && README.contains("Arm 3 / arm 2-until-concat stays `ZipWriter` STORE")
+            && README.contains("Arm 2 csize-changing skip-exact is concat + synthetic CD")
+            && README.contains("Arm 3 stays `ZipWriter` STORE")
             && !README.contains("Synthetic CD is parked"),
         "README must document priorities, hash match iff bit_identical_restore, leftover-junk vs homemade-None, arm 1 synthetic CD"
     );
@@ -274,7 +280,8 @@ fn docs_lock_leftover_junk_hash_policy_and_class_dedup() {
             )
             && LIBRARY.contains("Remaining homemade-`None` never gets `tail_blob`")
             && LIBRARY.contains("Arm 1 homemade-`None` with captured headers is stencil seek + synthetic CD")
-            && LIBRARY.contains("Arm 3 / arm 2-until-concat ZipWriter STOREs")
+            && LIBRARY.contains("Arm 2 csize-changing skip-exact is concat + synthetic CD")
+            && LIBRARY.contains("Arm 3 ZipWriter STOREs")
             && !LIBRARY.contains("Synthetic CD is parked")
             && LIBRARY.contains("never CAS `blake3(inner zip)`")
             && LIBRARY.contains("Do not store `cdata_blob`")
