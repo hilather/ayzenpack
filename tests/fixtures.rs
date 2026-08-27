@@ -755,10 +755,16 @@ pub fn write_zlib_deflate_zip(path: &Path, name: &str, data: &[u8]) {
     write_deflate_cdata_zip(path, name, data, &cdata);
 }
 
-/// zlib-rs level 3: valid inflate, not in the closed codec set (true miss).
+/// Valid inflate that is not zlib/flate2/stored (empty stored prefix + zlib-6).
+pub fn unknown_deflate(plain: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x00, 0x00, 0x00, 0xff, 0xff];
+    out.extend_from_slice(&zlib_raw_deflate(plain, 6));
+    out
+}
+
+/// zlib-rs level 3 is not a reliable miss (can collide with zlib-6).
 pub fn write_unknown_deflate_zip(path: &Path, name: &str, data: &[u8]) {
-    let cdata = zlib_raw_deflate(data, 3);
-    write_deflate_cdata_zip(path, name, data, &cdata);
+    write_deflate_cdata_zip(path, name, data, &unknown_deflate(data));
 }
 
 pub fn write_unknown_deflate_wrapped(path: &Path, launcher: &[u8], name: &str, data: &[u8]) {
@@ -795,7 +801,7 @@ pub fn write_codec_hit_plus_unknown_deflate(
                 method: 8,
                 crc: crc32fast::hash(miss),
                 uncomp: miss.len() as u32,
-                cdata: zlib_raw_deflate(miss, 3),
+                cdata: unknown_deflate(miss),
                 extra: Vec::new(),
             },
         ],

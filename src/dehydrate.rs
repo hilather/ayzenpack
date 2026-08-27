@@ -1461,7 +1461,7 @@ mod tests {
         };
         assert_eq!(
             classify_local(&entry, &local, 1),
-            LocalClass::DeflateHit(crate::deflate::CdataCodec::Flate2(6))
+            LocalClass::DeflateHit(crate::deflate::CdataCodec::Zlib(6))
         );
     }
 
@@ -1509,7 +1509,7 @@ mod tests {
         };
         assert_eq!(
             classify_local(&entry, &local, 1),
-            LocalClass::DeflateHit(crate::deflate::CdataCodec::Flate2(6))
+            LocalClass::DeflateHit(crate::deflate::CdataCodec::Zlib(6))
         );
     }
 

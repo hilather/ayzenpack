@@ -277,16 +277,24 @@ mod tests {
         );
     }
 
+    /// Empty non-final stored block + a closed-set stream. Inflates, but is not
+    /// a zlib/flate2/stored hit (Test 4 unknown-deflate).
+    pub fn unknown_deflate_prefix(plain: &[u8]) -> Result<Vec<u8>> {
+        let mut out = vec![0x00, 0x00, 0x00, 0xff, 0xff];
+        out.extend_from_slice(&zlib_raw_deflate(plain, 6)?);
+        Ok(out)
+    }
+
     #[test]
-    fn zlib_level_3_is_unknown_deflate_miss() {
+    fn unknown_deflate_prefix_is_miss() {
         let plain = b"unknown-deflate sibling miss payload".repeat(8);
-        let cdata = zlib_raw_deflate(&plain, 3).unwrap();
+        let cdata = unknown_deflate_prefix(&plain).unwrap();
         assert_eq!(inflate_raw(&cdata).unwrap(), plain.as_slice());
         assert_eq!(match_flate2(&plain, &cdata, 0).unwrap(), None);
         assert_eq!(
             match_deflate(&plain, &cdata, 0).unwrap(),
             None,
-            "zlib-3 is outside the closed set and must stay a miss"
+            "prefixed bitstream must stay a miss"
         );
     }
 

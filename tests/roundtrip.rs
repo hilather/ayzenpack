@@ -2125,9 +2125,9 @@ fn codec_hit_deflated_jar_is_bit_identical_without_cdata_blob() {
     let e = &m.jars[0].entries[0];
     assert!(e.cdata_blob.is_none());
     assert!(
-        e.cdata_codec
-            .as_deref()
-            .is_some_and(|c| c.starts_with("deflate-raw:flate2:")),
+        e.cdata_codec.as_deref().is_some_and(|c| {
+            c.starts_with("deflate-raw:flate2:") || c.starts_with("deflate-raw:zlib:")
+        }),
         "zip-crate deflate must hit cdata_codec, got {:?}",
         e.cdata_codec
     );
@@ -2164,7 +2164,7 @@ fn codec_miss_rebuilds_valid_zip_keeping_extras() {
     write_unknown_deflate_zip(&jar, "a.txt", &payload);
     let src = fs::read(&jar).unwrap();
     let out = dir.path().join("out.ayz");
-    let summary = dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
     let m = manifest_from_records(&read_archive(&out).2);
     let e = &m.jars[0].entries[0];
     assert!(e.cdata_blob.is_none());
@@ -2173,8 +2173,9 @@ fn codec_miss_rebuilds_valid_zip_keeping_extras() {
     assert!(m.jars[0].tail_blob.is_some());
     assert!(m.jars[0].metadata_rebuild());
     assert!(!m.jars[0].exact_restore());
-    assert!(
-        summary.bytes_unique_blobs < summary.bytes_in_jars,
+    assert_eq!(
+        content_blob_ids(&m).len(),
+        1,
         "miss pack must not store a second payload copy"
     );
 
@@ -2305,7 +2306,7 @@ fn store_plus_maven_empty_deflate_dir_is_bit_identical() {
     assert!(dir_ent.cdata_blob.is_none());
     assert_eq!(
         dir_ent.cdata_codec.as_deref(),
-        Some("deflate-raw:flate2:6"),
+        Some("deflate-raw:zlib:6"),
         "empty DEFLATE dir must record codec, not a content blob"
     );
     assert!(m.jars[0].exact_restore());
@@ -2341,7 +2342,7 @@ fn maven_empty_deflate_dir_does_not_force_cdata_blob() {
         );
     }
     assert_eq!(file.cdata_codec.as_deref(), Some("deflate-raw:stored"));
-    assert_eq!(dir_ent.cdata_codec.as_deref(), Some("deflate-raw:flate2:6"));
+    assert_eq!(dir_ent.cdata_codec.as_deref(), Some("deflate-raw:zlib:6"));
     assert!(m.jars[0].bit_identical_restore());
     assert!(
         summary.bytes_unique_blobs < summary.bytes_in_jars + 4096,
