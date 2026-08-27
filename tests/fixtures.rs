@@ -922,7 +922,7 @@ fn write_deflate_cdata_zip(path: &Path, name: &str, data: &[u8], cdata: &[u8]) {
     std::fs::write(path, replace_first_cdata(&tpl, cdata)).unwrap();
 }
 
-/// DEFLATE member whose raw cdata is a zlib-rs bitstream (closed set {1,6,9}).
+/// DEFLATE member whose raw cdata is a zlib-rs bitstream (closed set {1,3,6,9}).
 pub fn write_zlib_deflate_zip(path: &Path, name: &str, data: &[u8]) {
     let cdata = zlib_raw_deflate(data, 6);
     write_deflate_cdata_zip(path, name, data, &cdata);
@@ -935,7 +935,7 @@ pub fn unknown_deflate(plain: &[u8]) -> Vec<u8> {
     out
 }
 
-/// zlib-rs level 3 is not a reliable miss (can collide with zlib-6).
+/// Not zlib/flate2/stored (empty stored prefix + zlib-6). zlib-3 is a closed-set hit.
 pub fn write_unknown_deflate_zip(path: &Path, name: &str, data: &[u8]) {
     write_deflate_cdata_zip(path, name, data, &unknown_deflate(data));
 }

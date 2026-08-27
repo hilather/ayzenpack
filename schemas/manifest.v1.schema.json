@@ -155,7 +155,7 @@
         "cdata_blob": { "$ref": "#/$defs/hex64" },
         "cdata_codec": {
           "type": "string",
-          "pattern": "^deflate-raw:(flate2:[1369]|zlib:[169]|stored)$"
+          "pattern": "^deflate-raw:(flate2:[1369]|zlib:[1369]|stored)$"
         },
         "local_header_offset": { "type": "integer", "minimum": 0 },
         "local_header_hex": { "type": "string", "pattern": "^([0-9a-f]{2})+$" },

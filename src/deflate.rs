@@ -15,7 +15,8 @@ pub const FLATE2_PREFIX: &str = "deflate-raw:flate2:";
 pub const ZLIB_PREFIX: &str = "deflate-raw:zlib:";
 pub const STORED_CODEC: &str = "deflate-raw:stored";
 const DEFAULT_REBUILD_LEVEL: u32 = 6;
-const ZLIB_LEVELS: [u32; 3] = [1, 6, 9];
+/// Trial remainder after GPBF hint. Pin this order; first-match-wins on collision.
+const ZLIB_LEVELS: [u32; 4] = [1, 3, 6, 9];
 
 /// Closed codec set recorded on a hit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,7 +163,7 @@ pub fn parse_codec(codec: &str) -> Result<CdataCodec> {
         let level: u32 = rest.parse().map_err(|_| {
             AyzenpackError::FormatOwned(format!("unrecognized cdata_codec {codec}"))
         })?;
-        if !matches!(level, 1 | 6 | 9) {
+        if !matches!(level, 1 | 3 | 6 | 9) {
             return Err(AyzenpackError::FormatOwned(format!(
                 "unrecognized cdata_codec {codec}"
             )));
@@ -188,8 +189,8 @@ pub fn match_flate2(plain: &[u8], want: &[u8], flags: u16) -> Result<Option<u32>
     Ok(None)
 }
 
-/// First matching codec, or `None`. Order: zlib GPBF∩{1,6,9}, remaining zlib
-/// {1,6,9}, flate2 trial_levels, then stored.
+/// First matching codec, or `None`. Order: zlib GPBF∩{1,3,6,9}, remaining zlib
+/// {1,3,6,9}, flate2 trial_levels, then stored. First-match-wins.
 pub fn match_deflate(plain: &[u8], want: &[u8], flags: u16) -> Result<Option<CdataCodec>> {
     let hint = gpbf_deflate_hint(flags);
     let mut zlib_order = Vec::new();
@@ -317,6 +318,33 @@ mod tests {
     }
 
     #[test]
+    fn zlib_raw_level_3_is_flate2_miss_and_zlib_hit() {
+        let plain = b"zlib-rs gpbf-fast level-3 fixture payload".repeat(8);
+        let c3 = zlib_raw_deflate(&plain, 3).unwrap();
+        let c1 = zlib_raw_deflate(&plain, 1).unwrap();
+        let c6 = zlib_raw_deflate(&plain, 6).unwrap();
+        let c9 = zlib_raw_deflate(&plain, 9).unwrap();
+        assert_ne!(c3, c1);
+        assert_ne!(c3, c6);
+        assert_ne!(c3, c9);
+        assert_eq!(inflate_raw_capped(&c3, u64::MAX).unwrap(), plain.as_slice());
+        assert_eq!(
+            match_flate2(&plain, &c3, 1 << 2).unwrap(),
+            None,
+            "baked zlib-3 bitstream must not be a miniz collision"
+        );
+        // flags=0 tries zlib-6 first; distinguishing payload still matches 3.
+        assert_eq!(
+            match_deflate(&plain, &c3, 0).unwrap(),
+            Some(CdataCodec::Zlib(3))
+        );
+        assert_eq!(
+            match_deflate(&plain, &c3, 1 << 2).unwrap(),
+            Some(CdataCodec::Zlib(3))
+        );
+    }
+
+    #[test]
     fn parse_codec_accepts_closed_set() {
         assert_eq!(
             parse_codec("deflate-raw:flate2:6").unwrap(),
@@ -326,9 +354,13 @@ mod tests {
             parse_codec("deflate-raw:zlib:9").unwrap(),
             CdataCodec::Zlib(9)
         );
+        assert_eq!(
+            parse_codec("deflate-raw:zlib:3").unwrap(),
+            CdataCodec::Zlib(3)
+        );
         assert_eq!(parse_codec(STORED_CODEC).unwrap(), CdataCodec::Stored);
         assert!(parse_codec("deflate-raw:flate2:2").is_err());
-        assert!(parse_codec("deflate-raw:zlib:3").is_err());
+        assert!(parse_codec("deflate-raw:zlib:2").is_err());
         assert!(parse_codec("zlib:6").is_err());
     }
 

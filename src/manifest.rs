@@ -401,7 +401,7 @@ mod tests {
         assert!(SCHEMA_JSON.contains("raw_zip_blob"));
         assert!(SCHEMA_JSON.contains("cdata_blob"));
         assert!(SCHEMA_JSON.contains("cdata_codec"));
-        assert!(SCHEMA_JSON.contains("deflate-raw:(flate2:[1369]|zlib:[169]|stored)"));
+        assert!(SCHEMA_JSON.contains("deflate-raw:(flate2:[1369]|zlib:[1369]|stored)"));
         assert!(SCHEMA_JSON.contains("local_header_hex"));
         assert!(SCHEMA_JSON.contains("local_header_offset"));
         assert!(SCHEMA_JSON.contains("offsetheader"));

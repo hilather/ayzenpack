@@ -402,3 +402,25 @@ fn signed_jar_docs_do_not_claim_rebuild_breaks_jarsigner() {
         "DESIGN and README must say .SF / MANIFEST digest uncompressed entry bytes"
     );
 }
+
+#[test]
+fn docs_lock_closed_codec_set_includes_zlib_3() {
+    assert!(
+        DESIGN.contains("`deflate-raw:zlib:{1,3,6,9}`")
+            && AGENTS.contains("`deflate-raw:zlib:{1,3,6,9}`")
+            && README.contains("`deflate-raw:zlib:{1,3,6,9}`")
+            && LIBRARY.contains("`deflate-raw:zlib:{1,3,6,9}`"),
+        "closed codec set must include zlib-3 (deflate-raw:zlib:1,3,6,9)"
+    );
+    assert!(
+        SCHEMA.contains("zlib:[1369]"),
+        "schema cdata_codec pattern must accept zlib:3"
+    );
+    assert!(
+        !DESIGN.contains("`deflate-raw:zlib:{1,6,9}`")
+            && !AGENTS.contains("`deflate-raw:zlib:{1,6,9}`")
+            && !README.contains("`deflate-raw:zlib:{1,6,9}`")
+            && !LIBRARY.contains("`deflate-raw:zlib:{1,6,9}`"),
+        "live docs must not list zlib closed set without level 3"
+    );
+}
