@@ -591,25 +591,31 @@ fn corpus_mix_regular_and_spring_whole_file_hashes() {
             hash_match += 1;
             continue;
         }
-        assert!(
-            jar.metadata_rebuild(),
-            "{} hash mismatch must be metadata_rebuild (got neither exact nor rebuild)",
-            jar.name
-        );
-        let has_method8_file = jar.entries.iter().any(|e| !e.is_dir && e.method_code == 8);
-        let has_miss = jar
-            .entries
-            .iter()
-            .any(|e| !e.is_dir && e.method_code == 8 && e.cdata_codec.is_none());
-        assert!(
-            !has_method8_file || has_miss,
-            "{} is not bit-identical but every method-8 file has a codec (no proven miss)",
-            jar.name
-        );
+        // Hash match required iff bit_identical_restore; else valid ZIP +
+        // functional identity. Skip-exact (!tail && !raw_zip) must not be
+        // forced into metadata_rebuild().
+        let skip_exact = jar.tail_blob.is_none() && jar.raw_zip_blob.is_none();
+        if !skip_exact {
+            assert!(
+                jar.metadata_rebuild(),
+                "{} must be metadata_rebuild (got neither exact, rebuild, nor skip-exact)",
+                jar.name
+            );
+            let has_method8_file = jar.entries.iter().any(|e| !e.is_dir && e.method_code == 8);
+            let has_miss = jar
+                .entries
+                .iter()
+                .any(|e| !e.is_dir && e.method_code == 8 && e.cdata_codec.is_none());
+            assert!(
+                !has_method8_file || has_miss,
+                "{} is not bit-identical but every method-8 file has a codec (no proven miss)",
+                jar.name
+            );
+        }
         for e in &jar.entries {
             assert!(
                 e.cdata_blob.is_none(),
-                "{}!{} must not write cdata_blob on a rebuild jar",
+                "{}!{} must not write cdata_blob on a rebuild/skip-exact jar",
                 jar.name,
                 e.name
             );

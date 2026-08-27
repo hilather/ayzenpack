@@ -936,6 +936,32 @@ pub fn write_leftover_junk_plus_store_nested(path: &Path) {
     std::fs::write(path, buf).unwrap();
 }
 
+/// Listed zip whose homemade CD parse is `None` because a CD record is truncated
+/// (`extra_len` extends past EOCD `cd_size`). Not leftover junk after N complete
+/// records. ZipArchive still lists via EOCD entry count.
+pub fn write_truncated_cd_listed_zip(path: &Path) {
+    write_stored_zip(path, &[("a.txt", b"hello", crc32fast::hash(b"hello"))]);
+    let mut buf = std::fs::read(path).unwrap();
+    let eocd = {
+        let mut i = buf.len() - 22;
+        loop {
+            if buf[i..i + 4] == *b"PK\x05\x06" {
+                let comment_len = u16::from_le_bytes([buf[i + 20], buf[i + 21]]) as usize;
+                if i + 22 + comment_len == buf.len() {
+                    break i;
+                }
+            }
+            assert!(i > 0);
+            i -= 1;
+        }
+    };
+    let cd_off = u32::from_le_bytes(buf[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+    assert_eq!(&buf[cd_off..cd_off + 4], b"PK\x01\x02");
+    let extra_len = u16::from_le_bytes(buf[cd_off + 30..cd_off + 32].try_into().unwrap());
+    buf[cd_off + 30..cd_off + 32].copy_from_slice(&(extra_len + 8).to_le_bytes());
+    std::fs::write(path, buf).unwrap();
+}
+
 /// STORE zip with GPBF bit 0 set so rust zip reports `encrypted()`.
 pub fn write_encrypted_store_zip(path: &Path) {
     write_stored_zip(path, &[("secret.txt", b"hi", crc32fast::hash(b"hi"))]);

@@ -3,7 +3,8 @@
 //! New packs keep ZIP metadata (local headers + CD tail) and either splice a
 //! reproduced bitstream (`cdata_codec` / STORE / legacy `cdata_blob`) or rebuild
 //! a valid ZIP with patched sizes. Archives without those fields keep the 0.1.x
-//! `ZipWriter` path (functional identity). Prefix bytes are always bit-exact.
+//! `ZipWriter` path (STORE `method_code == 0` / `zip_index`; functional identity).
+//! Prefix bytes are always bit-exact.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -862,7 +863,10 @@ fn write_jar(
         let dt = DateTime::try_from_msdos(e.dos_date, e.dos_time)
             .unwrap_or_else(|_| DateTime::default());
 
-        let stored = e.is_dir || opts.store_all;
+        // Skip-exact: STORE method 0 / zip_index so nested STORE libs stay STORE.
+        // Payload is uncompressed (read_entry_content / reconstruct_child_zip);
+        // never resolve_cdata / encode_codec on this path.
+        let stored = e.is_dir || opts.store_all || e.method_code == 0 || e.zip_index.is_some();
         let method = if stored {
             CompressionMethod::Stored
         } else {

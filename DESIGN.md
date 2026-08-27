@@ -167,7 +167,7 @@ Root: `format`, `version`, `hash_algo`, `mode`, `jars[]`, `blobs[]`, `stats`.
 
 `blobs[]` is first-seen order (must match BLOB records and END). `jars[].entries[]` is central-directory order. Directory entries have `blob: null`. `jars[].name` is a single path segment; `..`, `/`, `\` are rejected.
 
-v1 **content** rebuild (old archives) uses `name` (Unicode from `ZipFile::name()`), `is_dir`, `blob`, `crc32`, `dos_*` via `DateTime::try_from_msdos` with `DateTime::default()` fallback, and `unix_mode`. `utf8_flag` is recorded only. `name_raw_hex` is not used on write. `method` is advisory: rebuilt files deflate, directories store, unless `--store-all`.
+v1 **content** rebuild (old archives) uses `name` (Unicode from `ZipFile::name()`), `is_dir`, `blob`, `crc32`, `dos_*` via `DateTime::try_from_msdos` with `DateTime::default()` fallback, and `unix_mode`. `utf8_flag` is recorded only. `name_raw_hex` is not used on write. Skip-exact ZipWriter (no `tail_blob`) STOREs directories, `--store-all`, `method_code == 0`, and `zip_index`; method-8 files DEFLATE at `deflate_level`. Payload is always uncompressed (`read_entry_content` / `reconstruct_child_zip`); never `resolve_cdata`.
 
 New packs store optional ZIP-slot index fields (omitted when absent, same style as `prefix_blob`). Unknown keys stay ignored on read. These fields point at CAS blobs and record local-header / tail bytes. They are not a license to store a second copy of entry payloads.
 
@@ -201,13 +201,14 @@ Rehydrate builds a **valid ZIP** from index + blobs. Paths, in order:
 - **DEFLATE codec hit:** optional `cdata_codec` when a pack-time trial matched original cdata: `deflate-raw:zlib:{1,6,9}` (in-process zlib-rs, raw/nowrap), `deflate-raw:flate2:{1,3,6,9}` (existing miniz), or `deflate-raw:stored` (BTYPE 00). Rehydrate encodes and splices. A hit is luck, not a goal. A miss must not drop sibling codecs.
 - **Child `zip_index`:** reconstruct the nested ZIP from `jars[].nestedindexes[i]` + CAS (`reconstruct_child_zip`), then splice or rebuild that outer slot. Depth 1. `blob` is null. Never a second whole-ZIP CAS.
 - **Otherwise rebuild:** neither `cdata_blob` nor `cdata_codec`. Patch local header / data descriptor / CD / EOCD (and Zip64 extras that already exist). Same names, CD order, timestamps, extras, uncompressed bytes. New compressed sizes. **`source_*` may change. That is acceptable.** Signed JARs on this path use the existing “rebuild will break the signature” warning.
+- **Skip-exact** (no `tail_blob`, no `raw_zip`; remaining homemade-`None`, overlap, slice `Err`): `zip::ZipWriter`. Payload is always uncompressed (`read_entry_content` / `reconstruct_child_zip`). STORE when `is_dir`, `--store-all`, `method_code == 0`, or `zip_index`. Method-8 misses DEFLATE at `deflate_level` (zip crate, not `deflate_raw` 6). Never `resolve_cdata` / `encode_codec`. Never seek `offsetheader`. Never `verify_source_identity`. Nested STORE `zip_index` members stay STORE (reassembled from shared class blobs; never late-CAS `blake3(inner zip)`). Dest size stays in the same league (`restored * 2 >= source`). **`source_*` may change.**
 - **Legacy `cdata_blob`:** read 0.1.6–0.1.8 dual-copy packs and 0.2.0 MixedExact leftovers. **Never write this shape again.** Maven/Java empty DEFLATE directories (`03 00`, usize 0) are codec/empty, not exotic.
 
 Per jar: `tail_blob` / `tail_size` is the CD-through-EOF index blob (structural, not a second copy of entry payloads).
 
 `raw_zip_blob` is only for a zip that cannot be listed at all. It is not the codec-miss path, not the exotic-sibling path, and not a slice/count-mismatch fallback.
 
-**Old archives** (no tail / `raw_zip`): keep the 0.1.x `ZipWriter` path. `--verbatim` is not a CLI flag.
+**Old archives** (no tail / `raw_zip`): keep the 0.1.x `ZipWriter` path, with STORE for `method_code == 0` and `zip_index`. `--verbatim` is not a CLI flag.
 
 ```
 ∀ jar (STORE splice / codec-hit / zip_index / legacy cdata_blob / raw_zip):
@@ -218,6 +219,11 @@ Per jar: `tail_blob` / `tail_size` is the CD-through-EOF index blob (structural,
 
 ∀ jar (rebuild):
   ZipArchive opens; names, CD order, uncompressed bytes match
+  source_* are the original file and are not verified
+
+∀ jar (skip-exact):
+  ZipArchive opens; names, uncompressed bytes, CRC match
+  method_code 0 / zip_index members are STORE
   source_* are the original file and are not verified
 ```
 
@@ -256,7 +262,7 @@ The original JAR is still gone after dehydrate. The index is a ratarmount-style 
 
 Closed codec set (record the id that hit original cdata; restore re-encodes): STORE; `deflate-raw:zlib:{1,6,9}` (in-process zlib-rs, not a Java `Deflater` process); `deflate-raw:flate2:{1,3,6,9}`; `deflate-raw:stored`. Other methods rebuild **that entry**. No new `cdata_blob`. A miss must not drop sibling codecs.
 
-A healthy zip -A fat whose first local is the prefix already slices on 0.2.3. Remaining skip-exact: homemade CD parse `None` (**never** `tail_blob`; `write_jar`) and leading pad (`leading_pad_blob` on a PK-start hole, do not extend `prefix_len`; prefix+hole stays skip-exact). Decide `zip_index` vs opaque before `jobs==1` `commit_blob` and before `--jobs` `spawn_file` via `scan_from_bytes` + `slice_from_bytes` on the STORE payload. After the child `NestedIndex` is built, `probe_explode` reconstructs against the in-hand pending blobs and requires those bytes equal the STORE payload. Mismatch (including child codec length) is opaque `commit_blob` of the combined ZIP **instead of** explode — never both. Do not use `Jar::bit_identical_restore()` as the probe predicate (child tail is still pending). Child `Encrypted` / empty listing / overlap / homemade count mismatch / ZipArchive latch / listing `uncompressed_size` > `--max-entry-bytes` / file-entry count > 65535 → opaque (do not fail the outer). Opaque is **instead of** explode: one combined-inner blob, not a latched inner-inner `zip_index` and not explode-plus-inner dual copy. Prefixed children already ran `zip_archive_opens` in `detect_zip_layout`. If `prefix_len == 0`, `scan_from_bytes` still requires homemade CD count (`find_cd_bounds`) == `ZipArchive::len()`; mismatch is `Err`. Do not require first `header_start == 0` (that is leading_pad). Encrypted outer still fails. `--jobs` applies inner `remember_blob` only from `Sequenced::Exploded` (one seq; first-seen stays jobs-invariant). Child stencil is tail-bearing (child `leading_pad_blob` if the inner ZIP has a hole); cap child file entries at 65535. Never CAS the whole inner ZIP if the slot is a `zip_index`. `verify` / `write_jar` / exact / rebuild all use `reconstruct_child_zip(index, get_blob)`.
+A healthy zip -A fat whose first local is the prefix already slices on 0.2.3. Remaining skip-exact: homemade CD parse `None` (**never** `tail_blob`; `write_jar` STOREs `method_code == 0` / `zip_index`) and leading pad (`leading_pad_blob` on a PK-start hole, do not extend `prefix_len`; prefix+hole stays skip-exact). Decide `zip_index` vs opaque before `jobs==1` `commit_blob` and before `--jobs` `spawn_file` via `scan_from_bytes` + `slice_from_bytes` on the STORE payload. After the child `NestedIndex` is built, `probe_explode` reconstructs against the in-hand pending blobs and requires those bytes equal the STORE payload. Mismatch (including child codec length) is opaque `commit_blob` of the combined ZIP **instead of** explode — never both. Do not use `Jar::bit_identical_restore()` as the probe predicate (child tail is still pending). Child `Encrypted` / empty listing / overlap / homemade count mismatch / ZipArchive latch / listing `uncompressed_size` > `--max-entry-bytes` / file-entry count > 65535 → opaque (do not fail the outer). Opaque is **instead of** explode: one combined-inner blob, not a latched inner-inner `zip_index` and not explode-plus-inner dual copy. Prefixed children already ran `zip_archive_opens` in `detect_zip_layout`. If `prefix_len == 0`, `scan_from_bytes` still requires homemade CD count (`find_cd_bounds`) == `ZipArchive::len()`; mismatch is `Err`. Do not require first `header_start == 0` (that is leading_pad). Encrypted outer still fails. `--jobs` applies inner `remember_blob` only from `Sequenced::Exploded` (one seq; first-seen stays jobs-invariant). Child stencil is tail-bearing (child `leading_pad_blob` if the inner ZIP has a hole); cap child file entries at 65535. Never CAS the whole inner ZIP if the slot is a `zip_index`. `verify` / `write_jar` / exact / rebuild all use `reconstruct_child_zip(index, get_blob)`.
 
 Old packs still read (opaque nested blob, flate2-only `cdata_codec`, zip-rel `local_header_offset`). New packs may add `offsetheader` / `data_start` / `zip_index` / `nestedindexes`. 0.2.3 cannot restore a pack that replaced a nested blob with `zip_index`.
 

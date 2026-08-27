@@ -2015,7 +2015,7 @@ fn content_mode_archive_still_rehydrates_via_zipwriter() {
         &jar,
         &[JarEntry::File {
             name: "payload.bin",
-            data: b"content-mode-should-deflate",
+            data: b"content-mode-should-store",
             method: CompressionMethod::Stored,
         }],
     );
@@ -2038,15 +2038,10 @@ fn content_mode_archive_still_rehydrates_via_zipwriter() {
     rehydrate(&rehydrate_opts(&crafted, &dest)).unwrap();
     let restored = dest.join("stored.jar");
     assert_functional_identity(&jar, &restored);
-    assert_ne!(
-        fs::read(&jar).unwrap(),
-        fs::read(&restored).unwrap(),
-        "content-mode ZipWriter must not be bit-identical for a stored source"
-    );
-    let mut out_z = ZipArchive::new(File::open(&restored).unwrap()).unwrap();
     assert_eq!(
-        out_z.by_index(0).unwrap().compression(),
-        CompressionMethod::Deflated
+        entry_compression(&restored, "payload.bin"),
+        CompressionMethod::Stored,
+        "content-mode ZipWriter STOREs method_code 0"
     );
 }
 
@@ -2581,11 +2576,26 @@ fn store_nested_zipa_matt_cli_zip_index() {
     assert_eq!(fs::read(&jar).unwrap(), src);
 }
 
+fn entry_compression(path: &Path, name: &str) -> CompressionMethod {
+    let mut z = ZipArchive::new(File::open(path).unwrap()).unwrap();
+    let file = z.by_name(name).unwrap();
+    let method = file.compression();
+    drop(file);
+    method
+}
+
 #[test]
 fn skip_exact_outer_explodes_store_inner() {
     let dir = tempfile::tempdir().unwrap();
     let jar = dir.path().join("overlap-nested.jar");
     write_overlapping_local_plus_store_nested(&jar);
+    let src_len = fs::metadata(&jar).unwrap().len();
+    let src_map = entry_map(&jar);
+    assert!(
+        src_map.contains_key("lib/inner.jar"),
+        "source must be the outer listing, got {:?}",
+        src_map.keys()
+    );
     let mut z = ZipArchive::new(File::open(&jar).unwrap()).unwrap();
     let mut inner = Vec::new();
     z.by_name("lib/inner.jar")
@@ -2594,11 +2604,21 @@ fn skip_exact_outer_explodes_store_inner() {
         .unwrap();
     drop(z);
     let out = dir.path().join("out.ayz");
-    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    matt_dehydrate(&out, &jar);
     let records = read_archive(&out).2;
     let m = manifest_from_records(&records);
     assert!(m.jars[0].tail_blob.is_none());
     assert!(m.jars[0].raw_zip_blob.is_none());
+    assert!(!m.jars[0].bit_identical_restore());
+    assert!(!m.jars[0].metadata_rebuild());
+    for e in &m.jars[0].entries {
+        assert!(e.cdata_blob.is_none(), "{} cdata_blob", e.name);
+    }
+    for nested in &m.jars[0].nestedindexes {
+        for e in &nested.entries {
+            assert!(e.cdata_blob.is_none(), "nested {} cdata_blob", e.name);
+        }
+    }
     let e = m.jars[0]
         .entries
         .iter()
@@ -2607,7 +2627,10 @@ fn skip_exact_outer_explodes_store_inner() {
     assert!(e.blob.is_none());
     assert!(e.zip_index.is_some());
     let inner_hex = ayzenpack::hashutil::hex_lower(&blake3_bytes(&inner));
-    assert!(!m.blobs.iter().any(|b| b.blake3 == inner_hex));
+    assert!(
+        !m.blobs.iter().any(|b| b.blake3 == inner_hex),
+        "blake3(inner zip) must not be in blobs[]"
+    );
     let payloads = blob_payloads(&records);
     let idx = e.zip_index.expect("zip_index");
     let got = ayzenpack::reconstruct_child_zip(
@@ -2620,11 +2643,22 @@ fn skip_exact_outer_explodes_store_inner() {
     )
     .unwrap();
     assert_eq!(got, inner);
+    // SAME-payload (a.txt/b.txt) + inner n.txt; not a second encoding of the inner zip.
+    assert_eq!(content_blob_ids(&m).len(), 2, "unique content not doubled");
     verify(&out).unwrap();
-    let dest = dir.path().join("restored");
-    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
-    let restored = dest.join("overlap-nested.jar");
-    let mut z = ZipArchive::new(File::open(&restored).unwrap()).unwrap();
+    matt_rehydrate(&out);
+    let got_len = fs::metadata(&jar).unwrap().len();
+    assert!(
+        got_len * 2 >= src_len,
+        "restored {got_len} must stay in the same league as source {src_len}"
+    );
+    assert_eq!(entry_map(&jar), src_map);
+    assert_eq!(
+        entry_compression(&jar, "lib/inner.jar"),
+        CompressionMethod::Stored
+    );
+    assert_eq!(entry_compression(&jar, "a.txt"), CompressionMethod::Stored);
+    let mut z = ZipArchive::new(File::open(&jar).unwrap()).unwrap();
     let mut got_inner = Vec::new();
     z.by_name("lib/inner.jar")
         .unwrap()
@@ -2801,6 +2835,44 @@ fn leftover_junk_plus_store_nested_is_exact_zip_index() {
         CompressionMethod::Stored
     );
     assert_eq!(fs::read(&restored).unwrap(), src);
+}
+
+#[test]
+fn listed_true_homemade_none_has_no_tail_blob() {
+    // Truncated/malformed CD (not leftover junk after N matching records).
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("truncated-cd.jar");
+    write_truncated_cd_listed_zip(&jar);
+    let listed = ZipArchive::new(File::open(&jar).unwrap()).unwrap().len();
+    assert!(listed >= 1, "fixture must stay listable");
+    let src_len = fs::metadata(&jar).unwrap().len();
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert!(
+        m.jars[0].tail_blob.is_none(),
+        "remaining homemade-None must never get tail_blob"
+    );
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    assert!(!m.jars[0].bit_identical_restore());
+    assert!(!m.jars[0].metadata_rebuild());
+    for e in &m.jars[0].entries {
+        assert!(e.cdata_blob.is_none(), "{} cdata_blob", e.name);
+    }
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("truncated-cd.jar");
+    let got_len = fs::metadata(&restored).unwrap().len();
+    assert!(
+        got_len * 2 >= src_len,
+        "restored {got_len} must stay in the same league as source {src_len}"
+    );
+    assert_functional_identity(&jar, &restored);
+    assert_eq!(
+        entry_compression(&restored, "a.txt"),
+        CompressionMethod::Stored,
+        "method-0 files must STORE on skip-exact ZipWriter"
+    );
 }
 
 #[test]
