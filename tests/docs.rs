@@ -293,3 +293,58 @@ fn docs_lock_leftover_junk_hash_policy_and_class_dedup() {
         "docs/library.md must document priorities, leftover-junk exact vs homemade-None, seek-walk, arm 1 synthetic CD, and absolute HTTPS links"
     );
 }
+
+#[test]
+fn docs_lock_synthetic_cd_hash_policy_fileabs_and_corpus() {
+    // Full sentences, not keyword soup. An inverted stub must fail.
+    assert!(
+        DESIGN.contains("**must not** require original-file match")
+            && DESIGN.contains("Locals-region identity")
+            && DESIGN.contains("FileAbs iff `prefix_size > 0`")
+            && DESIGN.contains("Homemade-`None` arm 1 is stencil-faithful skip-exact"),
+        "DESIGN.md hash policy must require locals-region + FileAbs listing on homemade-None, not original-file source_*"
+    );
+    assert!(
+        DESIGN.contains("### FileAbs listing oracle")
+            && DESIGN.contains("**`scan_jar` / `ZipView(prefix)`**")
+            && DESIGN.contains("**Do not** rewrite `assert_functional_identity`")
+            && DESIGN.contains("when `jar.tail_blob.is_none() && jar.prefix_size.unwrap_or(0) > 0`"),
+        "DESIGN.md must document FileAbs listing oracle per (arm, prefix) without rewriting mix assert_functional_identity"
+    );
+    assert!(
+        DESIGN.contains("### Corpus lucene/jackson `source_*`")
+            && DESIGN.contains("AYZENPACK_CORPUS_DIR=/path/to/corpus cargo test --test corpus")
+            && DESIGN.contains("ci/download-corpus.sh")
+            && DESIGN.contains("only when every printed line has `miss=0` and `exact=true`")
+            && DESIGN.contains(
+                "https://github.com/hilather/ayzenpack/blob/main/ci/download-corpus.sh"
+            ),
+        "DESIGN.md must document AYZENPACK_CORPUS_DIR enablement with absolute HTTPS links; not always-on until 100% hits"
+    );
+    assert!(
+        AGENTS.contains("Crate **0.2.6** / format **v2**")
+            && AGENTS.contains("locals-region identity + FileAbs listing")
+            && AGENTS.contains("`AYZENPACK_CORPUS_DIR`; not always-on until 100% hits")
+            && !AGENTS.contains("Crate **0.2.5** / format **v2**"),
+        "AGENTS.md current-tree must be crate 0.2.6 with homemade-None locals-region + FileAbs listing"
+    );
+    assert!(
+        README.contains("locals-region identity")
+            && README.contains("FileAbs listing")
+            && README.contains("AYZENPACK_CORPUS_DIR")
+            && README.contains("ci/download-corpus.sh")
+            && README.contains(
+                "when `!tail && prefix`, dest `ZipArchive::new(File)` vs source `scan_jar`"
+            ),
+        "README must document homemade-None locals-region + FileAbs listing and corpus enablement"
+    );
+    assert!(
+        LIBRARY.contains("locals-region identity")
+            && LIBRARY.contains("FileAbs iff `prefix_size > 0`")
+            && LIBRARY.contains("prefixed source is `scan_jar` / `ZipView`")
+            && LIBRARY.contains("AYZENPACK_CORPUS_DIR")
+            && LIBRARY
+                .contains("https://github.com/hilather/ayzenpack/blob/main/ci/download-corpus.sh"),
+        "docs/library.md must document FileAbs listing oracle and gated corpus enablement"
+    );
+}

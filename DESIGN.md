@@ -226,14 +226,43 @@ Per jar: `tail_blob` / `tail_size` is the CD-through-EOF index blob (structural,
 
 `source_*` **must** match iff `Jar::bit_identical_restore()`. Hash matching is a restore-time walk of the stencil over shared CAS blobs. Do not buy a match by storing `cdata_blob`, `raw_zip` of a listed jar, or `blake3(inner zip)` next to exploded class blobs.
 
-| Condition | `source_*` | Dest size vs source | Listing |
-|---|---|---|---|
-| Every slot hits + tail / raw_zip (`bit_identical_restore`), including leftover-junk listed zips that gained a tail | **must match** | equal (`set_len(source_size)` + `verify_source_identity`) | identical bytes |
-| Per-entry codec miss, tail present (`metadata_rebuild`) | may change | same league (pads/hole may drop) | names, uncompressed bytes, CRC |
-| Remaining homemade-`None` / overlap / slice `Err` (skip-exact) | may change | **must stay same league**; not inner-sized | outer names; nested STORE payload bytes match `reconstruct_child_zip` |
-| 0.1.x archive, no tail | may change | `ZipWriter` functional identity | names, uncompressed, CRC |
+`source_*` (`source_size` / `source_blake3` / `source_sha256`) are hashes of the **original input file** (prefix + ZIP), recorded at dehydrate. `Jar::bit_identical_restore()` is true iff `raw_zip` **or** (`tail_blob` **and** every `slot_exact`). `verify_source_identity` compares dest bytes to those original hashes. Do **not** retarget pack-time `source_*` at the stencil-reconstructed dest (that would lie about the original file). Do **not** flip `bit_identical_restore()` true without `tail_blob` (mix `tests/corpus.rs` requires `hashes_eq` whenever `bit_identical_restore()`).
 
-Always-on hash gates: baked zlib-rs bitstream; STORE zip-A fat after `zip_index`; leading-pad PK decoy; leftover-junk listed zip when every slot hits. Corpus lucene/jackson `source_*` stays gated on 100% measured method-8 / zlib hits (`AYZENPACK_CORPUS_DIR`); not always-on CI until those counts are 100%. Mix `cdata_blob == 0` and `output_len <= 569539 * 115 / 100` stay.
+| Condition | Restore backend | Dest vs original file | `source_*` |
+|---|---|---|---|
+| Every slot hits + original `tail_blob` / `raw_zip` (`bit_identical_restore`), including leftover-junk listed zips that gained a tail | `write_exact_jar` | byte-identical (`set_len(source_size)`) | **must match** |
+| Per-entry codec miss, tail present (`metadata_rebuild`) | `write_rebuilt_jar` | pads/hole dropped; CD patched | **may change** |
+| Homemade-`None`, headers present, every slot keeps recorded csize (**arm 1**) | stencil seek + **synthetic CD** | locals region byte-identical to source; CD is specified (not original truncated tail); FileAbs iff `prefix_size > 0` | **must not** require original-file match (tail withheld). Locals-region identity + FileAbs listing are the bit-identical gates |
+| Headers present, some slot would change csize (**arm 2**) | concat + synthetic CD (new zip_rel, patched locals) | rebuilt locals; FileAbs = `prefix_len + zip_rel` | **may change** |
+| No captured headers: overlap / prefix+hole / slice `Err` (**arm 3**) | ZipWriter STORE | valid ZIP, same size league | **may change** |
+| 0.1.x archive, no tail | ZipWriter | functional identity | **may change** |
+
+**Bit-identical means walking the stencil**, not a second encoding:
+
+```
+prefix_blob
+leading_pad_blob at prefix_len          # if Some; arm 1 only
+each slot at offsetheader:              # captured local header + cdata + descriptor + pad
+    cdata = STORE blob
+          | encode_codec(cdata_codec)
+          | reconstruct_child_zip(zip_index)
+then either:
+    original tail_blob                  # leftover-junk / healthy parse
+  | specified synthetic CD              # homemade-None arm 1 (stencil offsets) / arm 2 (concat zip_rel); never the withheld tail
+```
+
+A zopfli / unknown-deflate **codec miss** still rebuilds **that slot only**; sibling codecs kept; whole-file hashes **may** change. Do **not** propose Java-zlib bit-identical work or `cdata_blob` for misses.
+
+**Why homemade-`None` cannot match original `source_*` (Status: wontfix).** Remaining homemade-`None` is N complete `PK\x01\x02` rows plus a 46-byte magic-but-short stub counted in EOCD `cd_size`. Policy: **never** store that phys CD→EOF as `tail_blob`. A specified synthetic CD is N complete records + (Zip64 EOCD+locator if needed) + classic EOCD with `jar.comment`. It is **not** the original truncated tail:
+
+```
+source: [prefix][locals][N CD records][46-byte truncated stub][EOCD]
+dest:   [prefix][locals][N synthetic CD records][Zip64?][classic EOCD]
+```
+
+Locals-region identity (`dest[0 .. cd_start] == source[0 .. phys_cd]`) is required on arm 1. Whole-file `verify_source_identity` against original `source_*` would fail unless we attached the withheld tail — which is forbidden. Mix / corpus hash match stays **iff** `bit_identical_restore()`. Homemade-`None` arm 1 is stencil-faithful skip-exact, not a tail splice.
+
+Always-on hash gates: baked zlib-rs bitstream; STORE zip-A fat after `zip_index`; leading-pad PK decoy **with tail**; leftover-junk listed zip when every slot hits. Corpus lucene/jackson `source_*` stays gated on 100% measured method-8 / zlib hits (`AYZENPACK_CORPUS_DIR`); not always-on CI until those counts are 100%. Mix `cdata_blob == 0` and `output_len <= 569539 * 115 / 100` stay.
 
 ```
 ∀ jar (bit_identical_restore: STORE splice / codec-hit / leftover-junk exact / legacy cdata_blob / raw_zip):
@@ -246,7 +275,13 @@ Always-on hash gates: baked zlib-rs bitstream; STORE zip-A fat after `zip_index`
   ZipArchive opens; names, CD order, uncompressed bytes match
   source_* are the original file and are not verified
 
-∀ jar (skip-exact):
+∀ jar (skip-exact arm 1 homemade-None):
+  dest[0 .. cd_start] == source[0 .. phys_cd]   # locals-region identity
+  ZipArchive::new(File) lists outer names (FileAbs iff prefix_size > 0)
+  prefixed source listing is scan_jar / ZipView, not ZipArchive::new(File)
+  original-file source_* are not verified (tail withheld)
+
+∀ jar (skip-exact arm 2 / arm 3):
   ZipArchive opens; names, uncompressed bytes, CRC match
   method_code 0 / zip_index members are STORE
   source_* are the original file and are not verified
@@ -255,6 +290,58 @@ Always-on hash gates: baked zlib-rs bitstream; STORE zip-A fat after `zip_index`
 Do not add a Java subprocess / vendor `Deflater` or `cdata_blob` for misses to move a rebuild jar into the first block. In-process zlib-rs raw-deflate hits are the 0.2.4 path.
 
 Invalid DOS pairs including `0,0` still fall back to 1980-01-01 on the content path. Never `from_msdos_unchecked`.
+
+### FileAbs listing oracle
+
+Synthetic-CD dests are **not** the original file. For `prefix_size > 0` on arm 1, emit **FileAbs** CD local offsets (`offsetheader`) and FileAbs `cd_start` so `ZipArchive::new(File)` sees **outer** names (`BOOT-INF/lib/…`, `lib/inner.jar`), not an inner nested EOCD. Arm 2 FileAbs uses **new** concat offsets (`prefix_len + zip_rel`), not `offsetheader`. Exact zip-A fats already splice FileAbs tails; dest == source, so a latch on the dest is the same latch as the source. Rebuild backends still must not be fed `offsetheader` (PLAN: that makes zip-A look ZipRel and corrupts rebuild).
+
+`tests/corpus.rs` `entry_map` / `cd_entries` / `assert_functional_identity` and `tests/roundtrip.rs` open `ZipArchive::new(File)` with **no** `ZipView`. That is the right **dest** oracle for FileAbs. It is the wrong **source** oracle for unadjusted prefix: source CD is zip-rel, so `ZipArchive::new(File)` latches a STORE nested EOCD. After FileAbs, prefixed arm 1 dests list **outer** names; a global `assert_functional_identity(&src, &dest)` would compare latched-inner vs outer and fail.
+
+| Restore | `prefix_size` | Source listing | Dest listing |
+|---|---|---|---|
+| Exact splice (`bit_identical_restore`) | any | dest == source; `ZipArchive::new(File)` may latch both the same way | same bytes as source |
+| Arm 1 / arm 2 synthetic CD | 0 | `ZipArchive::new(File)` | `ZipArchive::new(File)` (outer == source outer) |
+| Arm 1 / arm 2 synthetic CD | > 0 | **`scan_jar` / `ZipView(prefix)`** (outer names) | **`ZipArchive::new(File)`** (FileAbs outer names) |
+| Arm 3 ZipWriter | 0 | `ZipArchive::new(File)` | `ZipArchive::new(File)` |
+| Arm 3 ZipWriter | > 0 | `scan_jar` | `scan_jar` (dest is still `[prefix][zip-rel zip]`; may latch) |
+
+**Do not** rewrite `assert_functional_identity` or `entry_map`. Those helpers are used for every mix jar. A global `if prefix_size > 0 { dest ZipArchive vs source scan_jar }` would compare a latched **exact** dest (zip-rel CD, dest==source) to source outer names and fail corpus CI on `spring-jackson-core.jar` / zip-A slf4j.
+
+Gate only in the **mix loop**: when `jar.tail_blob.is_none() && jar.prefix_size.unwrap_or(0) > 0`, dest `ZipArchive::new(File)` vs source `scan_jar`. Else `assert_functional_identity`. Exact prefixed jars stay dest==source. Current mix has no prefixed homemade-`None`. Prefixed homemade-`None` tests must **not** call `assert_functional_identity` (source `ZipArchive::new(File)` latches).
+
+### Remaining skip-exact matrix
+
+| Class | Headers? | Tail? | Arm | Dest listing | Locals identity | `source_*` |
+|---|---|---|---|---|---|---|
+| Leftover-junk CD, every slot hits | yes | **yes** | exact splice | dest == source | yes | **must match** |
+| Leftover-junk + method-8 miss | yes | yes | `write_rebuilt_jar` | patched CD | no (concat) | may change |
+| Truncated/malformed CD, every slot hits | yes | **never** | **1** synthetic CD | `ZipArchive::new(File)` outer; FileAbs if prefix (source listing: `scan_jar` if prefixed) | **yes** (`dest[..cd_start] == source[..phys_cd]`) | original-file **no** |
+| Truncated CD + method-8 miss | yes | never | **2** concat+synthetic | FileAbs if concat+prefix using **new** zip_rel, not `offsetheader` | no | may change |
+| Truncated CD + STORE nested + prefix | yes | never | **1** | FileAbs; dest `ZipArchive::new(File)` vs source `scan_jar`; **not** `assert_functional_identity` | prefix+locals match | original-file **no** |
+| Leading-pad PK decoy + truncated CD | yes + `leading_pad_blob` | never | **1** | pad at 0; CD after locals | includes decoy | original-file **no** |
+| Overlap / last-wins | **no** | never | **3** ZipWriter | `scan_jar` if prefixed | no | may change |
+| Prefix+hole | **no** (`Err`) | never | **3** ZipWriter | `scan_jar` | no | may change |
+
+Leftover-junk is **not** the synthetic-CD path after 0.2.5. Do not restage leftover-junk tests as synthetic-CD gates.
+
+### Corpus lucene/jackson `source_*`
+
+Already implemented and **env-gated**: [`tests/corpus.rs`](https://github.com/hilather/ayzenpack/blob/main/tests/corpus.rs) `corpus_lucene_jackson_source_identity_only_when_every_slot_hits` skips unless `AYZENPACK_CORPUS_DIR` is set. It prints per-jar `method8` / `flate2` / `zlib` / `stored` / `miss` / `exact`, and asserts whole-file hashes **only** when `jar.bit_identical_restore()`.
+
+**How to enable (operators / agents):**
+
+```bash
+# 1. Fetch pinned Maven JARs (not in git). See ci/download-corpus.sh.
+CORPUS_DIR=/path/to/corpus ci/download-corpus.sh
+
+# 2. Measure method-8 / zlib hits (not always-on CI).
+AYZENPACK_CORPUS_DIR=/path/to/corpus cargo test --test corpus \
+  corpus_lucene_jackson_source_identity_only_when_every_slot_hits -- --nocapture
+```
+
+[`ci/download-corpus.sh`](https://github.com/hilather/ayzenpack/blob/main/ci/download-corpus.sh) verifies SHA-256 from [`ci/corpus.lock.json`](https://github.com/hilather/ayzenpack/blob/main/ci/corpus.lock.json). Promote those jars into always-on CI `source_*` **only when every printed line has `miss=0` and `exact=true`** (100% measured method-8 hits, every slot STORE/codec/`zip_index`). Until then: keep the env gate; do not fail default `cargo test` on a remaining zlib-3 / zopfli miss. Mix `proven_miss` already allows sibling codecs.
+
+Do **not** buy lucene/jackson hashes with `cdata_blob` or Java `Deflater`. Mix gates stay: `cdata_blob == 0`; `output_len <= 569539 * 115 / 100`; unique content not doubled; no inner-zip CAS on `zip_index`.
 
 ---
 
