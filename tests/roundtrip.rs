@@ -2846,6 +2846,44 @@ fn listed_homemade_leftover_junk_cd_is_exact() {
 }
 
 #[test]
+fn listed_true_homemade_none_has_no_tail_blob() {
+    // Truncated/malformed CD (not leftover junk after N matching records).
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("truncated-cd.jar");
+    write_truncated_cd_listed_zip(&jar);
+    let listed = ZipArchive::new(File::open(&jar).unwrap()).unwrap().len();
+    assert!(listed >= 1, "fixture must stay listable");
+    let src_len = fs::metadata(&jar).unwrap().len();
+    let out = dir.path().join("out.ayz");
+    dehydrate(&opts(&out, vec![jar.clone()])).unwrap();
+    let m = manifest_from_records(&read_archive(&out).2);
+    assert!(
+        m.jars[0].tail_blob.is_none(),
+        "remaining homemade-None must never get tail_blob"
+    );
+    assert!(m.jars[0].raw_zip_blob.is_none());
+    assert!(!m.jars[0].bit_identical_restore());
+    assert!(!m.jars[0].metadata_rebuild());
+    for e in &m.jars[0].entries {
+        assert!(e.cdata_blob.is_none(), "{} cdata_blob", e.name);
+    }
+    let dest = dir.path().join("restored");
+    rehydrate(&rehydrate_opts(&out, &dest)).unwrap();
+    let restored = dest.join("truncated-cd.jar");
+    let got_len = fs::metadata(&restored).unwrap().len();
+    assert!(
+        got_len * 2 >= src_len,
+        "restored {got_len} must stay in the same league as source {src_len}"
+    );
+    assert_functional_identity(&jar, &restored);
+    assert_eq!(
+        entry_compression(&restored, "a.txt"),
+        CompressionMethod::Stored,
+        "method-0 files must STORE on skip-exact ZipWriter"
+    );
+}
+
+#[test]
 fn leftover_junk_plus_store_nested_is_exact_zip_index() {
     let dir = tempfile::tempdir().unwrap();
     let jar = dir.path().join("cd-junk-nested.jar");
