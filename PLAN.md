@@ -125,9 +125,13 @@ Rules:
 
 - Decide opaque vs `zip_index` **before** `remember_blob` **and** before `--jobs` `spawn_file` of the combined inner ZIP. Probe the in-memory STORE payload with a new `slice_from_bytes(&[u8])` (do not write a temp file; do not `slice_from_archive` on a path we never CAS). Classify child slots. No child `remember_blob` during the probe. No commit-then-rollback (`first_seen` / END digest cannot un-CAS).
 - **Child probe must not fail the outer.** Today `archive_local_records` returns `AyzenpackError::Encrypted` (`src/exact.rs` ~178) and `attach_exact` rethrows that (`src/dehydrate.rs` ~849). `slice_from_bytes` / the child probe maps encrypted child, empty listing, overlap, homemade count mismatch, latch (`zip_archive_opens` on the **child** bytes — same outer-listing rule as 0.2.3), or slice `Err` to **opaque**. Do not propagate `Encrypted` from a child. CRC-check the in-hand STORE payload (`check_crc`) before withholding CAS: mismatch → opaque (still `commit_blob` the combined bytes) unless `--strict` fails like today. Not-a-ZIP / unlistable → opaque.
-- **`jobs==1` is the default and Matt’s CLI** (`src/cli.rs` ~65; pipeline is `None` unless `jobs > 1`, `src/dehydrate.rs` ~419–423). The sequential path today always `commit_blob`s (`~531–535`). **Both paths must probe before CAS:**
-  - `jobs==1`: before `commit_blob` at `~535`, probe → explode (`remember_blob` inners only; one outer `blob: None` + `zip_index`; never `commit_blob` the combined ZIP) or today’s `commit_blob`.
-  - `jobs>1`: `Sequenced::Exploded` below. Do **not** treat Exploded as the only explode implementation.
+- **`jobs==1` is the default and Matt’s CLI** (`src/cli.rs` ~65; pipeline is `None` unless `jobs > 1`, `src/dehydrate.rs` ~419–423). The sequential path today always `commit_blob`s (`~531–535`). **One helper** (`explode_store_member` or equivalent) used by **both** paths, at the same first-seen point as that outer member’s seq:
+  - Probe via `scan_from_bytes` + `slice_from_bytes` (genericize scan as well as `archive_local_records` / `read_local` — slice locals have no `name` / `dos_*` / plains; `classify_local` needs an `Entry`). Check listing `uncompressed_size` **before** any `inflate_raw` / `io::copy`. Cap decoder output at `min(listing, max-entry-bytes)`; overflow → opaque.
+  - If explode: `remember_blob` inner **files and** child tail / headers / `leading_pad_blob` / `prefix_blob`; push `NestedIndex`; one outer `blob: None` + `zip_index`. Never `commit_blob` the combined ZIP. Collect `Vec<NestedIndex>` during the scan callback (no `Jar` yet, `src/dehydrate.rs` ~474–585) and move it onto `Jar` after the loop.
+  - If opaque: today’s `commit_blob` / `spawn_file` of the combined bytes.
+  - `jobs==1`: call the helper instead of `commit_blob` at `~535`.
+  - `jobs>1`: `apply_sequenced` on `Sequenced::Exploded` calls the **same** helper (do not remember child tail later in `attach_exact` on one path and inside Exploded on the other — that desyncs first-seen / END digest).
+  `attach_exact` slices the **outer** file only and cannot CAS child-stencil bytes.
 - **`--jobs` first-seen (blocking if omitted).** `Sequenced` is only `Dir | File` today; `File` always `commit_blob` (`src/dehydrate.rs` ~110, ~325). Explode must **not** `remember_blob` on the main thread while earlier seqs are still in-flight (that reorders `first_seen` / END digest vs `jobs==1`). Add `Sequenced::Exploded`:
   1. `wait_admit(sum of inner file bytes)` (today `wait_admit` is the only inflight gate; `spawn_file` is the only increment, ~188).
   2. Consume **exactly one** `next_seq` for the outer member (like `push_dir` / today’s one `spawn_file`). Do not `spawn_file` the combined ZIP (that would CAS it). Do not `spawn_file` each inner file (that increments `next_seq` per inner → extra outer rows).
@@ -143,7 +147,7 @@ Rules:
 - Depth **1** only. Do not recurse into a child’s nested ZIPs.
 - `zip_index` is a `usize` index into `jars[].nestedindexes[]`. Outer slot JSON: `blob: null` + `zip_index` set.
 - Encrypted **outer** listing: fail like today. Encrypted **child**: opaque (see above).
-- `nested_jar_not_exploded` **flips** only for STORE listable children that take `zip_index`.
+- `nested_jar_not_exploded` (`tests/roundtrip.rs`, `write_jar` **DEFLATE** nested) **stays opaque**. It flips only if rewritten onto a STORE listable child. Do not change that test to expect `zip_index`.
 - `slice_from_bytes` requires implement PR to genericize `archive_local_records` / `read_local` to `Read + Seek` (they take `Path` / `&mut File` today, `src/exact.rs` ~169, ~528). The generic `Encrypted` path must be catchable: child probe returns opaque; outer `attach_exact` still fails the job. Probe uses `zip_archive_opens` on the child bytes (latch → opaque, not a wrong listing).
 
 0.2.3 readers ignore unknown keys and will not restore a 0.2.4 pack that replaced a nested blob with `zip_index`. That is acceptable. 0.2.4 must keep reading 0.2.3 packs (opaque nested blob + flate2-only `cdata_codec`).
@@ -202,7 +206,9 @@ Do not fall back to jar-wide CleanMiss. Do not put `cdata_blob` on the miss.
 
 Do **not** change the gate to “accept `first offsetheader == prefix_len`”. That layout already slices on 0.2.3 after `cd_offset_to_zip_rel`.
 
-`slice_from_archive` today `Err`s on homemade `None` (`src/exact.rs` ~144). 0.2.4 adds a listed-outer branch: if `ZipArchive` locals do not overlap, return locals (and a phys tail buffer for optional use) even when `parse_central_directory` is `None`. `attach_exact` **never** sets `tail_blob` on homemade `None` (see §B.1). Homemade `Some` + every slot a hit → keep today’s tail. Overlap / last-wins still `Err` (skip-exact, no tail).
+`slice_from_archive` today `Err`s on homemade `None` (`src/exact.rs` ~144) and `attach_exact` **always** `remember_blob`s `slice.tail` on `Ok` (`src/dehydrate.rs` ~843–846). `ExactSlice` is `{ locals, tail }` with no homemade flag. The obvious “don’t Err on parse None” edit hits that `Ok` arm and **sets `tail_blob`** — the failure mode §B.1 names.
+
+0.2.4 **must** change the return type, e.g. `ExactSlice { locals, tail: Option<Vec<u8>> }` or `homemade_ok: bool`. `attach_exact` sets `tail_blob` only when homemade parse is `Some` **and** `locals.len() == jar.entries.len()`. Phys CD→EOF bytes on homemade `None` are **not** stored as `tail_blob` (even if every listing slot hits). Overlap / last-wins still `Err` (skip-exact, no tail). Always-on **unit**: a listed homemade-`None` fixture has `tail_blob.is_none()` (no fat `source_*` gate required).
 
 - **Leading pad (`min_off != 0`, `prefix_len == 0`):** do not `Err`. Read `[0, first offsetheader)` into `leading_pad_blob`. Then slice locals. Do not extend `prefix_len`. Do not zero-fill. Prefix + hole stays skip-exact.
 - **Overlap / last-wins / encrypted / `NotZip`:** unchanged skip-exact / fail.
@@ -220,7 +226,7 @@ This plan-only PR updates `PLAN.md`, the intended-model paragraphs in `DESIGN.md
 | `AGENTS.md` | Current-tree line → crate **0.2.4**. Keep storage-efficiency / no-default-`cdata_blob` / 4 MiB groups / mix `569539 * 115 / 100` / `cdata_blob == 0` / MSRV **1.80** / `forbid(unsafe_code)`. **Replace** (do not keep) the sentence `Do **not** add a Java/zlib deflater, \`cdata_blob\` for misses, or \`raw_zip\` of healthy jars` with: do not add a Java subprocess / vendor `Deflater`; do not add `cdata_blob` for misses; do not `raw_zip` a listed jar; in-process zlib-rs raw-deflate hits are the 0.2.4 path. Update `tests/docs.rs` in the **same** implement PR. |
 | `DESIGN.md` | Reconstruction + executable JAR: stencil walk; codec set; per-entry codecs; depth-1 `zip_index`; remaining skip-exact classes in §B. Keep `North star: **one CAS blob + ZIP index + zstd blocks**`. Nested STORE listable libs are `zip_index` on new packs when §2 applies. |
 | `README.md` / `docs/library.md` | Do not tell agents to store `cdata_blob` or chase bit-identical hashes via dual copy. Keep `Crate **0.2.1** never writes \`cdata_blob\` (file or dir, any method)`. |
-| `schemas/manifest.v1.schema.json` | Additive optional keys (`offsetheader`, `data_start`, `zip_index`, `nestedindexes`, `leading_pad_blob` / `leading_pad_size`). Widen `cdata_codec`. Keep `blob` required (hex\|null). No schema `oneOf`. Runtime refuse both-`Some`. |
+| `schemas/manifest.v1.schema.json` | Additive optional keys (`offsetheader`, `data_start`, `zip_index`, `nestedindexes`, `leading_pad_blob` / `leading_pad_size`). Add `$defs.nestedindex` (entries + tail + child prefix/leading_pad; **no** nested `nestedindexes`). Schema is `additionalProperties: false` on jar/entry. Widen `cdata_codec`. Keep `blob` required (hex\|null). No schema `oneOf`. Runtime refuse both-`Some`. `zip_index` OOB uses `.get()` → `Format` / `HashMismatch`, not `[]`. |
 | `tests/docs.rs` | PLAN identity stays the 0.2.4 title strings. Implement PR updates the Java/zlib locked phrase as above. |
 | `tests/corpus.rs` | Rewrite `proven_miss` (see §4). |
 
@@ -230,7 +236,7 @@ This plan-only PR updates `PLAN.md`, the intended-model paragraphs in `DESIGN.md
 
 Do **not** restage a test that is already green on 21e73bb and call it the 0.2.4 gate. In-tree zip -A fats already have `tail_blob`.
 
-1. **zlib-rs classic (always-on, not “Java-built”).** Bake a DEFLATE member whose raw cdata is a **fixed zlib bitstream** (bytes in the test, or built in-process with the zlib-rs pin; `window_bits = -15`, not `DeflateConfig::default()`). The test must call today’s `deflate::match_deflate` and assert `None` (not empty payload, not a miniz collision) so it fails on 0.2.3. After 0.2.4: `cdata_codec` is `deflate-raw:zlib:{1,6,9}`, no `cdata_blob`, Matt CLI, restored `source_size` and `source_sha256` match. **Java/Maven gate:** when `AYZENPACK_CORPUS_DIR` is set, the same `source_*` assertions on corpus **lucene-*** (or jackson) already in `ci/corpus.lock.json`. There is no groovy in the lock. Do not call the zlib-rs fixture “Java-built”. Do not require a network fetch.
+1. **zlib-rs classic (always-on, not “Java-built”).** Bake a DEFLATE member whose raw cdata is a **fixed zlib bitstream** (bytes in the test, or built in-process with the zlib-rs pin; raw/nowrap, not `DeflateConfig::default()` zlib wrapper). The unit must call today’s `deflate::match_deflate` and assert `None` (not empty payload, not a miniz collision) so it fails on 0.2.3 — put that assert in `src/deflate.rs` (`deflate` is crate-private). After 0.2.4: `cdata_codec` is `deflate-raw:zlib:{1,6,9}`, no `cdata_blob`, Matt CLI, restored `source_size` and `source_sha256` match. **Java/Maven `source_*` is not promised until measured.** When `AYZENPACK_CORPUS_DIR` is set, the implement PR first counts method-8 / flate2 hits / zlib-rs `{1,6,9}` hits on lockfile lucene-* / jackson; put whole-file `source_*` **only** on jars where every slot hits. A remaining miss jar stays rebuild (siblings keep codecs). Do not call the zlib-rs fixture “Java-built”. Do not require a network fetch. zlib-rs 0.6.7’s Rust API is marked unstable — pin and use whatever raw/nowrap API that line actually exports; do not enable flate2’s `zlib-rs` feature. `deflate-raw:stored` must handle multi-block BTYPE 00 (plains > 65535; `raw_stored_deflate` in fixtures is u16-only).
 
 2. **Leading-pad ZIP (always-on).** File starts with `PK` (`prefix_len == 0`) but first CD local is not at 0, so `min(zip_rel) != 0` on 21e73bb (`slice_from_archive` `Err`, `tail_blob.is_none()`, `source_sha256` mismatch). Do **not** use `launch.script` (that becomes `prefix_len` and slices). After 0.2.4: `leading_pad_blob` covers `[0, first offsetheader)`, `tail_blob.is_some()`, `raw_zip_blob.is_none()`, every `cdata_blob` absent, Matt CLI, `source_*` match. Homemade-`None` is **not** this test.
 
@@ -247,7 +253,7 @@ Do **not** restage a test that is already green on 21e73bb and call it the 0.2.4
 
 6. **Overlap / last-wins unchanged:** `unique_overlap_content_blobs_not_dual_copy`; `dup.txt` still skip-exact, no `raw_zip`.
 
-7. **0.2.3 packs still read:** check in a tiny 0.2.3 `.ayz` (or synthesize a manifest that omits additive keys: flate2 codec + opaque nested blob, no `offsetheader` / no `zip_index`). Dehydrate-on-0.2.4 is not a 0.2.3 pack.
+7. **0.2.3 packs still read:** check in `testdata/v0.2.3-tiny.ayz` **or** dehydrate a tiny flate2 + opaque-nested jar with the unmodified 0.2.3 tree in the implement PR, then rehydrate that file on 0.2.4. Do **not** treat an in-memory `Manifest` (serde ignore-unknown) as the gate. This test stays green on 0.2.3 (it is a compat read, not a 0.2.4 feature gate).
 
 8. **Skip-exact outer after explode (always-on).** One listed jar with overlapping locals (`dup.txt` last-wins class) **and** one STORE listable inner zip. On 0.2.3: skip-exact, opaque inner blob. After 0.2.4: inner is `zip_index` + `blob: null`, `blake3(inner) ∉ blobs[]`, no outer `tail_blob`, `write_jar` succeeds, `verify` succeeds, uncompressed inner bytes match `reconstruct_child_zip`. `source_*` may change. Proves there is no opaque-CAS fallback.
 
@@ -329,4 +335,10 @@ Closed holes a fourth skeptic would still hit: `slice_from_bytes` child probe; `
 1. `jobs==1` (Matt CLI default) must probe/explode before `commit_blob`; `Sequenced::Exploded` is not the only path.
 2. Rewrite **every** `raw_stored_deflate` caller (`maven_empty_deflate_dir_*`, `class4_miss_plus_dir_cdata_*`), not four named tests.
 3. Mix `blake3(inner zip) ∉ blobs[]` only for STORE `zip_index` slots; Zip64 DEFLATE nested stays an opaque whole-jar blob.
-4. Homemade-`None`: never `tail_blob`. Child listing `uncompressed_size` checked before `inflate_raw`. Java corpus gate is lucene/jackson, not groovy. Test 7 is a real 0.2.3 pack. Prefix+hole stays skip-exact.
+4. Homemade-`None`: never `tail_blob`. Child listing `uncompressed_size` checked before `inflate_raw`. Java corpus `source_*` only after a hit-count. Test 7 is a real 0.2.3 pack. Prefix+hole stays skip-exact.
+
+### Loop 3 sweep 2 — REVISE (applied)
+
+1. One explode helper for `jobs==1` and `Sequenced::Exploded`: CAS child tail/headers/pads, not “inners only”. Same first-seen slot. `scan_from_bytes` (slice locals have no names/plains).
+2. `ExactSlice` needs `homemade_ok` / `tail: Option`; `attach_exact` must not set `tail_blob` on the obvious “don’t Err” edit. Unit: homemade-`None` ⇒ `tail_blob.is_none()`.
+3. Do not promise lucene/jackson whole-file `source_*` until method-8 / zlib-hit counts are measured. Always-on gate is the baked zlib bitstream.
