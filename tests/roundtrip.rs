@@ -2595,7 +2595,7 @@ fn signed_rebuild_is_not_exact_restore() {
     assert!(m.jars[0].signed);
     assert!(
         !m.jars[0].exact_restore(),
-        "signed + rebuild must use the existing rebuild-breaks-signature warning path"
+        "signed unknown-deflate must stay a rebuild jar"
     );
 }
 
