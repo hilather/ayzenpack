@@ -3,7 +3,7 @@
 //! Always-on `cargo test` stays offline. Overlap/CRC/unique-blob tests run when
 //! `AYZENPACK_CORPUS_DIR` is set (corpus.yml). `#[ignore]`-style: skip unless env.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -26,6 +26,8 @@ const CORPUS_YML: &str = include_str!(concat!(
 ));
 
 const GUAVA_DEST: &str = "guava-33.2.1-jre.jar";
+const DATAFLOW_4_DEST: &str = "spring-cloud-dataflow-server-2.11.4.jar";
+const DATAFLOW_5_DEST: &str = "spring-cloud-dataflow-server-2.11.5.jar";
 
 fn lock_root() -> serde_json::Value {
     serde_json::from_str(LOCK_JSON).expect("ci/corpus.lock.json must be valid JSON")
@@ -107,6 +109,40 @@ fn jar_file_entry_count(path: &Path) -> u64 {
         }
     }
     files
+}
+
+fn jar_uncompressed_file_bytes(path: &Path) -> u64 {
+    let mut z = ZipArchive::new(File::open(path).unwrap()).unwrap();
+    let mut bytes = 0u64;
+    for i in 0..z.len() {
+        let e = z.by_index(i).unwrap();
+        if !e.is_dir() {
+            bytes += e.size();
+        }
+    }
+    bytes
+}
+
+/// Distinct `entries[].blob` ids and the sum of those content blob sizes.
+/// Index tails / raw_zip / large local headers are not content.
+fn unique_content_blobs(manifest: &ayzenpack::Manifest) -> (u64, u64) {
+    let sizes: BTreeMap<&str, u64> = manifest
+        .blobs
+        .iter()
+        .map(|b| (b.blake3.as_str(), b.size))
+        .collect();
+    let mut ids = BTreeSet::new();
+    let mut bytes = 0u64;
+    for jar in &manifest.jars {
+        for e in &jar.entries {
+            if let Some(id) = e.blob.as_deref() {
+                if ids.insert(id) {
+                    bytes += *sizes.get(id).expect("entry blob missing from blobs[]");
+                }
+            }
+        }
+    }
+    (ids.len() as u64, bytes)
 }
 
 /// Uncompressed file payloads keyed by Unicode ZIP name. Skips directories.
@@ -767,4 +803,107 @@ fn corpus_lucene_jackson_source_identity_only_when_every_slot_hits() {
         assert_eq!(hex_lower(&src_b3), hex_lower(&dest_b3), "{}", jar.name);
         assert_eq!(hex_lower(&src_sha), hex_lower(&dest_sha), "{}", jar.name);
     }
+}
+
+/// Two nearby Dataflow fat JARs. Listed + `raw_zip` is a bug, not a fallback.
+#[test]
+fn corpus_dataflow_pair_forbids_dual_copy() {
+    let Some(corpus) = corpus_dir() else {
+        eprintln!("skipping corpus_dataflow_pair_forbids_dual_copy: AYZENPACK_CORPUS_DIR not set");
+        return;
+    };
+    let jar4 = corpus.join(DATAFLOW_4_DEST);
+    let jar5 = corpus.join(DATAFLOW_5_DEST);
+    assert!(
+        jar4.is_file(),
+        "missing pinned artifact {} (run ci/download-corpus.sh)",
+        jar4.display()
+    );
+    assert!(
+        jar5.is_file(),
+        "missing pinned artifact {} (run ci/download-corpus.sh)",
+        jar5.display()
+    );
+
+    let files_4 = jar_file_entry_count(&jar4);
+    let files_5 = jar_file_entry_count(&jar5);
+    let uncomp_4 = jar_uncompressed_file_bytes(&jar4);
+    let uncomp_5 = jar_uncompressed_file_bytes(&jar5);
+    assert!(files_4 > 0, "{DATAFLOW_4_DEST} listed no file entries");
+    assert!(files_5 > 0, "{DATAFLOW_5_DEST} listed no file entries");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("dataflow-pair.ayz");
+    let restored = tmp.path().join("restored");
+    let mut opts = dehydrate_opts(&out, vec![jar4, jar5]);
+    opts.recursive = false;
+    let summary = dehydrate(&opts).unwrap();
+    assert_eq!(summary.jar_count, 2, "pair must pack both fat JARs");
+    verify(&out).unwrap();
+    rehydrate(&rehydrate_opts(&out, &restored)).unwrap();
+
+    let manifest = list(&out).unwrap();
+    assert_eq!(manifest.jars.len(), 2);
+    for jar in &manifest.jars {
+        assert!(
+            jar.raw_zip_blob.is_none(),
+            "{} listed file entries so raw_zip_blob is a bug, not a fallback",
+            jar.name
+        );
+        for e in &jar.entries {
+            assert!(
+                e.cdata_blob.is_none(),
+                "{}!{} must not write cdata_blob",
+                jar.name,
+                e.name
+            );
+        }
+        for (i, nested) in jar.nestedindexes.iter().enumerate() {
+            for e in &nested.entries {
+                assert!(
+                    e.cdata_blob.is_none(),
+                    "{} nestedindexes[{i}]!{} must not write cdata_blob",
+                    jar.name,
+                    e.name
+                );
+            }
+        }
+    }
+
+    let (unique_content_count, unique_content_bytes) = unique_content_blobs(&manifest);
+    let file_entry_sum = files_4 + files_5;
+    let uncomp_sum = uncomp_4 + uncomp_5;
+    println!(
+        "dataflow pair files_4={} files_5={} file_entry_sum={} uncomp_4={} uncomp_5={} uncomp_sum={} unique_content_count={} unique_content_bytes={} unique_blob_count={} bytes_unique_blobs={} bytes_in_jars={} output_len={}",
+        files_4,
+        files_5,
+        file_entry_sum,
+        uncomp_4,
+        uncomp_5,
+        uncomp_sum,
+        unique_content_count,
+        unique_content_bytes,
+        summary.unique_blob_count,
+        summary.bytes_unique_blobs,
+        summary.bytes_in_jars,
+        summary.output_len
+    );
+    assert!(
+        summary.bytes_unique_blobs < unique_content_bytes.saturating_mul(2),
+        "unique blob bytes {} must stay in the same league as unique uncompressed content {} (one CAS; Raw dual-copy fails this)",
+        summary.bytes_unique_blobs,
+        unique_content_bytes
+    );
+    assert!(
+        unique_content_count < file_entry_sum,
+        "unique content blob count {} must be strictly less than file-entry sum {} (BOOT-INF/lib CAS overlap)",
+        unique_content_count,
+        file_entry_sum
+    );
+    assert!(
+        summary.bytes_unique_blobs < uncomp_sum,
+        "bytes_unique_blobs {} must be strictly less than uncompressed file-entry sum {} (BOOT-INF/lib CAS overlap)",
+        summary.bytes_unique_blobs,
+        uncomp_sum
+    );
 }
