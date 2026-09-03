@@ -10,9 +10,9 @@ use ayzenpack::error::AyzenpackError;
 use ayzenpack::hashutil::hash_both;
 use ayzenpack::scan::{for_each_jar_entry, scan_jar, zip_prefix_len, ScannedEntry};
 use fixtures::{
-    spring_boot_launch_script, write_jar, write_jar_entries_with_mtime, write_wrapped_jar,
-    write_wrapped_jar_adjusted, write_wrapped_zip64_jar, zip64_jar_bytes, JarEntry,
-    SPRING_LAUNCHER,
+    spring_boot_launch_script, write_jar, write_jar_entries_with_mtime, write_stored_zip,
+    write_wrapped_jar, write_wrapped_jar_adjusted, write_wrapped_zip64_jar, zip64_jar_bytes,
+    JarEntry, SPRING_LAUNCHER,
 };
 use zip::CompressionMethod;
 use zip::DateTime;
@@ -481,4 +481,22 @@ fn assert_no_class_forest(dir: &Path) {
         );
         assert!(entry.file_type().unwrap().is_file());
     }
+}
+
+#[test]
+fn scan_dup_txt_last_wins_stays_listable() {
+    // ZipArchive IndexMap last-wins (1) vs EOCD count (2) is not a nested latch.
+    let (_dir, path) = temp_jar("dup.jar");
+    let first = b"first-payload".as_slice();
+    let second = b"second-payload".as_slice();
+    write_stored_zip(
+        &path,
+        &[
+            ("dup.txt", first, crc32fast::hash(first)),
+            ("dup.txt", second, crc32fast::hash(second)),
+        ],
+    );
+    let scanned = scan_jar(&path, MAX_ENTRY).expect("dup.txt last-wins must stay listable");
+    assert_eq!(scanned.entries.len(), 1);
+    assert_eq!(scanned.entries[0].name, "dup.txt");
 }
