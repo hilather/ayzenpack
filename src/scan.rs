@@ -147,25 +147,13 @@ pub(crate) fn scan_from_bytes(bytes: &[u8], max_entry: u64) -> Result<Vec<Scanne
     // PK-start returns prefix_len=0 immediately; still require homemade CD
     // count == ZipArchive::len() so a nested-EOCD latch is Err (opaque at probe).
     // Do not require header_start == 0: a PK-start hole is leading_pad, not latch.
-    let homemade_n = if layout.prefix_len == 0 {
-        match find_cd_bounds(path, &mut cur, bytes.len() as u64) {
-            Ok((_, _, _, n)) => Some(n),
-            Err(err) => return Err(err),
-        }
-    } else {
-        None
-    };
+    let homemade_n =
+        pk_start_homemade_entry_count(path, &mut cur, bytes.len() as u64, layout.prefix_len)?;
     cur.seek(SeekFrom::Start(0))
         .map_err(|source| io_at(source, path))?;
     let reader = BufReader::with_capacity(ZIP_BUF, ZipView::new(cur, layout.view_shift));
     let mut archive = ZipArchive::new(reader).map_err(|err| map_archive_open_err(err, path))?;
-    if let Some(n) = homemade_n {
-        if archive.len() as u64 != n {
-            return Err(AyzenpackError::FormatOwned(
-                "child zip listing disagrees with homemade central directory count".into(),
-            ));
-        }
-    }
+    reject_pk_start_listing_latch(archive.len(), homemade_n, true)?;
     let mut out = Vec::with_capacity(archive.len());
     for i in 0..archive.len() {
         let mut zf = archive
@@ -253,6 +241,8 @@ where
     let layout = detect_zip_layout(path, &mut file)?;
     let (source_blake3, source_sha256) =
         hash_source(&mut file).map_err(|source| io_at(source, path))?;
+    let homemade_n =
+        pk_start_homemade_entry_count(path, &mut file, source_size, layout.prefix_len)?;
     let prefix = if layout.prefix_len > 0 {
         file.seek(SeekFrom::Start(0))
             .map_err(|source| io_at(source, path))?;
@@ -266,6 +256,16 @@ where
 
     let reader = BufReader::with_capacity(ZIP_BUF, ZipView::new(file, layout.view_shift));
     let mut archive = ZipArchive::new(reader).map_err(|err| map_archive_open_err(err, path))?;
+    if let Some(n) = homemade_n {
+        if archive.len() as u64 != n {
+            let mut probe = File::open(path).map_err(|source| io_at(source, path))?;
+            if pk_start_is_nested_eocd_latch(path, &mut probe, source_size, archive.len(), n)? {
+                return Err(AyzenpackError::FormatOwned(
+                    "zip listing disagrees with homemade central directory count".into(),
+                ));
+            }
+        }
+    }
     let comment = String::from_utf8_lossy(archive.comment()).into_owned();
     on_len(archive.len() as u64);
 
@@ -479,6 +479,67 @@ fn layout_from_first_pk(
         }));
     }
     Ok(None)
+}
+
+/// Homemade EOCD/Zip64 entry count for a PK-start file (`prefix_len == 0`).
+/// Prefixed files already ran [`zip_archive_opens`]; a PK-start hole is
+/// `leading_pad`, not a prefix, so `detect_zip_layout` never applies that gate.
+fn pk_start_homemade_entry_count(
+    path: &Path,
+    file: &mut (impl Read + Seek),
+    file_len: u64,
+    prefix_len: u64,
+) -> Result<Option<u64>> {
+    if prefix_len != 0 {
+        return Ok(None);
+    }
+    let (_, _, _, n) = find_cd_bounds(path, file, file_len)?;
+    Ok(Some(n))
+}
+
+/// Refuse a ZipArchive that bound a STORE nested EOCD instead of the outer CD.
+/// Child probe maps this `Err` to opaque. Outer scan uses
+/// [`pk_start_is_nested_eocd_latch`] so `dup.txt` last-wins stays listable.
+fn reject_pk_start_listing_latch(
+    archive_len: usize,
+    homemade_n: Option<u64>,
+    child: bool,
+) -> Result<()> {
+    let Some(n) = homemade_n else {
+        return Ok(());
+    };
+    if archive_len as u64 == n {
+        return Ok(());
+    }
+    let who = if child {
+        "child zip listing"
+    } else {
+        "zip listing"
+    };
+    Err(AyzenpackError::FormatOwned(format!(
+        "{who} disagrees with homemade central directory count"
+    )))
+}
+
+/// Same-zip last-wins (`dup.txt`) has first local at 0. A PK-start hole whose
+/// shifted view lists the homemade outer count is a nested-EOCD latch.
+fn pk_start_is_nested_eocd_latch(
+    path: &Path,
+    file: &mut (impl Read + Seek),
+    file_len: u64,
+    archive_len: usize,
+    homemade_n: u64,
+) -> Result<bool> {
+    if archive_len as u64 == homemade_n {
+        return Ok(false);
+    }
+    let Some(first) = find_cd_first_local(path, file, file_len)? else {
+        return Ok(false);
+    };
+    if first == 0 {
+        return Ok(false);
+    }
+    zip_archive_opens(path, file, first, first, homemade_n)
 }
 
 /// `ZipArchive::new` success is not enough: rust zip may latch onto a STORE
@@ -1466,6 +1527,27 @@ mod tests {
             }
             Err(other) => panic!("latch must be FormatOwned, got {other:?}"),
             Ok(_) => panic!("latch must be Err, not a latched listing"),
+        }
+    }
+
+    #[test]
+    fn pk_start_store_nested_outer_scan_refuses_latch() {
+        let bytes = pk_start_unadjusted_store_nested_latch();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("latch.jar");
+        std::fs::write(&path, &bytes).unwrap();
+        match scan_jar(&path, u64::MAX) {
+            Err(AyzenpackError::FormatOwned(msg)) => {
+                assert!(
+                    msg.contains("homemade central directory count"),
+                    "got {msg}"
+                );
+            }
+            Err(other) => panic!("outer latch must be FormatOwned, got {other:?}"),
+            Ok(scanned) => panic!(
+                "outer scan must not pack a latched listing, got {:?}",
+                scanned.entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+            ),
         }
     }
 }

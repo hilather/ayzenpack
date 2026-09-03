@@ -3976,6 +3976,27 @@ fn child_ziparchive_latch_packs_opaque() {
 }
 
 #[test]
+fn pk_start_store_nested_outer_dehydrate_refuses_latch() {
+    // Same bytes as child_ziparchive_latch_packs_opaque, but as the *outer* jar.
+    // Unfixed scan packs the latched inner listing (LatchInner) and drops App + libs.
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("latch.jar");
+    std::fs::write(&jar, pk_start_unadjusted_store_nested_latch_bytes()).unwrap();
+    let out = dir.path().join("out.ayz");
+    match dehydrate(&opts(&out, vec![jar])) {
+        Err(AyzenpackError::FormatOwned(msg)) => {
+            assert!(
+                msg.contains("homemade central directory count"),
+                "got {msg}"
+            );
+        }
+        Err(other) => panic!("outer latch dehydrate must be FormatOwned, got {other:?}"),
+        Ok(_) => panic!("must not pack a latched inner listing as the outer jar"),
+    }
+    assert!(!out.exists(), "failed dehydrate must not leave a pack");
+}
+
+#[test]
 fn store_nested_reconstruct_equality_omits_inner_zip_cas() {
     let dir = tempfile::tempdir().unwrap();
     let inner_path = dir.path().join("inner.jar");
