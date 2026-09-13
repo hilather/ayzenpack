@@ -83,7 +83,7 @@ ayzenpack list -i libs.ayz
 ayzenpack rehydrate -i libs.ayz -d restored/ --overwrite
 ```
 
-`--jobs 0` hashes on every core; BLOB order stays first-seen, so `--sort-inputs` archives are byte-identical at any job count. Directories are not walked unless `--recursive`. Duplicate basenames become `a.jar`, `a__2.jar`, `a__3.jar`.
+`--jobs 0` hashes on every core; BLOB order stays first-seen, so `--sort-inputs` archives are byte-identical at any job count. Directories are not walked unless `--recursive`. Duplicate basenames become `a.jar`, `a__2.jar`, `a__3.jar`, skipping any name already assigned so pack `jars[].name` stays unique.
 
 ---
 

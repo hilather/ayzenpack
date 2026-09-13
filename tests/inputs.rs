@@ -4,7 +4,8 @@
 mod fixtures;
 
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::Path;
 
 use assert_cmd::Command;
@@ -33,6 +34,58 @@ fn restored_names(root: &Path) -> BTreeSet<String> {
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect()
+}
+
+#[test]
+fn generated_suffix_does_not_collide_with_existing_basename() {
+    // Two lib.jar copies plus a real lib__2.jar used to assign lib__2.jar twice.
+    // Rehydrate -d without --overwrite then aborted after writing one of them;
+    // --overwrite silently dropped a jar.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("web")).unwrap();
+    fs::create_dir_all(root.join("search")).unwrap();
+    write_jar(&root.join("web/lib.jar"), &[("id.txt", b"web")]);
+    write_jar(&root.join("search/lib.jar"), &[("id.txt", b"search")]);
+    write_jar(&root.join("lib__2.jar"), &[("id.txt", b"real-suffix")]);
+    ayzenpack()
+        .current_dir(root)
+        .args([
+            "dehydrate",
+            "-o",
+            "out.ayz",
+            "web/lib.jar",
+            "search/lib.jar",
+            "lib__2.jar",
+        ])
+        .assert()
+        .success();
+    let names = restored_names(root);
+    assert_eq!(names.len(), 3, "got {names:?}");
+    assert!(names.contains("lib.jar"), "got {names:?}");
+    assert!(names.contains("lib__2.jar"), "got {names:?}");
+    assert!(
+        names.contains("lib__2__2.jar"),
+        "real lib__2.jar must not reuse the generated suffix, got {names:?}"
+    );
+    let restored = root.join("restored");
+    assert_eq!(jar_entry_bytes(&restored.join("lib.jar"), "id.txt"), b"web");
+    assert_eq!(
+        jar_entry_bytes(&restored.join("lib__2.jar"), "id.txt"),
+        b"search"
+    );
+    assert_eq!(
+        jar_entry_bytes(&restored.join("lib__2__2.jar"), "id.txt"),
+        b"real-suffix"
+    );
+}
+
+fn jar_entry_bytes(path: &Path, name: &str) -> Vec<u8> {
+    let mut z = zip::ZipArchive::new(File::open(path).unwrap()).unwrap();
+    let mut f = z.by_name(name).unwrap();
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).unwrap();
+    buf
 }
 
 #[allow(non_snake_case)] // required test name: lib.jar / lib__2.jar

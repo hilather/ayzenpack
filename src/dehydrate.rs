@@ -1386,19 +1386,29 @@ fn unique_basename(path: &Path, used: &mut HashMap<String, u32>) -> Result<Strin
     if base.contains('/') || base.contains('\\') || base == ".." || base == "." {
         return Err(AyzenpackError::UnsafePath(base.to_string()));
     }
-    let n = {
-        let slot = used.entry(base.to_string()).or_insert(0);
-        *slot += 1;
-        *slot
-    };
-    if n == 1 {
-        return Ok(base.to_string());
-    }
+    // `used` is the set of already-assigned pack names (not a per-input-basename
+    // counter). Two `a.jar` inputs still become `a.jar` / `a__2.jar`. A later
+    // real `a__2.jar` must not reuse that generated name — `-d` restore would
+    // overwrite or abort after writing only one of the two.
     let p = Path::new(base);
     let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or(base);
-    match p.extension().and_then(|s| s.to_str()) {
-        Some(ext) => Ok(format!("{stem}__{n}.{ext}")),
-        None => Ok(format!("{stem}__{n}")),
+    let mut n = 1u32;
+    loop {
+        let candidate = if n == 1 {
+            base.to_string()
+        } else {
+            match p.extension().and_then(|s| s.to_str()) {
+                Some(ext) => format!("{stem}__{n}.{ext}"),
+                None => format!("{stem}__{n}"),
+            }
+        };
+        if let std::collections::hash_map::Entry::Vacant(slot) = used.entry(candidate.clone()) {
+            slot.insert(n);
+            return Ok(candidate);
+        }
+        n = n.checked_add(1).ok_or_else(|| {
+            AyzenpackError::FormatOwned(format!("too many basename collisions for {base}"))
+        })?;
     }
 }
 
@@ -1745,6 +1755,45 @@ mod tests {
         assert_eq!(
             unique_basename(Path::new("copy/lib.tar.jar"), &mut used).unwrap(),
             "lib.tar__2.jar"
+        );
+    }
+
+    #[test]
+    fn unique_basename_skips_already_assigned_generated_suffix() {
+        // web/a.jar + other/a.jar + a real a__2.jar must not share a__2.jar.
+        let mut used = HashMap::new();
+        assert_eq!(
+            unique_basename(Path::new("web/a.jar"), &mut used).unwrap(),
+            "a.jar"
+        );
+        assert_eq!(
+            unique_basename(Path::new("other/a.jar"), &mut used).unwrap(),
+            "a__2.jar"
+        );
+        assert_eq!(
+            unique_basename(Path::new("a__2.jar"), &mut used).unwrap(),
+            "a__2__2.jar"
+        );
+        let mut names: Vec<_> = used.keys().cloned().collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 3, "pack names must stay unique: {names:?}");
+    }
+
+    #[test]
+    fn unique_basename_existing_suffix_file_first_still_unique() {
+        let mut used = HashMap::new();
+        assert_eq!(
+            unique_basename(Path::new("a__2.jar"), &mut used).unwrap(),
+            "a__2.jar"
+        );
+        assert_eq!(
+            unique_basename(Path::new("lib/a.jar"), &mut used).unwrap(),
+            "a.jar"
+        );
+        assert_eq!(
+            unique_basename(Path::new("other/a.jar"), &mut used).unwrap(),
+            "a__3.jar"
         );
     }
 

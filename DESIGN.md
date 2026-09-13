@@ -49,7 +49,7 @@ JARs  →  zip::ZipArchive by_index
 
 Rehydrate seeks the trailer, decodes every zstd frame in `payload_bytes` into a content-addressed directory (`xx/yy/hex`), then rebuilds each JAR. `list` on v2 seeks `header_total + manifest_zstd_off` and decodes only that last frame (`REC_MANIFEST` + JSON + `REC_END`).
 
-Scan is sequential (central-directory order). `--jobs` hashes on a pool; a single writer emits BLOBs in first-seen order so END digest and `blobs[]` stay deterministic. `--sort-inputs` archives are byte-identical at any `--jobs`.
+Scan is sequential (central-directory order). `--jobs` hashes on a pool; a single writer emits BLOBs in first-seen order so END digest and `blobs[]` stay deterministic. `--sort-inputs` archives are byte-identical at any `--jobs`. Pack `jars[].name` is a unique single path segment: the first copy of a basename stays `a.jar`, further copies are `a__2.jar`, `a__3.jar`, … skipping any name already assigned (a real `a__2.jar` next to two `a.jar` inputs must not share `a__2.jar`; `-d` restore would otherwise overwrite or abort after writing one of the two).
 
 ---
 
