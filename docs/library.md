@@ -74,7 +74,7 @@ ayzenpack = { git = "https://github.com/hilather/ayzenpack" }
 | Field | Default | Notes |
 |-------|---------|--------|
 | `output` | empty (required) | overwritten if the file exists |
-| `inputs` | `[]` (required) | files, or directories when `recursive` |
+| `inputs` | `[]` (required) | files, or directories when `recursive`. Duplicate basenames become `a.jar` / `a__2.jar` / …; assigned names stay unique even when a later input is already named `a__2.jar` |
 | `recursive` | `false` | `*.jar,*.zip,*.war,*.ear`, case-insensitive |
 | `sort_inputs` | `false` | also forces header `created_unix` to `0` |
 | `level` | `3` | zstd 1..=19 |
