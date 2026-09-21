@@ -1,0 +1,42 @@
+name: muse-bump-lock
+on:
+  push:
+    branches: [chore/release-v0.2.10]
+    paths: ['.github/workflows/_muse_bump_lock.yml']
+permissions:
+  contents: write
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: chore/release-v0.2.10
+      - name: Bump Cargo.lock and remove this workflow
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          lock = Path('Cargo.lock')
+          text = lock.read_text()
+          new, n = re.subn(
+              r'(?m)^(name = "ayzenpack"\n)version = "0\.2\.9"$',
+              r'\1version = "0.2.10"',
+              text,
+              count=1,
+          )
+          if n != 1:
+              raise SystemExit(f'expected 1 ayzenpack 0.2.9 bump, got {n}')
+          # Preserve exact EOF (no forced trailing newline)
+          lock.write_text(new)
+          print('bumped ayzenpack Cargo.lock to 0.2.10')
+          PY
+          rm -f .github/workflows/_muse_bump_lock.yml
+          git config user.name "hilather"
+          git config user.email "hilather@gmail.com"
+          git add Cargo.lock
+          git add -u .github/workflows/_muse_bump_lock.yml
+          git status
+          git commit -m "Bump version to 0.2.10 (Cargo.lock)" -m "— Muse"
+          git push origin HEAD:chore/release-v0.2.10
